@@ -393,21 +393,39 @@ func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
 // (excluding wire headers). contiguous is true iff the payload reservation
 // is contiguous (no ring wrap).
 //
-// Heuristic (mirrors grpc-dotnet-shm):
+// The whole point of SHM is to avoid the per-byte memcpy that UDS / TCP
+// pay on every RPC. ZC is the mechanism that delivers on that promise,
+// so we want ZC to fire for as many payload sizes as physically safe.
+// The eligibility rules below were chosen accordingly:
 //
-//   - Adaptive minimum payload threshold: 64 KiB on rings ≥ 1 MiB
-//     (large enough that a 64 KiB ZC hold leaves >> 90% of the ring
-//     free for the writer); progressively smaller on smaller rings
-//     so ZC stays useful for the dominant message size; never below
-//     4 KiB where memcpy is faster than ZC bookkeeping.
-//   - Disabled entirely on rings below 1 MiB: a single 64 KiB ZC hold
-//     would freeze 25% of a 256 KiB ring and stall the writer.
-//   - Back-pressure self-disable: if the ring is already > 75% full
-//     (used×4 > cap×3), taking ZC would risk stalling the writer.
-//   - At-most-one-ZC: zcActive==0 enforces a single ZC payload in
-//     flight per ring. The deferred-publish protocol assumes a single
-//     producer of bumps to zcDeferredTarget; multiple concurrent ZC
-//     frames would require multi-producer ordering not yet implemented.
+//   - At-most-one-ZC in flight per ring (zcActive). The deferred-
+//     publish protocol assumes a single producer of bumps to
+//     zcDeferredTarget; multiple concurrent ZC frames would require
+//     multi-producer ordering not yet implemented. For pipelined
+//     streaming this means the second message of a back-to-back burst
+//     falls back to the single-mem.Copy fast path, which is correct
+//     and inexpensive.
+//
+//   - Payload must be contiguous (no ring wrap). The H2 codec's
+//     copy-fallback handles wrap-aware reassembly.
+//
+//   - Ring must be at least 1 MiB. Below that a single ZC hold would
+//     freeze a measurable fraction of the ring (e.g., 64 KiB out of
+//     256 KiB = 25 %) and stall the writer.
+//
+//   - Minimum payload of 4 KiB. Below that the ZC bookkeeping cost
+//     (atomic bumps + Buffer wrap + EndZcReservation publish) reliably
+//     loses to a direct mem.Copy. 4 KiB is one page; copying a single
+//     page is sub-µs on modern HW.
+//
+//   - Back-pressure self-disable: when the ring is already > 75 % full
+//     (used*4 > cap*3), holding any extra bytes via ZC risks stalling
+//     the writer; let the copy path drain into heap instead.
+//
+// Compared to the previous heuristic (64 KiB minimum), the 4 KiB floor
+// lets ZC fire on the medium-message sizes (4 KiB – 16 KiB) where the
+// SHM advantage over UDS / TCP is most visible: those sizes still cost
+// the kernel two per-byte copies on UDS but zero on SHM with ZC.
 func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bool {
 	if !contiguous {
 		return false
@@ -416,15 +434,9 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 	if r.capacity < minRingForZC {
 		return false
 	}
-	// Adaptive minimum: min(64 KiB, cap/16), floored at 4 KiB.
-	adaptiveMin := uint64(64 * 1024)
-	if r.capacity/16 < adaptiveMin {
-		adaptiveMin = r.capacity / 16
-	}
-	if adaptiveMin < 4*1024 {
-		adaptiveMin = 4 * 1024
-	}
-	if uint64(payloadLength) < adaptiveMin {
+	// 4 KiB minimum payload — below this a direct mem.Copy beats the
+	// per-ZC bookkeeping cost.
+	if payloadLength < 4*1024 {
 		return false
 	}
 	if atomic.LoadUint32(&r.zcActive) != 0 {
