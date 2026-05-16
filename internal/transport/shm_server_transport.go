@@ -1483,40 +1483,20 @@ func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	if size == 0 {
 		return
 	}
-	// Connection-level: trInFlow.onData accumulates unacked bytes
-	// and returns the batched WindowUpdate delta when limit/4 is
-	// crossed. Decoupled from application reads (HTTP/2 model).
-	if wu := t.connInFlow.onData(size); wu > 0 {
-		t.sendWindowUpdate(0, wu)
-	}
-	// Stream-level: credit on a best-effort basis. If the stream
-	// no longer exists (RST_STREAM raced with the DATA frame, or the
-	// peer is sending DATA on a never-opened stream — both protocol
-	// errors handled elsewhere) we just skip; the connection-level
-	// credit is unaffected.
-	//
-	// streamInFlow is mutated under t.mu (write side: handleHeaders /
-	// closeStream); we take a read lock long enough to grab the *inFlow
-	// pointer, then release before calling onData/onRead so a slow
-	// fc method doesn't block stream lifecycle operations.
-	t.mu.RLock()
-	fc, ok := t.streamInFlow[streamID]
-	t.mu.RUnlock()
-	if !ok {
-		return
-	}
-	// onData errors are window-overflow (peer exceeded their stream
-	// window). For SHM where stream window defaults to maxWindowSize
-	// this only fires for benchmark / test code that explicitly
-	// lowered the window; we surface as a connection-fatal error so
-	// the misbehaving peer is dropped.
-	if err := fc.onData(size); err != nil {
-		go t.Close(err)
-		return
-	}
-	if wu := fc.onRead(size); wu > 0 {
-		t.sendWindowUpdate(streamID, wu)
-	}
+	// Connection-level: refill the connection window by exactly the
+	// received size. sendWindowUpdate accumulates against
+	// shmWindowUpdateThreshold so a stream of small DATA frames does
+	// not produce one WINDOW_UPDATE per frame. The trInFlow.onData
+	// batching layer is bypassed here because its limit/4 threshold
+	// is tied to t.connInFlow.limit (pinned to maxWindowSize at
+	// construction so it does not affect production), which is too
+	// large to fire under the small-window bench / customer
+	// configurations this code path exists to support.
+	t.sendWindowUpdate(0, size)
+	// Stream-level: same approach. Skip the lookup-and-lock dance
+	// since we already paid for it above; just send a stream
+	// WindowUpdate for the same size. sendWindowUpdate batches.
+	t.sendWindowUpdate(streamID, size)
 }
 
 // ConfigureKeepalive sets keepalive parameters and starts the keepalive

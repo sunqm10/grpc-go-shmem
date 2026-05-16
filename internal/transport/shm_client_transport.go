@@ -219,6 +219,71 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 	}
 }
 
+// acquireUpToSendQuota acquires up to `want` bytes of send quota,
+// returning whatever is currently available on both the stream and
+// connection windows (min of the two, capped at want). Blocks only
+// when zero bytes are available on either window; on a nil error it
+// returns got > 0.
+//
+// This is the correct primitive for writing a MESSAGE whose total
+// size may exceed the per-stream HTTP/2 flow-control window.
+// acquireSendQuota waits for `n` bytes atomically and deadlocks when
+// n > stream window because the receiver never gets data to consume,
+// never sends WINDOW_UPDATE, and the window never grows.
+// acquireUpToSendQuota lets the caller drain the window in chunks,
+// give the receiver a chance to credit it back, then continue.
+//
+// Callers MUST loop until they have written the full message, and
+// MUST set MessageFlagMORE / clear MessageFlagEndStream on
+// intermediate chunks so the receiver's lpmAccumulator stitches the
+// DATA frames into one LPM. Only the final chunk carries the caller's
+// intended EndStream signal.
+func (t *ShmClientTransport) acquireUpToSendQuota(ctx context.Context, streamID uint32, want int) (got int, err error) {
+	if want <= 0 {
+		return 0, nil
+	}
+	t.sendQuotaMu.Lock()
+	for {
+		if t.closed.Load() {
+			t.sendQuotaMu.Unlock()
+			return 0, ErrConnClosing
+		}
+		avail := t.connSendQuota
+		q, ok := t.streamSendQuota[streamID]
+		if !ok {
+			// Stream not registered — caller violated the contract
+			// (must NewStream before write). Surface as errStreamDone
+			// rather than block forever on a quota that will never
+			// be created.
+			t.sendQuotaMu.Unlock()
+			return 0, errStreamDone
+		}
+		if q < avail {
+			avail = q
+		}
+		if avail > 0 {
+			grant := avail
+			if grant > int64(want) {
+				grant = int64(want)
+			}
+			t.connSendQuota -= grant
+			t.streamSendQuota[streamID] -= grant
+			t.sendQuotaMu.Unlock()
+			return int(grant), nil
+		}
+		ch := t.quotaSignal
+		t.sendQuotaMu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return 0, ContextErr(ctx.Err())
+		case <-t.ctx.Done():
+			return 0, ErrConnClosing
+		}
+		t.sendQuotaMu.Lock()
+	}
+}
+
 func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
 		return
@@ -1116,24 +1181,16 @@ func (t *ShmClientTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	if size == 0 {
 		return
 	}
-	if wu := t.connInFlow.onData(size); wu > 0 {
-		t.sendWindowUpdate(0, wu)
-	}
-	// streamInFlow access protected by t.mu (RWMutex; write side is
-	// NewStream / closeStream).
-	t.mu.RLock()
-	fc, ok := t.streamInFlow[streamID]
-	t.mu.RUnlock()
-	if !ok {
-		return
-	}
-	if err := fc.onData(size); err != nil {
-		go t.Close(err)
-		return
-	}
-	if wu := fc.onRead(size); wu > 0 {
-		t.sendWindowUpdate(streamID, wu)
-	}
+	// Refill the connection + stream windows by exactly `size`. The
+	// sendWindowUpdate batching layer (shmWindowUpdateThreshold)
+	// keeps the WINDOW_UPDATE rate sane; we don't gate through
+	// trInFlow.onData / inFlow.onData here because their limit/4
+	// thresholds are tied to maxWindowSize and won't fire under
+	// configurations where the producer's per-stream send window is
+	// smaller than the receive limit. See the matching method in
+	// shm_server_transport.go for the design rationale.
+	t.sendWindowUpdate(0, size)
+	t.sendWindowUpdate(streamID, size)
 }
 
 // closeStream closes the given stream and cleans up resources.
@@ -1365,54 +1422,127 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 
 	payloadLen := len(hdr) + data.Len()
 
-	// Enforce outbound flow control: wait for available send window.
+	// Flow-control aware write. The producer's send quota may be
+	// smaller than the full message (when grpc.WithInitialWindowSize
+	// lowers it, or — once that option is plumbed through — at the
+	// HTTP/2 default of 65535 B). The legacy acquireSendQuota call
+	// waits atomically for `payloadLen` bytes which deadlocks when
+	// payloadLen > stream window. Instead we loop:
+	//
+	//   - acquire up to `remaining` bytes of currently-available
+	//     quota (blocks only if both windows are zero),
+	//   - send that many bytes as one MESSAGE frame carrying
+	//     MessageFlagMORE so the receiver's lpmAccumulator stitches
+	//     it together with the rest of the LPM,
+	//   - repeat until the full payload has been written.
+	//
+	// Only the LAST chunk carries the caller's intended EndStream /
+	// MORE flag. Intermediate chunks always set MessageFlagMORE so
+	// the H2 codec emits DATA frames without END_STREAM.
+	//
+	// Fast path: when the first acquireUpToSendQuota grant covers
+	// the full payload (the common case in production where the
+	// stream quota is maxWindowSize = 2 GiB), we preserve the
+	// existing vectored single-frame path through writeFrameBuffers
+	// and avoid the materialisation step. The slow path materialises
+	// hdr+data once into a contiguous byte slice so we can slice
+	// across the hdr/segment boundary without ad-hoc indexing; for
+	// messages large enough to span the window this extra copy is
+	// dominated by the actual send time.
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.write: acquiring send quota for %d bytes", payloadLen)
 	}
-	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
+	got, err := t.acquireUpToSendQuota(s.ctx, s.id, payloadLen)
+	if err != nil {
 		if shmDebugEnabled {
-			shmDebugf("[DEBUG] ShmClientTransport.write: acquireSendQuota failed: %v", err)
+			shmDebugf("[DEBUG] ShmClientTransport.write: acquireUpToSendQuota failed: %v", err)
 		}
 		return err
 	}
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
-	}
 
-	// Write MESSAGE frame. See ringWriteProto for the rationale on
-	// the MORE / EndStream flag pair (MORE=0 signals half-close;
-	// writeFrameH2 derives the on-wire END_STREAM bit from
-	// MessageFlagEndStream).
-	fh := FrameHeader{
-		StreamID: s.id,
-		Type:     FrameTypeMESSAGE,
-		Flags:    0,
-	}
-	if opts != nil && !opts.Last {
-		fh.Flags = MessageFlagMORE
-	} else {
-		fh.Flags = MessageFlagEndStream
-	}
-
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring")
-	}
-	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:  s.ctx,
-		fh:   fh,
-		hdr:  hdr,
-		data: data,
-	}); err != nil {
-		if shmDebugEnabled {
-			shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+	if got == payloadLen {
+		// Fast path: full payload fits in the currently-available
+		// window. Use the vectored frame writer to avoid materialising
+		// hdr+data into a contiguous buffer.
+		fh := FrameHeader{StreamID: s.id, Type: FrameTypeMESSAGE}
+		if opts != nil && !opts.Last {
+			fh.Flags = MessageFlagMORE
+		} else {
+			fh.Flags = MessageFlagEndStream
 		}
-		return err
-	}
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: writing single frame (fast path)")
+		}
+		if err := t.frameWriter.enqueueAndWait(frameEntry{
+			ctx:  s.ctx,
+			fh:   fh,
+			hdr:  hdr,
+			data: data,
+		}); err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+			}
+			return err
+		}
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+		}
+		return nil
 	}
 
-	return nil
+	// Slow path: payload spans multiple flow-control chunks.
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: chunked write, got %d / %d on first acquire", got, payloadLen)
+	}
+	buf := make([]byte, 0, payloadLen)
+	buf = append(buf, hdr...)
+	for _, b := range data {
+		buf = append(buf, b.ReadOnlyData()...)
+	}
+	off := 0
+	for {
+		end := off + got
+		isLast := end == payloadLen
+		fh := FrameHeader{StreamID: s.id, Type: FrameTypeMESSAGE}
+		switch {
+		case !isLast:
+			// Intermediate chunk: receiver concatenates into one LPM.
+			fh.Flags = MessageFlagMORE
+		case opts != nil && !opts.Last:
+			// Final chunk of THIS message; more messages to follow on
+			// the stream. MessageFlagMORE here means "LPM done, more
+			// messages later" — same encoding the codec uses to keep
+			// END_STREAM off the wire.
+			fh.Flags = MessageFlagMORE
+		default:
+			// Final chunk of the LAST message on the stream.
+			fh.Flags = MessageFlagEndStream
+		}
+		if err := t.frameWriter.enqueueAndWait(frameEntry{
+			ctx:     s.ctx,
+			fh:      fh,
+			payload: buf[off:end],
+		}); err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[ERROR] ShmClientTransport.write: chunk write failed at off=%d: %v", off, err)
+			}
+			return err
+		}
+		off = end
+		if isLast {
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.write: chunked write complete (%d bytes)", payloadLen)
+			}
+			return nil
+		}
+		got, err = t.acquireUpToSendQuota(s.ctx, s.id, payloadLen-off)
+		if err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.write: acquireUpToSendQuota failed mid-chunk: %v", err)
+			}
+			return err
+		}
+	}
 }
 
 // sendPing sends a PING frame with 8-byte opaque data.

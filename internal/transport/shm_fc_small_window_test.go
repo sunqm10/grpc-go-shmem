@@ -84,16 +84,6 @@ import (
 // failure is actionable (the original investigation needed the dump
 // to identify the lpmAccumulator → handleMessage coupling).
 func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
-	// PINNED TO SKIP until producer-side chunked write under flow
-	// control lands. The receiver-side per-DATA-frame credit fix
-	// (onDataFrameReceived in shm_*_transport.go) landed in a
-	// previous commit; the producer's acquireSendQuota still waits
-	// atomically on the FULL payload size, so when payloadLen
-	// exceeds the artificially-clamped stream quota the call still
-	// deadlocks. Once chunked write lands (acquireUpToSendQuota +
-	// loop in ShmClientTransport.write), remove the skip.
-	t.Skip("waiting on producer-side chunked write")
-
 	// Configure the SHM flow-control knobs BEFORE any transport is
 	// constructed. Both transports capture the values at construction;
 	// mutating them mid-test does nothing.
