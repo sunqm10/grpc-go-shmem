@@ -83,8 +83,118 @@ func (e *grpcBenchEnv) close() {
 	}
 }
 
+// benchProfile controls HTTP/2 flow-control window sizes applied
+// uniformly across SHM, TCP, and UDS so reviewers can compare them
+// under matching settings. The original asymmetry that prompted
+// adding this knob:
+//
+//   - SHM transport used `shmInitialWindowSize = 32 MiB` BDP target
+//     internally; producer / receive limits were pinned at 2 GiB i.e.
+//     flow control effectively disabled.
+//   - TCP / UDS use HTTP/2's spec default 65535-byte initial window.
+//
+// So large-message streaming numbers on SHM were partly an artifact
+// of unlimited flow control, not just transport efficiency. Set
+// BENCH_PROFILE to one of:
+//
+//   - shm-tuned    : (default) SHM keeps its production 2 GiB quota;
+//                    TCP / UDS use HTTP/2 default 65535. Matches the
+//                    historical numbers in the repo. Shows SHM's
+//                    upper bound when tuned for local IPC.
+//
+//   - fair-default : All three transports use HTTP/2 default 65535 B.
+//                    Doug's preferred comparison. Tests SHM purely on
+//                    transport mechanics, no flow-control advantage.
+//
+//   - fair-32mb    : All three transports use 32 MiB windows. Tests
+//                    SHM against TCP / UDS when operators tune
+//                    grpc.WithInitialWindowSize for streaming.
+type benchProfile struct {
+	// initialWindowSize, when > 0, is passed as
+	// grpc.WithInitialWindowSize on the client and
+	// grpc.InitialWindowSize on the server. The SHM transport reads
+	// it from ConnectOptions and applies it to per-stream send /
+	// receive quota; TCP / UDS pass it directly to the HTTP/2
+	// transport.
+	initialWindowSize int32
+
+	// initialConnWindowSize: same, for the connection-level window.
+	initialConnWindowSize int32
+
+	// applyToShm is false when the profile wants SHM to stay on its
+	// native 2 GiB quota even when overriding TCP / UDS (i.e. the
+	// "shm-tuned" profile). True for fair-* profiles.
+	applyToShm bool
+}
+
+func loadBenchProfile() benchProfile {
+	switch os.Getenv("BENCH_PROFILE") {
+	case "fair-default":
+		return benchProfile{
+			initialWindowSize:     65535,
+			initialConnWindowSize: 65535,
+			applyToShm:            true,
+		}
+	case "fair-32mb":
+		return benchProfile{
+			initialWindowSize:     32 * 1024 * 1024,
+			initialConnWindowSize: 32 * 1024 * 1024,
+			applyToShm:            true,
+		}
+	case "", "shm-tuned":
+		return benchProfile{}
+	default:
+		panic(fmt.Sprintf("BENCH_PROFILE %q not recognised; use shm-tuned | fair-default | fair-32mb",
+			os.Getenv("BENCH_PROFILE")))
+	}
+}
+
+func (p benchProfile) dialOpts(transport string) []grpc.DialOption {
+	apply := true
+	if transport == "shm" && !p.applyToShm {
+		apply = false
+	}
+	if !apply || p.initialWindowSize == 0 {
+		return nil
+	}
+	return []grpc.DialOption{
+		grpc.WithInitialWindowSize(p.initialWindowSize),
+		grpc.WithInitialConnWindowSize(p.initialConnWindowSize),
+	}
+}
+
+func (p benchProfile) serverOpts(transport string) []grpc.ServerOption {
+	apply := true
+	if transport == "shm" && !p.applyToShm {
+		apply = false
+	}
+	if !apply || p.initialWindowSize == 0 {
+		return nil
+	}
+	return []grpc.ServerOption{
+		grpc.InitialWindowSize(p.initialWindowSize),
+		grpc.InitialConnWindowSize(p.initialConnWindowSize),
+	}
+}
+
 // newShmEnv creates a full gRPC server+client over shared memory transport.
 func newShmEnv(b *testing.B) *grpcBenchEnv {
+	profile := loadBenchProfile()
+	// Apply the bench profile's window size to the SHM-specific
+	// flow-control knobs (shmInitialWindowSize, shmWindowUpdateThreshold)
+	// BEFORE constructing any transport. The dial-option plumbing
+	// (grpc.WithInitialWindowSize → ConnectOptions.InitialWindowSize →
+	// DialOptions.InitialWindowSize → conn/stream send quota) handles
+	// the QUOTA side; this call separately handles the WindowUpdate
+	// BATCHING THRESHOLD side which is also package-global. Without
+	// it the threshold stays at the default 8 MiB so a small-window
+	// stream takes thousands of iterations before its first
+	// WindowUpdate fires, which deadlocks the producer once the
+	// window drains. ResetShmFlowControlForBench is registered in
+	// cleanups below so subsequent tests don't inherit the override.
+	if profile.applyToShm && profile.initialWindowSize > 0 {
+		transport.ConfigureShmFlowControlForBench(int(profile.initialWindowSize))
+	}
 	name := fmt.Sprintf("bench_grpc_shm_%d", time.Now().UnixNano())
 	lis, err := transport.NewShmListener(
 		&transport.ShmAddr{Name: name},
@@ -98,16 +208,19 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 		grpc.MaxRecvMsgSize(benchMaxMsg),
 		grpc.MaxSendMsgSize(benchMaxMsg),
 	}
+	srvOpts = append(srvOpts, profile.serverOpts("shm")...)
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
 
-	conn, err := grpc.NewClient("shm://"+name,
+	dialOpts := []grpc.DialOption{
 		grpc.WithShmTransport(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),
 			grpc.MaxCallSendMsgSize(benchMaxMsg),
 		),
-	)
+	}
+	dialOpts = append(dialOpts, profile.dialOpts("shm")...)
+	conn, err := grpc.NewClient("shm://"+name, dialOpts...)
 	if err != nil {
 		stop()
 		lis.Close()
@@ -125,12 +238,17 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 		cleanups: []func(){
 			func() { lis.Close() },
 			func() { transport.RemoveSegment(name) },
+			// Restore SHM flow-control defaults so subsequent bench
+			// envs in the same `go test` invocation don't inherit
+			// this profile's overrides. No-op if we didn't override.
+			transport.ResetShmFlowControlForBench,
 		},
 	}
 }
 
 // newTCPEnv creates a full gRPC server+client over TCP loopback.
 func newTCPEnv(b *testing.B) *grpcBenchEnv {
+	profile := loadBenchProfile()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatalf("Listen: %v", err)
@@ -140,15 +258,18 @@ func newTCPEnv(b *testing.B) *grpcBenchEnv {
 		grpc.MaxRecvMsgSize(benchMaxMsg),
 		grpc.MaxSendMsgSize(benchMaxMsg),
 	}
+	srvOpts = append(srvOpts, profile.serverOpts("tcp")...)
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
 
-	conn, err := grpc.NewClient(lis.Addr().String(),
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),
 			grpc.MaxCallSendMsgSize(benchMaxMsg),
 		),
-	)
+	}
+	dialOpts = append(dialOpts, profile.dialOpts("tcp")...)
+	conn, err := grpc.NewClient(lis.Addr().String(), dialOpts...)
 	if err != nil {
 		stop()
 		lis.Close()
@@ -168,6 +289,7 @@ func newTCPEnv(b *testing.B) *grpcBenchEnv {
 
 // newUnixEnv creates a full gRPC server+client over a Unix domain socket.
 func newUnixEnv(b *testing.B) *grpcBenchEnv {
+	profile := loadBenchProfile()
 	sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("bench_grpc_%d.sock", time.Now().UnixNano()))
 	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -181,15 +303,18 @@ func newUnixEnv(b *testing.B) *grpcBenchEnv {
 		grpc.MaxRecvMsgSize(benchMaxMsg),
 		grpc.MaxSendMsgSize(benchMaxMsg),
 	}
+	srvOpts = append(srvOpts, profile.serverOpts("uds")...)
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
 
-	conn, err := grpc.NewClient("unix:"+sockPath,
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),
 			grpc.MaxCallSendMsgSize(benchMaxMsg),
 		),
-	)
+	}
+	dialOpts = append(dialOpts, profile.dialOpts("uds")...)
+	conn, err := grpc.NewClient("unix:"+sockPath, dialOpts...)
 	if err != nil {
 		stop()
 		lis.Close()

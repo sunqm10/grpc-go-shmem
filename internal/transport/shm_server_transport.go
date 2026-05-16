@@ -1241,6 +1241,18 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		return false, nil
 	}
 
+	// Skip ZC when the message exceeds the current send window —
+	// acquireSendQuota is atomic on quotaSize and deadlocks when the
+	// stream window is smaller. The fallback write() path chunks
+	// under flow control via acquireUpToSendQuota.
+	t.sendQuotaMu.Lock()
+	streamQ, hasStreamQ := t.streamSendQuota[s.id]
+	if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
+		t.sendQuotaMu.Unlock()
+		return false, nil
+	}
+	t.sendQuotaMu.Unlock()
+
 	// Flow control: account only the gRPC payload (5-byte LPM + proto body).
 	// The 9-byte H2 frame header is NOT included in WINDOW_UPDATE.
 	if err := t.acquireSendQuota(s.ctx, s.id, quotaSize); err != nil {
