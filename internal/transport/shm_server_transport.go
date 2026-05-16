@@ -251,7 +251,13 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	// correct value, and so an external HTTP/2 peer parsing this
 	// frame interprets the increment correctly.
 	binary.BigEndian.PutUint32(buf, delta)
-	_ = t.frameWriter.enqueue(frameEntry{
+	// enqueueOrInline: writes the WU frame directly on this goroutine if
+	// the frame writer is idle (the common case on the receive path,
+	// since the writer parks waiting for app traffic). Falls back to
+	// async enqueue under contention. Saves one goroutine hop +
+	// scheduler wake per WU; matters under fair-default flow control
+	// where the producer stalls one round-trip per ~16 KiB consumed.
+	_ = t.frameWriter.enqueueOrInline(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID},
 		payload: buf,

@@ -159,6 +159,45 @@ func (w *shmFrameWriter) trySend(entry frameEntry) bool {
 	return true
 }
 
+// enqueueOrInline writes the frame inline if the writer goroutine is idle
+// (inlineMu available), otherwise enqueues to the channel for asynchronous
+// processing. The caller does not block waiting for completion either way.
+//
+// Used for fire-and-forget control frames (WINDOW_UPDATE in particular) that
+// callers do not need to acknowledge but where avoiding the writer-goroutine
+// wakeup matters for latency. Under fair-default flow control (65535 B
+// HTTP/2 window) the receiver emits a WINDOW_UPDATE roughly every DATA frame,
+// and the round-trip cost of "enqueue -> wake writer goroutine -> write
+// frame -> futexWake peer" is the dominant stall in the producer's send
+// loop. Writing the WU inline collapses that to "write frame -> futexWake".
+//
+// Returns nil on success (inline or queued); ErrConnClosing if closed.
+func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
+	w.closeMu.RLock()
+	if w.closed.Load() {
+		w.closeMu.RUnlock()
+		return ErrConnClosing
+	}
+	if w.inlineMu.TryLock() {
+		var err error
+		if entry.data != nil {
+			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
+		} else {
+			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+		}
+		w.inlineMu.Unlock()
+		w.closeMu.RUnlock()
+		return err
+	}
+	w.closeMu.RUnlock()
+	// Writer goroutine is busy; fall back to async enqueue. The caller
+	// does not need synchronous completion, so doneCh stays nil.
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
+	return nil
+}
+
 // tryEnqueueNonBlocking attempts to send a frame without blocking.
 // Used for best-effort frames (GOAWAY) in Close() where blocking would
 // deadlock if the channel is full (writer goroutine stuck on ring write).
