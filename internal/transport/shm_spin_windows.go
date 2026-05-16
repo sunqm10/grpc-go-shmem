@@ -37,10 +37,4 @@ const (
 	// during sustained high-throughput transfers where spinning
 	// consistently succeeds.
 	spinIterationsMax = 50000
-
-	// spinMoreBoost: when a MORE chunk is detected, boost spin to
-	// ~1.4ms (200K × 7ns). While the reader spins, DataWaiters == 0,
-	// so the writer skips WakeByAddress — eliminating cgocall on
-	// BOTH sides. This is the Go equivalent of C#'s fire-and-forget.
-	spinMoreBoost = 200000
 )

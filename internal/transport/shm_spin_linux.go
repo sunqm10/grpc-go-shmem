@@ -59,10 +59,4 @@ const (
 	// of one of the four wake-ups per iteration. Far below the
 	// scheduler quantum so a runnable peer never gets starved.
 	spinIterationsMax = 32000
-
-	// spinMoreBoost: when a MORE chunk is detected, boost spin to
-	// cover the inter-chunk latency (~5-20µs). On Linux, futex
-	// wake is cheap so we don't need the extreme 200K of Windows.
-	// ~70µs at 7ns/PAUSE covers the typical chunk write time.
-	spinMoreBoost = 10000
 )

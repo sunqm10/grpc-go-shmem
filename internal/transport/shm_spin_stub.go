@@ -26,5 +26,4 @@ const (
 	spinIterationsDefault = 300
 	spinIterationsMin     = 50
 	spinIterationsMax     = 4000
-	spinMoreBoost         = 10000
 )
