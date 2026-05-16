@@ -127,6 +127,15 @@ func ConfigureShmFlowControlForBench(initialWindow int) {
 	// WindowUpdate overhead per-byte under tiny windows) and a
 	// window/2 ceiling (so the sender can always refill at least
 	// once before exhausting the window).
+	//
+	// We empirically validated window/4 vs window/2: under streaming
+	// the smaller threshold pipelines better — the producer receives
+	// a steady trickle of small credits and never fully drains the
+	// window. window/2 makes the producer wait for larger but less
+	// frequent refills, which adds a full RTT block between each
+	// chunk. HTTP/2 over TCP fires WUs at delta/2 because TCP's
+	// per-segment overhead is high; SHM's per-WU overhead is much
+	// lower so more frequent updates are net positive.
 	threshold := initialWindow / 4
 	if threshold < 1024 {
 		threshold = 1024

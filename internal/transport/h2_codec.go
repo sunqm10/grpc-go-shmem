@@ -2027,6 +2027,17 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 	if maxChunk == 0 {
 		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
+	// Batch the per-DATA-frame writes so the reader sees one
+	// IncrementDataSequence + at most one signalData call across the
+	// whole multi-frame message, instead of one per chunk. Under
+	// fair-default (16 KiB MAX_FRAME_SIZE) a 64 KiB window-bounded
+	// caller chunk emits 4 DATA frames; without batching that's 4×
+	// (atomic increment + futex-wake check). With batching it's 1.
+	multi := len(body) > maxChunk
+	if multi {
+		tx.BeginBatch()
+		defer tx.EndBatch()
+	}
 	for off := 0; off < len(body); off += maxChunk {
 		end := off + maxChunk
 		if end > len(body) {
