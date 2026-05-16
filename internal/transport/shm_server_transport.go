@@ -423,6 +423,16 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer)
 	}
+	// Install the per-DATA-frame flow-control callback on the H2
+	// decoder for the client→server ring. The codec invokes this
+	// every time it consumes an H2 DATA frame body, BEFORE the bytes
+	// are handed to the per-stream lpmAccumulator. Crediting at this
+	// point — rather than waiting until handleMessage assembles a
+	// complete LPM — decouples HTTP/2 connection flow control from
+	// gRPC message reassembly and lets a producer with a small
+	// per-stream send window drain a multi-DATA-frame LPM without
+	// deadlocking on a WindowUpdate that never arrives.
+	t.clientToServer.h2Decoder().onDataFrame = t.onDataFrameReceived
 	defer func() {
 		if shmDebugEnabled {
 			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: EXITING")
@@ -766,13 +776,11 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 		sendBDPPing = t.bdpEst.add(sz)
 	}
 
-	if wu := t.connInFlow.onData(sz); wu > 0 {
-		t.sendWindowUpdate(0, wu)
-	}
-	if err := s.fc.onData(sz); err != nil {
-		s.write(recvMsg{err: err})
-		return
-	}
+	// NOTE: connection + stream flow-control credit is NOT done here.
+	// onDataFrameReceived (installed on the h2 decoder in
+	// processIncomingData) credits per H2 DATA frame at receipt time,
+	// which is the correct decoupling point for multi-DATA-frame
+	// LPMs. Crediting again here would double-count.
 
 	// Send BDP ping if BDP estimator requests it
 	if sendBDPPing {
@@ -824,14 +832,8 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		sendBDPPing = t.bdpEst.add(sz)
 	}
 
-	if wu := t.connInFlow.onData(sz); wu > 0 {
-		t.sendWindowUpdate(0, wu)
-	}
-	if err := s.fc.onData(sz); err != nil {
-		buf.Free()
-		s.write(recvMsg{err: err})
-		return
-	}
+	// NOTE: flow-control credit is already done per H2 DATA frame in
+	// onDataFrameReceived. See handleMessage for rationale.
 
 	// Send BDP ping if BDP estimator requests it
 	if sendBDPPing {
@@ -1446,6 +1448,74 @@ func (t *ShmServerTransport) adjustWindow(s *ServerStream, n uint32) {
 func (t *ShmServerTransport) updateWindow(s *ServerStream, n uint32) {
 	if w := s.fc.onRead(n); w > 0 {
 		t.sendWindowUpdate(s.id, w)
+	}
+}
+
+// onDataFrameReceived is installed on the H2 decoder of the client→server
+// ring (see processIncomingData). The codec invokes it synchronously
+// from the reader goroutine for every H2 DATA frame whose body is being
+// consumed from the ring, BEFORE the per-stream lpmAccumulator buffers
+// the bytes. Crediting flow control here decouples WINDOW_UPDATE
+// emission from LPM completion; this is what makes producers with a
+// per-stream send window smaller than a single MESSAGE able to drain
+// the message across multiple round-trips instead of deadlocking.
+//
+// `size` is the on-wire DATA payload length (includes PADDED bytes if
+// any), matching what the peer charged against their send window. The
+// HTTP/2 trInFlow / inFlow machinery returns the batched delta to send
+// as a WINDOW_UPDATE when the accumulated unacked bytes cross the
+// limit/4 threshold; we emit those frames via sendWindowUpdate which
+// itself batches against shmWindowUpdateThreshold.
+//
+// Stream-level credit is intentionally "auto-acked" via onRead(size)
+// — i.e. we treat the bytes as immediately consumed by the application
+// regardless of whether the lpmAccumulator has surfaced them to the
+// user yet. This matches the SHM transport's design choice to use the
+// ring buffer (not HTTP/2 flow control) as the real backpressure
+// signal; the upper-layer recvBuffer / inFlow.pendingData accounting
+// is still done by handleMessage when the LPM completes, but the
+// stream window doesn't have to wait that long to refill.
+//
+// Runs on the reader goroutine; MUST NOT block on the producer (it
+// goes through sendWindowUpdate → frameWriter.tryEnqueueNonBlocking
+// for the WINDOW_UPDATE emission).
+func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
+	if size == 0 {
+		return
+	}
+	// Connection-level: trInFlow.onData accumulates unacked bytes
+	// and returns the batched WindowUpdate delta when limit/4 is
+	// crossed. Decoupled from application reads (HTTP/2 model).
+	if wu := t.connInFlow.onData(size); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+	// Stream-level: credit on a best-effort basis. If the stream
+	// no longer exists (RST_STREAM raced with the DATA frame, or the
+	// peer is sending DATA on a never-opened stream — both protocol
+	// errors handled elsewhere) we just skip; the connection-level
+	// credit is unaffected.
+	//
+	// streamInFlow is mutated under t.mu (write side: handleHeaders /
+	// closeStream); we take a read lock long enough to grab the *inFlow
+	// pointer, then release before calling onData/onRead so a slow
+	// fc method doesn't block stream lifecycle operations.
+	t.mu.RLock()
+	fc, ok := t.streamInFlow[streamID]
+	t.mu.RUnlock()
+	if !ok {
+		return
+	}
+	// onData errors are window-overflow (peer exceeded their stream
+	// window). For SHM where stream window defaults to maxWindowSize
+	// this only fires for benchmark / test code that explicitly
+	// lowered the window; we surface as a connection-fatal error so
+	// the misbehaving peer is dropped.
+	if err := fc.onData(size); err != nil {
+		go t.Close(err)
+		return
+	}
+	if wu := fc.onRead(size); wu > 0 {
+		t.sendWindowUpdate(streamID, wu)
 	}
 }
 

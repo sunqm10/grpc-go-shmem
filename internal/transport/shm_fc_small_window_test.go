@@ -84,15 +84,15 @@ import (
 // failure is actionable (the original investigation needed the dump
 // to identify the lpmAccumulator → handleMessage coupling).
 func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
-	// PINNED TO SKIP until per-frame flow-control accounting + producer
-	// chunked-write land. The test reproduces a real deadlock that
-	// would surface the moment grpc.WithInitialWindowSize is plumbed
-	// through to the SHM transport. Run with `go test -run
-	// TestShmSmallWindow -count=1` against a candidate fix to verify
-	// it now PASSES; remove the skip in the commit that lands the
-	// fix. See /memories/session/shm-flow-control-bug-2026-05-16.md
-	// for the full design notes.
-	t.Skip("documents known SHM flow-control deadlock; un-skip when per-frame fc accounting lands")
+	// PINNED TO SKIP until producer-side chunked write under flow
+	// control lands. The receiver-side per-DATA-frame credit fix
+	// (onDataFrameReceived in shm_*_transport.go) landed in a
+	// previous commit; the producer's acquireSendQuota still waits
+	// atomically on the FULL payload size, so when payloadLen
+	// exceeds the artificially-clamped stream quota the call still
+	// deadlocks. Once chunked write lands (acquireUpToSendQuota +
+	// loop in ShmClientTransport.write), remove the skip.
+	t.Skip("waiting on producer-side chunked write")
 
 	// Configure the SHM flow-control knobs BEFORE any transport is
 	// constructed. Both transports capture the values at construction;

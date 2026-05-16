@@ -425,6 +425,13 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
 	}
+	// Install the per-DATA-frame flow-control callback on the H2
+	// decoder for the server→client ring. See the matching block in
+	// ShmServerTransport.processIncomingData for the design rationale
+	// (decouple H2 conn-flow credit from gRPC LPM reassembly so
+	// multi-DATA-frame responses don't deadlock under a small
+	// per-stream send window).
+	t.serverToClient.h2Decoder().onDataFrame = t.onDataFrameReceived
 	defer func() {
 		if shmDebugEnabled {
 			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
@@ -593,17 +600,10 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				sendBDPPing = t.bdpEst.add(sz)
 			}
 
-			if wu := t.connInFlow.onData(sz); wu > 0 {
-				t.sendWindowUpdate(0, wu)
-			}
-			if err := stream.fc.onData(sz); err != nil {
-				if shmDebugEnabled {
-					shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
-				}
-				release()
-				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
-				continue
-			}
+			// NOTE: connection + stream flow-control credit is done
+			// per H2 DATA frame in onDataFrameReceived (installed on
+			// the h2 decoder above). Crediting here would double-
+			// count. See onDataFrameReceived for the design rationale.
 
 			// Send BDP ping if BDP estimator requests it
 			if sendBDPPing {
@@ -1095,6 +1095,44 @@ func (t *ShmClientTransport) adjustWindow(s *ClientStream, n uint32) {
 func (t *ShmClientTransport) updateWindow(s *ClientStream, n uint32) {
 	if w := s.fc.onRead(n); w > 0 {
 		t.sendWindowUpdate(s.id, w)
+	}
+}
+
+// onDataFrameReceived is the per-DATA-frame flow-control callback
+// the H2 decoder fires on the reader goroutine (see
+// processIncomingData where this is installed on the server→client
+// ring's hpackDecoderHolder). Same design as the server side: credit
+// HTTP/2 connection + stream windows as soon as we've seen the bytes
+// on the wire, decoupled from gRPC LPM reassembly. Without this, a
+// multi-DATA-frame response message larger than the per-stream send
+// window will deadlock the server because the client's recv-side
+// lpmAccumulator is buffering the partial LPM and won't trigger
+// handleMessage → connInFlow.onData until the whole LPM completes.
+//
+// `size` is the on-wire DATA payload length (h2fh.Length); auto-acked
+// via onRead because the SHM transport treats the ring buffer (not
+// HTTP/2 flow control) as the real backpressure signal.
+func (t *ShmClientTransport) onDataFrameReceived(streamID uint32, size uint32) {
+	if size == 0 {
+		return
+	}
+	if wu := t.connInFlow.onData(size); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+	// streamInFlow access protected by t.mu (RWMutex; write side is
+	// NewStream / closeStream).
+	t.mu.RLock()
+	fc, ok := t.streamInFlow[streamID]
+	t.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if err := fc.onData(size); err != nil {
+		go t.Close(err)
+		return
+	}
+	if wu := fc.onRead(size); wu > 0 {
+		t.sendWindowUpdate(streamID, wu)
 	}
 }
 

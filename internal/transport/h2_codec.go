@@ -125,6 +125,24 @@ type hpackDecoderHolder struct {
 	// stream's recv channel) so a HEADERS-only RPC doesn't hang
 	// waiting for a MESSAGE that never arrives.
 	pendingHalfCloseStreamID uint32
+
+	// onDataFrame, when non-nil, is invoked synchronously every time
+	// the codec consumes the body bytes of an H2 DATA frame from the
+	// ring — BEFORE those bytes are handed to the per-stream
+	// lpmAccumulator. The callback runs on the reader goroutine and
+	// MUST NOT block on the producer (e.g., it must not call into
+	// frameWriter.enqueueAndWait); instead it queues WINDOW_UPDATE
+	// frames non-blocking. The transport layer plugs this in to
+	// credit HTTP/2 flow control per-DATA-frame, decoupled from LPM
+	// reassembly — which mirrors http2_client.handleData's "Decouple
+	// connection's flow control from application's read" design and
+	// lets a producer with a small per-stream send window drain a
+	// multi-DATA-frame LPM without deadlocking on a WindowUpdate that
+	// never arrives because the consumer is buffering the partial
+	// LPM. nil is the legacy behaviour (credit only on complete LPM
+	// inside handleMessage / handleMessageBuffer); valid for callers
+	// that pin sendQuota = maxWindowSize.
+	onDataFrame func(streamID uint32, size uint32)
 }
 
 // scratchBytes returns a slice of length n drawn from the holder's
@@ -186,6 +204,26 @@ func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
 	h.lastSid = sid
 	h.lastAcc = a
 	return a
+}
+
+// notifyDataFrameConsumed invokes the holder's onDataFrame callback
+// if one is set. Called at every site in the codec that has just
+// committed an H2 DATA-frame body from the ring — BEFORE either the
+// lpmAccumulator buffers the bytes (multi-DATA-frame LPM) or the
+// ZC fast path returns a ring-backed slice (single-DATA-frame LPM).
+// The transport plugs in onDataFrame to credit HTTP/2 flow control
+// per DATA frame, mirroring http2_client.handleData's decoupling of
+// connection flow control from message reassembly.
+//
+// streamID is the H2 stream id from the DATA frame header; size is
+// the on-wire payload length (h2fh.Length) — this includes any
+// padding bytes for PADDED frames because the bytes WERE charged
+// against the peer's window on the wire even though the codec will
+// later strip them.
+func (h *hpackDecoderHolder) notifyDataFrameConsumed(streamID uint32, size uint32) {
+	if h.onDataFrame != nil && size > 0 {
+		h.onDataFrame(streamID, size)
+	}
 }
 
 // removeLpmAccumulator drops the accumulator for stream sid (called on
@@ -1003,6 +1041,14 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// where the per-stream HEADERS state is tracked.
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 		case H2FrameDATA:
+			// Credit HTTP/2 flow control for the on-wire DATA bytes
+			// at frame-receipt time, decoupled from LPM reassembly.
+			// Mirrors http2_client.handleData. The bytes have already
+			// been committed from the ring above; we credit BEFORE
+			// branching into LPM accumulator / ZC paths so that
+			// multi-DATA-frame LPMs don't starve the producer of
+			// window updates while we buffer partial bytes.
+			holder.notifyDataFrameConsumed(h2fh.StreamID, h2fh.Length)
 			// RFC 7540 §6.1: PADDED DATA carries a 1-byte pad-length
 			// prefix and trailing padding. Strip both before LPM parse.
 			// gRPC peers don't normally pad, but a standards-compliant
@@ -1359,6 +1405,23 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 
 		case H2FrameDATA:
+			// Credit HTTP/2 flow control for the on-wire DATA bytes
+			// at frame-receipt time, decoupled from LPM reassembly.
+			// Mirrors http2_client.handleData. The bytes have not been
+			// committed from the ring yet at this point (the various
+			// sub-paths below commit lazily), but the peer charged
+			// their send window the moment they wrote the DATA frame
+			// to the wire so we MUST credit it back ASAP — otherwise a
+			// multi-DATA-frame LPM whose total size exceeds the
+			// peer's per-stream window deadlocks (peer waits for
+			// WINDOW_UPDATE; codec waits for the rest of the LPM
+			// before it would have surfaced handleMessage which is
+			// where the legacy per-LPM credit happened).
+			//
+			// h2fh.Length is the on-wire payload size including any
+			// PADDED bytes; we credit the full on-wire size because
+			// that is what was charged against the peer's window.
+			holder.notifyDataFrameConsumed(h2fh.StreamID, h2fh.Length)
 			// PADDED with Length=0 is illegal: the mandatory 1-byte
 			// pad-length prefix can't fit. Per RFC 7540 §6.1
 			// FRAME_SIZE_ERROR. Check this BEFORE the empty-DATA
