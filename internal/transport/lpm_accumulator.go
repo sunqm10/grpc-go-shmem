@@ -129,19 +129,21 @@ func (a *lpmAccumulator) feed(data []byte, maxBody int) (msg []byte, leftover []
 		//     bytes): cap = 8 KiB, only what was received-or-headroom
 		//     can be allocated. The 256 KiB DoS-bound asserted by
 		//     TestH2LPM_NoPreallocOversized is preserved.
-		//   * Large-body fast path: if data carries ≥
-		//     largeFirstChunkHint body bytes AND expectedTotal is
-		//     larger, allocate the full expectedTotal up-front. See
-		//     feedSplit's matching comment for the rationale and DoS
-		//     argument.
+		//     largeFirstChunkMultiplier × first-chunk body bytes is
+		//     used as the pre-alloc hint: a 16 KiB first chunk grants
+		//     1 MiB up-front (matches a typical fair-default 1 MiB
+		//     LPM where MAX_FRAME_SIZE limits each DATA frame to
+		//     16 KiB), while a 1 KiB DoS chunk only grants 64 KiB,
+		//     well under the 256 KiB bound asserted by
+		//     TestH2LPM_NoPreallocOversized.
 		const initialBufHint = 8 * 1024
-		const largeFirstChunkHint = 1 * 1024 * 1024 // 1 MiB
+		const largeFirstChunkMultiplier = 64
 		initialCap := initialBufHint
 		if 5+len(data) > initialCap {
 			initialCap = 5 + len(data)
 		}
-		if len(data) >= largeFirstChunkHint && a.expectedTotal > initialCap {
-			initialCap = a.expectedTotal
+		if hint := largeFirstChunkMultiplier * len(data); hint > initialCap {
+			initialCap = hint
 		}
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
@@ -274,34 +276,28 @@ func (a *lpmAccumulator) feedSplit(pFirst, pSecond []byte, maxBody int) (msg, le
 		// appended. Bytes after header consumption represent body
 		// only, so we add 5 explicitly here.
 		//
-		// Large-body fast path: if the first chunk carries ≥
-		// largeFirstChunkHint body bytes AND the declared
-		// expectedTotal is also large, allocate the full expectedTotal
-		// up-front. This skips the cascade of doubling-realloc work
-		// (16 MiB → 32 MiB → 64 MiB → ... copying every time) on
-		// the receive side of multi-frame messages, which the CPU
-		// profile shows as the dominant cost for ≥16 MiB unary
-		// throughput.
-		//
-		// DoS safety: this only fires when the peer has ALREADY
-		// committed to sending ≥1 MiB of body bytes in the first
-		// chunk. A peer attacking with a tiny chunk (e.g., 1 KiB)
+		// Large-body fast path: scale the pre-alloc cap by the
+		// first-chunk body size (64× multiplier, clamped to
+		// expectedTotal). This skips the cascade of doubling-realloc
+		// work (16 KiB → 32 KiB → … copying every time) on the
+		// receive side of multi-frame messages, which the CPU
+		// profile of fair-default 1 MiB streaming shows as the
+		// dominant cost (lpmAccumulator.growBufForChunk ~13% of
+		// total). A peer attacking with a tiny chunk (e.g., 1 KiB)
 		// against a huge declared body length still hits the small-
-		// allocation path and is bounded by Fix #2's
-		// "received-so-far + 8 KiB" cap. maxBody (caller-supplied,
-		// typically 511 MiB) is the absolute hard ceiling on
-		// expectedTotal so the upfront alloc cannot exceed it.
+		// allocation path and is bounded by Fix #2's "received-so-
+		// far + 8 KiB" cap. maxBody (caller-supplied, typically
+		// 511 MiB) is the absolute hard ceiling on expectedTotal so
+		// the upfront alloc cannot exceed it.
 		bodyBytes := len(pFirst) + len(pSecond)
 		const initialBufHint = 8 * 1024
-		const largeFirstChunkHint = 1 * 1024 * 1024 // 1 MiB
+		const largeFirstChunkMultiplier = 64
 		initialCap := initialBufHint
 		if 5+bodyBytes > initialCap {
 			initialCap = 5 + bodyBytes
 		}
-		if bodyBytes >= largeFirstChunkHint && a.expectedTotal > initialCap {
-			// Peer is sending real data; trust expectedTotal up to
-			// the maxBody ceiling already enforced above.
-			initialCap = a.expectedTotal
+		if hint := largeFirstChunkMultiplier * bodyBytes; hint > initialCap {
+			initialCap = hint
 		}
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
