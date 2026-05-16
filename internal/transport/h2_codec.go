@@ -199,7 +199,7 @@ func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
 		h.lastAcc = a
 		return a
 	}
-	a := &lpmAccumulator{}
+	a := &lpmAccumulator{pool: mem.DefaultBufferPool()}
 	h.lpmAccumulators[sid] = a
 	h.lastSid = sid
 	h.lastAcc = a
@@ -1330,15 +1330,16 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					msgFlags = 0
 					holder.removeLpmAccumulator(sid)
 				}
-				// acc.buf is already a heap-owned slice of the exact
-				// LPM size; wrap directly via mem.NewBuffer(&msg, nil)
-				// (no-op Free) instead of pool.Get + memcpy.
+				// acc.buf is the exact LPM size, allocated from acc.pool;
+				// wrap via mem.NewBuffer(&msg, acc.pool) so Buffer.Free()
+				// returns the slice to the pool for reuse on the next RPC,
+				// avoiding the runtime.memclr cost of a fresh make().
 				return FrameHeader{
 					Type:     FrameTypeMESSAGE,
 					StreamID: sid,
 					Length:   uint32(len(msg)),
 					Flags:    msgFlags,
-				}, mem.NewBuffer(&msg, nil), nil
+				}, mem.NewBuffer(&msg, acc.pool), nil
 			}
 			// Truncated LPM at end of stream: connection-fatal.
 			if endStream && len(leftover) == 0 && acc.inProgress() {
@@ -1575,8 +1576,10 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//     in the same DATA frame).
 				//
 				// Both paths return the accumulator's heap buffer wrapped
-				// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
-				// one further mem.Copy that the prior code performed.
+				// via mem.NewBuffer(&msg, acc.pool); the wrapping pool is
+				// the same one acc.buf was allocated from, so Buffer.Free()
+				// returns the slice to the pool for reuse on the next RPC
+				// and avoids the runtime.memclr cost of a fresh make().
 				if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
 					// Mid-chain chunk: route through growBufForChunk to
 					// pick up the explicit 2× doubling rather than Go's
@@ -1620,7 +1623,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 			} // end isPadded fast-path skip
 
@@ -1665,7 +1668,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 				if h2fh.Flags&H2FlagEndStream != 0 && acc.inProgress() {
 					return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
@@ -1713,7 +1716,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 				break
 			}

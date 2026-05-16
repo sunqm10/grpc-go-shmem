@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	"google.golang.org/grpc/mem"
 )
 
 // lpmAccumulator reassembles a single in-progress gRPC length-prefixed
@@ -60,6 +62,21 @@ type lpmAccumulator struct {
 	expectedTotal   int     // 5 + body length, set once header complete
 	pos             int     // bytes written into buf (includes 5-byte header)
 	buf             []byte  // accumulated frame, len == pos, cap >= expectedTotal
+
+	// pool, when non-nil, is the source of buf allocations. Each
+	// emitted message takes its backing slice from this pool;
+	// downstream callers re-wrap the slice via mem.NewBuffer(&msg,
+	// pool) so that Buffer.Free() returns the slice to the pool
+	// instead of dropping it on the GC. Reusing the same slice across
+	// RPCs eliminates the runtime.mallocgcLarge + runtime.memclr cost
+	// that profiling showed as the dominant overhead under
+	// fair-default streaming once growBufForChunk was handled.
+	//
+	// The accumulator never auto-pools allocations from the standard
+	// allocator: a nil pool keeps the legacy GC-managed behaviour
+	// (used by unit tests and the H2 codec read paths that don't
+	// pass through SHM).
+	pool mem.BufferPool
 }
 
 // inProgress reports whether the accumulator is mid-message.
@@ -148,7 +165,7 @@ func (a *lpmAccumulator) feed(data []byte, maxBody int) (msg []byte, leftover []
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
 		}
-		a.buf = make([]byte, 0, initialCap)
+		a.buf = a.allocBuf(initialCap)
 		a.buf = append(a.buf, a.headerBuf[:]...)
 		a.pos = 5
 	}
@@ -215,9 +232,36 @@ func (a *lpmAccumulator) growBufForChunk(need int) {
 		// No grow needed (caller already checked, but be safe).
 		return
 	}
-	newBuf := make([]byte, len(a.buf), newCap)
+	newBuf := a.allocBuf(newCap)[:len(a.buf)]
 	copy(newBuf, a.buf)
+	a.releaseBuf(a.buf)
 	a.buf = newBuf
+}
+
+// allocBuf returns a slice with len=0 cap>=size. When a.pool is set,
+// the slice is taken from the pool (avoiding the runtime.memclr that
+// `make([]byte, 0, size)` would perform on a fresh allocation). The
+// returned slice's cap may exceed size since the binary-tiered pool
+// rounds up to the next power of two; callers MUST honour cap when
+// computing further allocations.
+func (a *lpmAccumulator) allocBuf(size int) []byte {
+	if a.pool == nil {
+		return make([]byte, 0, size)
+	}
+	buf := a.pool.Get(size)
+	// pool returns *[]byte; len may be ≥ size depending on rounding.
+	return (*buf)[:0:cap(*buf)]
+}
+
+// releaseBuf returns a slice to a.pool. No-op when pool is nil or
+// when the slice was never pool-rooted (cap < pool's minimum tier).
+// The pool tolerates either case via its sizedBufferPool fallback.
+func (a *lpmAccumulator) releaseBuf(buf []byte) {
+	if a.pool == nil || cap(buf) == 0 {
+		return
+	}
+	b := buf[:0]
+	a.pool.Put(&b)
 }
 
 // feedSplit is the two-slice analogue of feed: it consumes data from
@@ -302,7 +346,7 @@ func (a *lpmAccumulator) feedSplit(pFirst, pSecond []byte, maxBody int) (msg, le
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
 		}
-		a.buf = make([]byte, 0, initialCap)
+		a.buf = a.allocBuf(initialCap)
 		a.buf = append(a.buf, a.headerBuf[:]...)
 		a.pos = 5
 	}
