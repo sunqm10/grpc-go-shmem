@@ -397,6 +397,7 @@ func benchStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int)
 
 	b.SetBytes(int64(size))
 	b.ResetTimer()
+	endCPU := startCPUProbe(b)
 
 	for i := 0; i < b.N; i++ {
 		if err := stream.Send(req); err != nil {
@@ -407,6 +408,7 @@ func benchStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int)
 		}
 	}
 	b.StopTimer()
+	endCPU()
 
 	// Close the stream cleanly so the next benchmark size starts fresh.
 	_ = stream.CloseSend()
@@ -431,12 +433,15 @@ func benchUnary(b *testing.B, client testgrpc.BenchmarkServiceClient, size int) 
 
 	b.SetBytes(int64(size))
 	b.ResetTimer()
+	endCPU := startCPUProbe(b)
 
 	for i := 0; i < b.N; i++ {
 		if _, err := client.UnaryCall(ctx, req); err != nil {
 			b.Fatalf("UnaryCall: %v", err)
 		}
 	}
+	b.StopTimer()
+	endCPU()
 }
 
 // Standard payload sizes (64 B to 1 MiB).
