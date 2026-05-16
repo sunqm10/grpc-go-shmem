@@ -267,6 +267,17 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 	if opts.KeepaliveParams != (keepalive.ClientParameters{}) {
 		dialOpts.KeepaliveParams = opts.KeepaliveParams
 	}
+	// Propagate flow-control window overrides from gRPC dial options
+	// (grpc.WithInitialWindowSize / WithInitialConnWindowSize). These
+	// reach us through ConnectOptions; we just forward them. With the
+	// default zero values the SHM transport keeps its 2 GiB quota
+	// (flow control disabled, ring buffer is backpressure).
+	if opts.InitialWindowSize > 0 {
+		dialOpts.InitialWindowSize = opts.InitialWindowSize
+	}
+	if opts.InitialConnWindowSize > 0 {
+		dialOpts.InitialConnWindowSize = opts.InitialConnWindowSize
+	}
 
 	// Use connect context timeout if available
 	if deadline, ok := connectCtx.Deadline(); ok {

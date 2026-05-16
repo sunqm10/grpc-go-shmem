@@ -112,6 +112,15 @@ type ShmClientTransport struct {
 	bdpEst            *shmBDPEstimator
 	initialWindowSize int32
 
+	// initialStreamWindow is the per-stream send-quota value applied
+	// to each new stream's streamSendQuota at NewStream time. When 0
+	// (default), the transport uses maxWindowSize (~2 GiB) i.e. flow
+	// control disabled — production behavior. When set non-zero by
+	// DialShm reading opts.InitialWindowSize, the producer-side
+	// chunked write path (acquireUpToSendQuota) actually enforces
+	// the window.
+	initialStreamWindow int64
+
 	// WindowUpdate batching: accumulate deltas and flush when threshold exceeded.
 	pendingConnWU   uint32            // accumulated connection-level WindowUpdate delta
 	pendingStreamWU map[uint32]uint32 // accumulated per-stream WindowUpdate deltas
@@ -960,6 +969,9 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 		}
 		s.Stream.buf.init()
 		s.fc = inFlow{limit: uint32(maxWindowSize)}
+		if t.initialStreamWindow > 0 && t.initialStreamWindow < int64(maxWindowSize) {
+			s.fc = inFlow{limit: uint32(t.initialStreamWindow)}
+		}
 		s.readRequester = s
 
 		// Set up transport reader for this stream
@@ -982,7 +994,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 			t.cachedStream.Store(nil)
 		}
 		t.sendQuotaMu.Lock()
-		t.streamSendQuota[streamID] = int64(maxWindowSize)
+		streamWindow := int64(maxWindowSize)
+		if t.initialStreamWindow > 0 {
+			streamWindow = t.initialStreamWindow
+		}
+		t.streamSendQuota[streamID] = streamWindow
 		t.sendQuotaMu.Unlock()
 		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
