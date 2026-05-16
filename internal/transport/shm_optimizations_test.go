@@ -245,7 +245,7 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 	}
 
 	// Now send a large delta that pushes past the threshold.
-	ct.sendWindowUpdate(0, shmWindowUpdateThreshold)
+	ct.sendWindowUpdate(0, uint32(shmWindowUpdateThreshold))
 
 	ct.sendQuotaMu.Lock()
 	pendingAfter := ct.pendingConnWU
@@ -449,7 +449,7 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 	}
 	defer ct.Close(nil)
 
-	if ct.initialWindowSize != shmInitialWindowSize {
+	if ct.initialWindowSize != int32(shmInitialWindowSize) {
 		t.Errorf("client initialWindowSize = %d, want %d", ct.initialWindowSize, shmInitialWindowSize)
 	}
 
@@ -459,7 +459,7 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 	}
 	defer st.Close(nil)
 
-	if st.initialWindowSize != shmInitialWindowSize {
+	if st.initialWindowSize != int32(shmInitialWindowSize) {
 		t.Errorf("server initialWindowSize = %d, want %d", st.initialWindowSize, shmInitialWindowSize)
 	}
 }

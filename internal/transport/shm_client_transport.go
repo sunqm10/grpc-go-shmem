@@ -229,7 +229,7 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	t.sendQuotaMu.Lock()
 	if streamID == 0 {
 		t.pendingConnWU += delta
-		if t.pendingConnWU < shmWindowUpdateThreshold {
+		if t.pendingConnWU < uint32(shmWindowUpdateThreshold) {
 			t.sendQuotaMu.Unlock()
 			return
 		}
@@ -237,7 +237,7 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 		t.pendingConnWU = 0
 	} else {
 		t.pendingStreamWU[streamID] += delta
-		if t.pendingStreamWU[streamID] < shmWindowUpdateThreshold {
+		if t.pendingStreamWU[streamID] < uint32(shmWindowUpdateThreshold) {
 			t.sendQuotaMu.Unlock()
 			return
 		}
@@ -361,7 +361,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// Initialize BDP estimation for dynamic flow control (RFC A73 Phase 5).
 	// SHM uses a much larger initial window (32MB) than HTTP/2 (64KB) because
 	// local memory has near-zero RTT and high bandwidth.
-	t.initialWindowSize = shmInitialWindowSize
+	t.initialWindowSize = int32(shmInitialWindowSize)
 	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
 
 	max := segment.H.MaxStreams()

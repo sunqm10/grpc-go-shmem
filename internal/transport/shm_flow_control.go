@@ -57,23 +57,85 @@ import (
 	"time"
 )
 
-// SHM-specific flow control constants.
-// Unlike HTTP/2 over TCP, shared memory is local with near-zero RTT, so we use
-// much larger initial windows to avoid stalling on WindowUpdate round-trips.
-const (
-	// shmInitialWindowSize is the initial per-stream flow control window for
-	// the shared memory transport. Set to 32 MB to allow large local RPCs
-	// without waiting for BDP ramp-up.
-	shmInitialWindowSize = 32 * 1024 * 1024 // 32 MB
+// SHM-specific flow control. Unlike HTTP/2 over TCP, shared memory is
+// local with near-zero RTT, so production tunes the per-stream window
+// much higher than the 65535-byte HTTP/2 default to avoid WindowUpdate
+// round-trips during bulk streaming.
+//
+// The size knobs below are package-level `var`s rather than `const`s
+// so benchmark / test code can switch the SHM transport into a fair-
+// comparison profile (matching the HTTP/2 default window used by the
+// in-tree TCP and Unix-socket benchmarks). Production code MUST NOT
+// mutate these from the data plane — the transport reads them once
+// at construction (for `initialWindowSize` and the conn / stream
+// quota initial values) and on every WindowUpdate emission (for the
+// batching threshold). Use ConfigureShmFlowControlForBench from test
+// setup BEFORE any transport is dialed or listened.
+var (
+	// shmInitialWindowSize is the initial per-stream flow-control
+	// window the SHM BDP estimator starts from. Default 32 MiB allows
+	// large local RPCs without waiting for BDP ramp-up.
+	shmInitialWindowSize = 32 * 1024 * 1024
 
-	// shmBDPLimit is the maximum BDP window size for SHM. This is 4x the
-	// HTTP/2 limit (16 MB) because local memory bandwidth is much higher.
-	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
-
-	// shmWindowUpdateThreshold is the minimum accumulated bytes before a
-	// WindowUpdate frame is sent. Batching reduces frame write overhead.
-	shmWindowUpdateThreshold = shmInitialWindowSize / 4 // 8 MB
+	// shmWindowUpdateThreshold is the minimum accumulated bytes
+	// before a WindowUpdate frame is sent. Batching reduces frame
+	// write overhead. Default is shmInitialWindowSize/4 = 8 MiB.
+	// ConfigureShmFlowControlForBench keeps the relationship sane:
+	// if the threshold ever exceeded the effective window the sender
+	// would deadlock (the consumer can never accumulate enough to
+	// trigger a WindowUpdate before the producer exhausts the window).
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4
 )
+
+const (
+	// shmBDPLimit is the maximum BDP window size for SHM. 4× HTTP/2's
+	// limit (16 MiB) because local memory bandwidth is much higher.
+	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
+)
+
+// ConfigureShmFlowControlForBench overrides shmInitialWindowSize and
+// shmWindowUpdateThreshold consistently. Intended for benchmark and
+// regression-test code that wants to exercise the SHM transport under
+// HTTP/2-default (65535 B) or other window sizes — both to compare
+// SHM against TCP / UDS on equal footing and to drive the transport
+// into code paths (multi-DATA-frame LPM under flow control) that are
+// hidden by the SHM-tuned 32 MiB default.
+//
+// MUST be called BEFORE any ShmClientTransport or ShmServerTransport
+// is constructed. The values are captured once at construction. NOT
+// safe to call from the data plane.
+//
+// initialWindow values below 4 KiB are clamped to 4 KiB so the
+// WindowUpdate threshold never collapses to zero (which would cause
+// every byte received to emit a window-update frame).
+func ConfigureShmFlowControlForBench(initialWindow int) {
+	if initialWindow < 4*1024 {
+		initialWindow = 4 * 1024
+	}
+	shmInitialWindowSize = initialWindow
+	// Threshold = window / 4, with a 1 KiB floor (so we don't pay
+	// WindowUpdate overhead per-byte under tiny windows) and a
+	// window/2 ceiling (so the sender can always refill at least
+	// once before exhausting the window).
+	threshold := initialWindow / 4
+	if threshold < 1024 {
+		threshold = 1024
+	}
+	if threshold >= initialWindow {
+		threshold = initialWindow / 2
+	}
+	shmWindowUpdateThreshold = threshold
+}
+
+// ResetShmFlowControlForBench restores the SHM flow-control knobs to
+// their production defaults (32 MiB window, 8 MiB threshold). Tests
+// and benchmarks that call ConfigureShmFlowControlForBench should
+// `defer` this so subsequent tests in the same `go test` invocation
+// don't inherit the override.
+func ResetShmFlowControlForBench() {
+	shmInitialWindowSize = 32 * 1024 * 1024
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4
+}
 
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
 // memory transport. It uses the same exponential moving average algorithm as
