@@ -23,8 +23,32 @@ import (
 	"errors"
 	"fmt"
 
+	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/mem"
 )
+
+// shmLpmPool backs lpmAccumulator.buf allocations across all SHM
+// transports. Buffers are pooled by power-of-two size and explicitly
+// NOT zeroed on Get — the accumulator immediately overwrites every
+// returned slice with received DATA-frame bytes before the slice is
+// handed to the gRPC layer, so the runtime.memclrNoHeapPointers cost
+// that the default DefaultBufferPool() pays on every Get is pure
+// waste here. Profiling fair-default 1 MiB streaming after the
+// pre-alloc + cross-RPC pooling fixes showed memclr at ~20% of total
+// CPU; switching to a dirty pool eliminates it.
+//
+// Size tiers match mem.DefaultBufferPool: 256 B, 4 KiB, 16 KiB,
+// 32 KiB, 1 MiB. Requests above 1 MiB fall back to the dirty simple
+// pool which does sync.Pool reuse without the size-bucketing.
+var shmLpmPool = func() mem.BufferPool {
+	p, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
+	if err != nil {
+		// Argument list is hardcoded above; failure here implies a
+		// programming error in imem itself.
+		panic(fmt.Sprintf("shmLpmPool: NewDirtyBinaryTieredBufferPool failed: %v", err))
+	}
+	return p
+}()
 
 // lpmAccumulator reassembles a single in-progress gRPC length-prefixed
 // message (LPM) across multiple HTTP/2 DATA frames. HTTP/2 DATA frames

@@ -1531,7 +1531,18 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.write: chunked write, got %d / %d on first acquire", got, payloadLen)
 	}
-	buf := make([]byte, 0, payloadLen)
+	// Materialise hdr + data into one contiguous slice so we can hand
+	// payload[off:end] to enqueueAndWait without re-indexing across
+	// the hdr / segment boundary. Take it from shmLpmPool (the same
+	// dirty pool the receive-side accumulator uses) — a fresh
+	// make([]byte, 0, payloadLen) here triggers a runtime.memclr of
+	// the full payload size on every RPC, which profiling showed at
+	// ~20% of total CPU for a 1 MiB write under fair-default. The
+	// slice is dirty, but we immediately overwrite every byte with
+	// hdr+data via append below, so the zero is pure waste.
+	bufPtr := shmLpmPool.Get(payloadLen)
+	buf := (*bufPtr)[:0:cap(*bufPtr)]
+	defer shmLpmPool.Put(bufPtr)
 	buf = append(buf, hdr...)
 	for _, b := range data {
 		buf = append(buf, b.ReadOnlyData()...)

@@ -199,7 +199,7 @@ func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
 		h.lastAcc = a
 		return a
 	}
-	a := &lpmAccumulator{pool: mem.DefaultBufferPool()}
+	a := &lpmAccumulator{pool: shmLpmPool}
 	h.lpmAccumulators[sid] = a
 	h.lastSid = sid
 	h.lastAcc = a
