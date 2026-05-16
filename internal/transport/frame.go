@@ -416,10 +416,13 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	}
 	// Vectored fast path for MESSAGE frames: writes hdr + segments
 	// directly into the ring reservation when the body fits in a
-	// single H2 DATA frame.
+	// single H2 DATA frame. Use shmMaxFrameSize (the configurable
+	// per-DATA-frame ceiling) instead of h2MaxFramePayload (the RFC
+	// absolute limit) so a fair-comparison bench profile that sets
+	// max frame to 16384 actually chunks here too.
 	if fh.Type == FrameTypeMESSAGE {
 		bodyLen := len(hdr) + dataLen
-		if bodyLen <= h2MaxFramePayload && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
+		if bodyLen <= shmMaxFrameSize && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
 			return writeFrameH2Message(ctx, tx, fh.StreamID, fh.Flags, hdr, payload)
 		}
 	}

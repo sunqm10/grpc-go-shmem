@@ -1934,11 +1934,13 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 		h2payload = payload
 	}
 
-	// MESSAGE payloads are split into multiple DATA frames in two cases:
+	// MESSAGE payloads are split into multiple DATA frames in three cases:
 	//
-	//  (1) Protocol limit: the payload exceeds the 16 MiB-1 maximum H2
-	//      frame size (mandatory for compliance with peers honoring
-	//      SETTINGS_MAX_FRAME_SIZE).
+	//  (1) Protocol limit: the payload exceeds shmMaxFrameSize. By
+	//      default this equals h2MaxFramePayload (RFC ceiling); under
+	//      a fair-comparison bench profile that matches HTTP/2's
+	//      spec default of 16384 B, this knob is what makes SHM emit
+	//      the same DATA frame cadence as TCP / UDS.
 	//
 	//  (2) Ring capacity: the payload plus the 9-byte H2 header doesn't
 	//      fit in the ring's reserve-write budget. ReserveWrite rejects
@@ -1948,7 +1950,7 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 	//      well-formed and must be transported incrementally. The
 	//      reader's lpmAccumulator reassembles the chunks.
 	if fh.Type == FrameTypeMESSAGE &&
-		(len(h2payload) > h2MaxFramePayload ||
+		(len(h2payload) > shmMaxFrameSize ||
 			uint64(h2FrameHeaderSize+len(h2payload)) > tx.Capacity()) {
 		return writeFrameH2DataChunked(ctx, tx, fh.StreamID, h2payload, h2f)
 	}
@@ -2008,12 +2010,17 @@ func writeH2Single(ctx context.Context, tx *ShmRing, h2t H2FrameType, h2f byte, 
 // lpmAccumulator reassembles the LPM stream; END_STREAM is never set on
 // these intermediate frames (gRPC ends the stream via TRAILERS).
 //
-// Chunk size is bounded by both h2MaxFramePayload (RFC 7540 §4.2) and
-// the ring capacity / 4 — the latter ensures the writer can always
-// place the next chunk while the reader is still consuming the
-// previous, avoiding stall under back-pressure.
+// Chunk size is bounded by all three of: shmMaxFrameSize (the
+// configurable per-DATA-frame ceiling, default h2MaxFramePayload),
+// h2MaxFramePayload (RFC 7540 §4.2 absolute limit) and the ring
+// capacity / 4 — the latter ensures the writer can always place the
+// next chunk while the reader is still consuming the previous,
+// avoiding stall under back-pressure.
 func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, body []byte, baseFlags byte) error {
-	maxChunk := h2MaxFramePayload
+	maxChunk := shmMaxFrameSize
+	if maxChunk > h2MaxFramePayload {
+		maxChunk = h2MaxFramePayload
+	}
 	if uint64(maxChunk) > tx.Capacity()/4 {
 		maxChunk = int(tx.Capacity() / 4)
 	}
@@ -2189,6 +2196,15 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	}
 	if uint64(total) > h2MaxFramePayload+h2FrameHeaderSize {
 		// Single H2 DATA frame can't carry more than 16MB-1 of body.
+		return false, nil
+	}
+	// Honour the configurable shmMaxFrameSize too — under a fair-
+	// comparison bench profile that sets max frame to 16384, ZC
+	// would otherwise emit one giant DATA frame while the codec
+	// chunking path emits 16 KiB frames; return false so the
+	// caller falls back to writeFrameBuffers which respects the
+	// knob via writeFrameH2DataChunked.
+	if total > h2FrameHeaderSize+shmMaxFrameSize {
 		return false, nil
 	}
 	// Non-blocking contiguous-space check.

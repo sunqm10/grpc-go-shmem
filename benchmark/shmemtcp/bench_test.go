@@ -121,6 +121,14 @@ type benchProfile struct {
 	// initialConnWindowSize: same, for the connection-level window.
 	initialConnWindowSize int32
 
+	// maxFrameSize, when > 0, caps the body of each H2 DATA frame
+	// the SHM producer emits. HTTP/2 over TCP / UDS in grpc-go uses
+	// the spec default 16384 (= http2MaxFrameLen). Matching it on
+	// SHM ensures all three transports emit the same DATA-frame
+	// cadence under fair profiles. The receiver always accepts up
+	// to the RFC ceiling regardless.
+	maxFrameSize int
+
 	// applyToShm is false when the profile wants SHM to stay on its
 	// native 2 GiB quota even when overriding TCP / UDS (i.e. the
 	// "shm-tuned" profile). True for fair-* profiles.
@@ -133,13 +141,18 @@ func loadBenchProfile() benchProfile {
 		return benchProfile{
 			initialWindowSize:     65535,
 			initialConnWindowSize: 65535,
+			maxFrameSize:          16384,
 			applyToShm:            true,
 		}
 	case "fair-32mb":
 		return benchProfile{
 			initialWindowSize:     32 * 1024 * 1024,
 			initialConnWindowSize: 32 * 1024 * 1024,
-			applyToShm:            true,
+			// 32 MiB profile leaves frame size at the SHM default
+			// (h2MaxFramePayload) so DATA frames are large enough to
+			// amortise per-frame overhead. The reviewer-requested
+			// strict fairness is covered by fair-default.
+			applyToShm: true,
 		}
 	case "", "shm-tuned":
 		return benchProfile{}
@@ -194,6 +207,9 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	// cleanups below so subsequent tests don't inherit the override.
 	if profile.applyToShm && profile.initialWindowSize > 0 {
 		transport.ConfigureShmFlowControlForBench(int(profile.initialWindowSize))
+	}
+	if profile.applyToShm && profile.maxFrameSize > 0 {
+		transport.ConfigureShmMaxFrameSizeForBench(profile.maxFrameSize)
 	}
 	name := fmt.Sprintf("bench_grpc_shm_%d", time.Now().UnixNano())
 	lis, err := transport.NewShmListener(

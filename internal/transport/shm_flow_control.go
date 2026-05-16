@@ -85,6 +85,16 @@ var (
 	// would deadlock (the consumer can never accumulate enough to
 	// trigger a WindowUpdate before the producer exhausts the window).
 	shmWindowUpdateThreshold = shmInitialWindowSize / 4
+
+	// shmMaxFrameSize bounds the body of a single H2 DATA frame the
+	// producer emits. Defaults to the RFC 7540 ceiling (16 MiB - 1)
+	// because SHM is local and per-frame overhead is negligible.
+	// HTTP/2 over TCP / UDS in this codebase uses the HTTP/2 spec
+	// default of 16384 bytes; bench code can match it via
+	// ConfigureShmFlowControlForBench so SHM and TCP / UDS emit the
+	// same number of DATA frames per write. The receiver always
+	// accepts up to the RFC ceiling regardless of this knob.
+	shmMaxFrameSize = h2MaxFramePayload
 )
 
 const (
@@ -127,14 +137,34 @@ func ConfigureShmFlowControlForBench(initialWindow int) {
 	shmWindowUpdateThreshold = threshold
 }
 
+// ConfigureShmMaxFrameSizeForBench overrides shmMaxFrameSize so the SHM
+// producer chunks H2 DATA frames at the given body size, matching the
+// HTTP/2 spec default of 16384 used by TCP / UDS in this codebase
+// when run under a fair-comparison bench profile. Values are clamped
+// to the RFC range [2^14, 2^24-1].
+//
+// MUST be called BEFORE any ShmClientTransport or ShmServerTransport
+// is constructed. Reset via ResetShmFlowControlForBench.
+func ConfigureShmMaxFrameSizeForBench(maxFrame int) {
+	const minFrame = 1 << 14 // RFC 7540 §6.5.2 SETTINGS_MAX_FRAME_SIZE lower bound
+	if maxFrame < minFrame {
+		maxFrame = minFrame
+	}
+	if maxFrame > h2MaxFramePayload {
+		maxFrame = h2MaxFramePayload
+	}
+	shmMaxFrameSize = maxFrame
+}
+
 // ResetShmFlowControlForBench restores the SHM flow-control knobs to
-// their production defaults (32 MiB window, 8 MiB threshold). Tests
-// and benchmarks that call ConfigureShmFlowControlForBench should
-// `defer` this so subsequent tests in the same `go test` invocation
-// don't inherit the override.
+// their production defaults (32 MiB window, 8 MiB threshold, RFC max
+// frame size). Tests and benchmarks that call ConfigureShmFlowControlForBench
+// or ConfigureShmMaxFrameSizeForBench should `defer` this so subsequent
+// tests in the same `go test` invocation don't inherit the override.
 func ResetShmFlowControlForBench() {
 	shmInitialWindowSize = 32 * 1024 * 1024
 	shmWindowUpdateThreshold = shmInitialWindowSize / 4
+	shmMaxFrameSize = h2MaxFramePayload
 }
 
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
