@@ -286,7 +286,7 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	// Create a real stream.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Cleanup"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Cleanup"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -818,7 +818,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 
 	// Create first stream → cache should be set.
 	ctx := context.Background()
-	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"})
+	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 1: %v", err)
 	}
@@ -827,7 +827,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 	}
 
 	// Create second stream → cache should be nil.
-	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"})
+	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}

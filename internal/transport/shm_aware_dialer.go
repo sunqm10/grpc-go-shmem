@@ -256,7 +256,7 @@ func MustUseShmForAddress(addr resolver.Address, cfg *ShmServiceConfig) bool {
 //   - onClose: Callback invoked when transport is closed
 //
 // Returns the ClientTransport or an error if connection fails.
-func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
+func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayInfo)) (ClientTransport, error) {
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
 		return nil, fmt.Errorf("shm: no segment name available for address %q", addr.Addr)

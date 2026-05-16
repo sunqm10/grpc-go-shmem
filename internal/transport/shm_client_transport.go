@@ -39,6 +39,7 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -139,7 +140,7 @@ type ShmClientTransport struct {
 	// onClose is a callback invoked when the transport is closed.
 	// This is used by ClientConn/addrConn to track connectivity state.
 	// RFC A73: Required for proper subchannel lifecycle management.
-	onClose func(GoAwayReason)
+	onClose func(GoAwayInfo)
 
 	// authInfo stores the authentication information from security handshake.
 	authInfo credentials.AuthInfo
@@ -384,7 +385,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // SetOnClose sets the callback to be invoked when the transport is closed.
 // RFC A73: This integrates with gRPC's ClientConn connectivity state management.
-func (t *ShmClientTransport) SetOnClose(f func(GoAwayReason)) {
+func (t *ShmClientTransport) SetOnClose(f func(GoAwayInfo)) {
 	t.onClose = f
 }
 
@@ -788,7 +789,7 @@ func (t *ShmClientTransport) Close(err error) {
 		// RFC A73: Invoke onClose callback to notify ClientConn of transport closure.
 		// This allows the addrConn to update connectivity state properly.
 		if t.onClose != nil {
-			t.onClose(t.goAwayReason)
+			t.onClose(GoAwayInfo{Reason: t.goAwayReason})
 		}
 	})
 }
@@ -828,7 +829,7 @@ func (t *ShmClientTransport) GracefulClose() {
 }
 
 // NewStream creates a Stream for an RPC.
-func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
+func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error) {
 	if t.closed.Load() || t.draining.Load() {
 		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
@@ -886,10 +887,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 				sendCompress:   callHdr.SendCompress,
 				contentSubtype: callHdr.ContentSubtype,
 			},
-			ct:         t, // Set the client transport (now an interface, no unsafe needed)
-			done:       make(chan struct{}),
-			headerChan: make(chan struct{}),
-			doneFunc:   callHdr.DoneFunc,
+			ct:           t, // Set the client transport (now an interface, no unsafe needed)
+			done:         make(chan struct{}),
+			headerChan:   make(chan struct{}),
+			doneFunc:     callHdr.DoneFunc,
+			statsHandler: handler,
 		}
 		s.Stream.buf.init()
 		s.fc = inFlow{limit: uint32(maxWindowSize)}
