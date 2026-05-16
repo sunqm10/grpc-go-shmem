@@ -469,23 +469,53 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShmSpinConstants(t *testing.T) {
-	// Verify spin parameters are tuned for SHM (higher than Folly defaults).
-	// Values are platform-specific: Windows uses higher values due to
-	// costlier WaitOnAddress/cgocall (~40µs), Linux uses lower values.
-	if spinIterationsDefault < 100 {
-		t.Errorf("spinIterationsDefault = %d, should be >= 100 for SHM", spinIterationsDefault)
+	// Default behaviour is no spin (loadShmSpin* all 0). Verify that
+	// ConfigureShmSpinIterations correctly applies bounded values and
+	// that ResetShmSpinIterationsForBench restores the no-spin
+	// default. The platform-specific spinIterationsLimit caps the
+	// upper bound an operator can ask for.
+	defer ResetShmSpinIterationsForBench()
+
+	// Default state: no spin.
+	if got := loadShmSpinDefault(); got != 0 {
+		t.Errorf("default shmSpinDefault = %d, want 0", got)
 	}
-	if spinIterationsMin < 10 {
-		t.Errorf("spinIterationsMin = %d, should be >= 10 for SHM", spinIterationsMin)
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("default shmSpinMax = %d, want 0", got)
 	}
-	if spinIterationsMax < 2000 {
-		t.Errorf("spinIterationsMax = %d, should be >= 2000 for SHM", spinIterationsMax)
+	if got := loadShmSpinMin(); got != 0 {
+		t.Errorf("default shmSpinMin = %d, want 0", got)
 	}
-	if spinIterationsMin >= spinIterationsDefault {
-		t.Error("spinIterationsMin should be < spinIterationsDefault")
+
+	// Operator opts in.
+	ConfigureShmSpinIterations(2000)
+	if got, want := loadShmSpinMax(), uint32(2000); got != want {
+		t.Errorf("after Configure(2000): shmSpinMax = %d, want %d", got, want)
 	}
-	if spinIterationsDefault >= spinIterationsMax {
-		t.Error("spinIterationsDefault should be < spinIterationsMax")
+	if got, want := loadShmSpinDefault(), uint32(2000); got != want {
+		t.Errorf("after Configure(2000): shmSpinDefault = %d, want %d (optimistic start at max)", got, want)
+	}
+	if got := loadShmSpinMin(); got != 0 {
+		t.Errorf("after Configure(2000): shmSpinMin = %d, want 0 (floor)", got)
+	}
+
+	// Clamping above platform limit.
+	ConfigureShmSpinIterations(spinIterationsLimit * 10)
+	if got, want := loadShmSpinMax(), uint32(spinIterationsLimit); got != want {
+		t.Errorf("clamp: shmSpinMax = %d, want %d (platform limit)", got, want)
+	}
+
+	// Negative input is clamped to 0.
+	ConfigureShmSpinIterations(-1)
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("Configure(-1): shmSpinMax = %d, want 0", got)
+	}
+
+	// Reset restores defaults.
+	ConfigureShmSpinIterations(1000)
+	ResetShmSpinIterationsForBench()
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("after Reset: shmSpinMax = %d, want 0", got)
 	}
 }
 

@@ -43,6 +43,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -211,6 +212,19 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	if profile.applyToShm && profile.maxFrameSize > 0 {
 		transport.ConfigureShmMaxFrameSizeForBench(profile.maxFrameSize)
 	}
+	// SHM_SPIN_ITERS lets reviewers compare SHM under "no spin" (the
+	// default — matches UDS behaviour by paying a futex syscall per
+	// wake) vs operator-tuned "spin opted-in" (skips both sides'
+	// syscalls when the spin window catches the data). 0 disables
+	// spin. Typical opt-in values: 500–2000 on Linux. See
+	// transport.ConfigureShmSpinIterations GoDoc for guidance.
+	if v := os.Getenv("SHM_SPIN_ITERS"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 0 {
+			b.Fatalf("SHM_SPIN_ITERS=%q invalid: %v", v, perr)
+		}
+		transport.ConfigureShmSpinIterations(n)
+	}
 	name := fmt.Sprintf("bench_grpc_shm_%d", time.Now().UnixNano())
 	lis, err := transport.NewShmListener(
 		&transport.ShmAddr{Name: name},
@@ -258,6 +272,7 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 			// envs in the same `go test` invocation don't inherit
 			// this profile's overrides. No-op if we didn't override.
 			transport.ResetShmFlowControlForBench,
+			transport.ResetShmSpinIterationsForBench,
 		},
 	}
 }

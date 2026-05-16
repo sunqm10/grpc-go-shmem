@@ -569,8 +569,8 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 		dataOff:         uintptr(ringView.offset + RingHeaderSize),
 		mem:             mem,
 		capacity:        capacity, // Store actual capacity separately
-		dataSpinCutoff:  spinIterationsDefault,
-		spaceSpinCutoff: spinIterationsDefault,
+		dataSpinCutoff:  loadShmSpinDefault(),
+		spaceSpinCutoff: loadShmSpinDefault(),
 	}
 	// Initialize read commit context with back-pointer (reads are single-threaded)
 	r.readCommit.ring = r
@@ -820,9 +820,9 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					// Space available! Update adaptive cutoff
 					if spin > 0 {
-						target := min(spinIterationsMax, spin*2)
+						target := min(loadShmSpinMax(), spin*2)
 						newCutoff := (7*spinLimit + target) / 8
-						atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+						atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 					}
 					spaceAvailable = true
 					break
@@ -836,8 +836,8 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				continue
 			}
 			// Phase 2: Spin failed, reduce cutoff and fall back to futex
-			newCutoff := (7*spinLimit + spinIterationsMin) / 8
-			atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+			newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+			atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
@@ -865,9 +865,9 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			readIdx = hdr.ReadIndex()
 			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				if spin > 0 {
-					target := min(spinIterationsMax, spin*2)
+					target := min(loadShmSpinMax(), spin*2)
 					newCutoff := (7*spinLimit + target) / 8
-					atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+					atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 				}
 				spaceAvailable = true
 				break
@@ -881,8 +881,8 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			continue
 		}
 		// Phase 2: Spin failed, fall back to futex
-		newCutoff := (7*spinLimit + spinIterationsMin) / 8
-		atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+		newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+		atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 		hdr.IncContigWaiters()
 		exp := hdr.ContigSequence()
@@ -1007,9 +1007,9 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 					// Data arrived! Update adaptive cutoff (success = spin faster next time)
 					if spin > 0 {
 						// Exponential moving average: new = (7*old + target) / 8
-						target := min(spinIterationsMax, spin*2)
+						target := min(loadShmSpinMax(), spin*2)
 						newCutoff := (7*spinLimit + target) / 8
-						atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+						atomic.StoreUint32(&r.dataSpinCutoff, max(loadShmSpinMin(), newCutoff))
 					}
 					break // Exit spin loop; outer loop will read data
 				}
@@ -1024,8 +1024,8 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 			// Phase 2: Spin didn't succeed, fall back to futex
 			// Reduce spin cutoff (timeout = spin less next time)
-			newCutoff := (7*spinLimit + spinIterationsMin) / 8
-			atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+			newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+			atomic.StoreUint32(&r.dataSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 			hdr.IncDataWaiters()
 			dataSeq := hdr.DataSequence()
@@ -1717,9 +1717,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			if avail >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward
-				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
-				if newCutoff > spinIterationsMax {
-					newCutoff = spinIterationsMax
+				newCutoff := (7*spinCutoff + loadShmSpinMax()) / 8
+				if newCutoff > loadShmSpinMax() {
+					newCutoff = loadShmSpinMax()
 				}
 				atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 				break
@@ -1729,9 +1729,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			continue // Loop back to reserve space
 		}
 		// Spin timed out - adapt cutoff downward
-		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
-		if newCutoff < spinIterationsMin {
-			newCutoff = spinIterationsMin
+		newCutoff := (7*spinCutoff + loadShmSpinMin()) / 8
+		if newCutoff < loadShmSpinMin() {
+			newCutoff = loadShmSpinMin()
 		}
 		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 
@@ -1946,9 +1946,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			if writeIdx-pendingIdx >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward (exponential moving average)
-				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
-				if newCutoff > spinIterationsMax {
-					newCutoff = spinIterationsMax
+				newCutoff := (7*spinCutoff + loadShmSpinMax()) / 8
+				if newCutoff > loadShmSpinMax() {
+					newCutoff = loadShmSpinMax()
 				}
 				atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
 				break
@@ -1958,9 +1958,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			continue // Loop back to return data
 		}
 		// Spin timed out - adapt cutoff downward
-		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
-		if newCutoff < spinIterationsMin {
-			newCutoff = spinIterationsMin
+		newCutoff := (7*spinCutoff + loadShmSpinMin()) / 8
+		if newCutoff < loadShmSpinMin() {
+			newCutoff = loadShmSpinMin()
 		}
 		atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
 

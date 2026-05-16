@@ -20,43 +20,28 @@
 
 package transport
 
-// Linux spin-wait constants. The reader spins for up to dataSpinCutoff
-// iterations of runtime_procyield(1) (≈7ns each) before incrementing the
-// waiter count and calling futex(WAIT). If data arrives within the spin
-// window, the wait is skipped entirely — and so is the corresponding
-// futex(WAKE) on the writer side (it observes waiters == 0 and elides
-// the syscall). For ping-pong RPCs this is the single biggest latency
-// knob: every wake we skip saves ~30–80 µs of OS-thread reschedule
-// overhead (futex syscall + runtime.startm + cache reload), which the
-// CPU profile of BenchmarkGRPCShmStream/size=64 attributes ~46 % of
-// total time to.
+// Linux spin-wait UPPER bounds. The actual spin behaviour is controlled
+// by ConfigureShmSpinIterations (or the dial / server option that wraps
+// it) — the constants below cap how aggressive an operator can ask
+// the implementation to be on Linux.
 //
-// The values below are tuned for HW where runtime_procyield(1) costs
-// ~7 ns and one full futex wake/wait round-trip costs ~25–50 µs.
-// The adaptive logic in ring.go grows the per-ring cutoff toward
-// spinIterationsMax on successful spins and shrinks toward
-// spinIterationsMin on misses; the floor must stay high enough that
-// a ping-pong workload (where every wait misses the spin window once)
-// doesn't collapse to a level too low to ever catch the next round.
+// The DEFAULT spin behaviour is *no spin*. Reviewer (Doug) flagged that
+// busy-spinning costs CPU that UDS / TCP don't incur, and the project's
+// own anti-busy-wait rule (copilot-instructions) says spinning should
+// not tie up a CPU. Operators that want sub-µs latency for hot streams
+// must explicitly call ConfigureShmSpinIterations(n) (or pass the
+// matching dial / server option) to trade CPU for latency.
+//
+// Why this cap is ~225 µs (not lower): empirically the gap between
+// "writer commits" and "reader sees data" in this codebase's full
+// gRPC stack — even on a quiescent dedicated core — is on the order of
+// 30–100 µs (covers the handler dispatch, gRPC framework overhead,
+// goroutine scheduling, and ring memory ordering). A spin cap below
+// that range almost never catches the data and devolves to "pay
+// spin cost AND futex cost". The cap is well below scheduler quantum
+// (~10 ms) so a runnable peer is never starved.
 const (
-	// spinIterationsDefault: starting cutoff for a fresh ring.
-	// ~28 µs covers a same-process write→signalData→wake path on
-	// a quiescent CPU and matches the typical inter-frame gap of
-	// small-to-medium streaming workloads.
-	spinIterationsDefault = 4000
-
-	// spinIterationsMin: adaptive floor. ~14 µs — keeps the floor
-	// high enough that an alternating ping-pong workload still
-	// catches occasional fast responses without a futex round-trip.
-	// Below ~5 µs (700 iters) the reader essentially never wins
-	// the race and pays both the spin cost AND the futex cost.
-	spinIterationsMin = 2000
-
-	// spinIterationsMax: cap for sustained throughput workloads.
-	// ~225 µs — large enough to absorb the full handler+send path
-	// of a small-message ping-pong (typical 30–150 µs on a busy
-	// box) and trade a fraction of a core's CPU for elimination
-	// of one of the four wake-ups per iteration. Far below the
-	// scheduler quantum so a runnable peer never gets starved.
-	spinIterationsMax = 32000
+	// spinIterationsLimit caps the maximum value the adaptive spin
+	// cutoff can be configured to on Linux. ~225 µs at 7 ns/PAUSE.
+	spinIterationsLimit = 32000
 )
