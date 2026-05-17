@@ -27,6 +27,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -806,6 +807,9 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	if flags&MessageFlagMORE == 0 {
 		s.write(recvMsg{err: io.EOF})
 	}
+	// Co-locate the handler G on this M (see ShmClientTransport
+	// processIncomingData for the wakep-avoidance rationale).
+	runtime.Gosched()
 }
 
 // handleMessageBuffer mirrors handleMessage but transfers ownership of the
@@ -854,6 +858,8 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	if flags&MessageFlagMORE == 0 {
 		s.write(recvMsg{err: io.EOF})
 	}
+	// Co-locate the handler G on this M.
+	runtime.Gosched()
 }
 
 // handlePing processes a PING frame, sends PONG, and enforces keepalive policy.

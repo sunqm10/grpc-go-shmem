@@ -27,6 +27,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -709,6 +710,17 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				buf := mem.Copy(payload, mem.DefaultBufferPool())
 				stream.write(recvMsg{buffer: buf})
 			}
+			// Yield to the app goroutine that was just goready'd by the channel
+			// send. The recvBuffer's channel put places the receiver G on the
+			// current P's local runq head; without a Gosched the runtime's
+			// wakep then tries to find an idle M on another P to run the
+			// woken G in parallel — which costs a futex syscall on Linux.
+			// For ping-pong RPCs the parallelism is illusory (the reader has
+			// nothing else to do until the server replies, which itself waits
+			// on the app's next Send), so co-locating the two Gs on this M
+			// strictly wins. The runtime.Gosched is a cooperative yield, not
+			// a spin: it costs no CPU when no other G is runnable.
+			runtime.Gosched()
 			if shmDebugEnabled {
 				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
 			}
