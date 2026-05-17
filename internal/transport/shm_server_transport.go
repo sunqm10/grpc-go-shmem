@@ -164,9 +164,15 @@ func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 	})
 }
 
+// notifyQuotaChangeLocked wakes ONE waiter (if any is parked) so it
+// can recheck its quota condition. Successful acquirers chain-wake
+// the next parker via the same signal at their return point. See
+// the matching method on ShmClientTransport for full design notes.
 func (t *ShmServerTransport) notifyQuotaChangeLocked() {
-	close(t.quotaSignal)
-	t.quotaSignal = make(chan struct{})
+	select {
+	case t.quotaSignal <- struct{}{}:
+	default:
+	}
 }
 
 func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
@@ -203,6 +209,11 @@ func (t *ShmServerTransport) acquireSendQuota(ctx context.Context, streamID uint
 		if connOK && streamOK {
 			t.connSendQuota -= int64(n)
 			t.streamSendQuota[streamID] -= int64(n)
+			// Chain-wake: see notifyQuotaChangeLocked.
+			select {
+			case t.quotaSignal <- struct{}{}:
+			default:
+			}
 			t.sendQuotaMu.Unlock()
 			return nil
 		}
@@ -365,7 +376,7 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		streamInFlow:    make(map[uint32]*inFlow),
 		pendingStreamWU: make(map[uint32]uint32),
 		errCh:           make(chan struct{}),
-		quotaSignal:     make(chan struct{}),
+		quotaSignal:     make(chan struct{}, 1),
 		done:            make(chan struct{}),
 		keepaliveDone:   make(chan struct{}),
 	}

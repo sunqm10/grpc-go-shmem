@@ -174,9 +174,27 @@ func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
 	})
 }
 
+// notifyQuotaChangeLocked wakes ONE waiter (if any is parked) so it
+// can recheck its quota condition. Successful acquirers chain-wake
+// the next parker via the same signal at their return point, so a
+// single WindowUpdate cascades through all satisfiable waiters.
+//
+// quotaSignal is a buffered-1 channel: a notify while no waiter is
+// parked just buffers; the next acquirer consumes it and proceeds.
+// A notify while the buffer is already full drops, which is fine
+// because the prior pending notify is sufficient to wake one parker
+// (and they chain-wake the next).
+//
+// This replaces the previous close-and-recreate broadcast pattern,
+// which woke EVERY parker on every WindowUpdate. At N=1000
+// concurrent streams with the fair-default 64 KiB HTTP/2 connection
+// window, the broadcast caused a thundering herd that burned ~22%
+// of CPU in runtime.futex (verified by pprof).
 func (t *ShmClientTransport) notifyQuotaChangeLocked() {
-	close(t.quotaSignal)
-	t.quotaSignal = make(chan struct{})
+	select {
+	case t.quotaSignal <- struct{}{}:
+	default:
+	}
 }
 
 func (t *ShmClientTransport) addSendQuota(streamID uint32, delta uint32) {
@@ -213,6 +231,12 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 		if connOK && streamOK {
 			t.connSendQuota -= int64(n)
 			t.streamSendQuota[streamID] -= int64(n)
+			// Chain-wake: signal one more parker so cascading WUs reach
+			// every satisfiable waiter without thundering herd.
+			select {
+			case t.quotaSignal <- struct{}{}:
+			default:
+			}
 			t.sendQuotaMu.Unlock()
 			return nil
 		}
@@ -278,6 +302,11 @@ func (t *ShmClientTransport) acquireUpToSendQuota(ctx context.Context, streamID 
 			}
 			t.connSendQuota -= grant
 			t.streamSendQuota[streamID] -= grant
+			// Chain-wake: see notifyQuotaChangeLocked.
+			select {
+			case t.quotaSignal <- struct{}{}:
+			default:
+			}
 			t.sendQuotaMu.Unlock()
 			return int(grant), nil
 		}
