@@ -1255,6 +1255,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	streamQ, hasStreamQ := t.streamSendQuota[s.id]
 	if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
 		t.sendQuotaMu.Unlock()
+		atomic.AddUint64(&shmZCWriteSkipQuota, 1)
 		return false, nil
 	}
 	t.sendQuotaMu.Unlock()
@@ -1279,6 +1280,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	}
 	if !t.frameWriter.inlineMu.TryLock() {
 		t.frameWriter.closeMu.RUnlock()
+		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 		t.sendQuotaMu.Lock()
 		t.connSendQuota += int64(quotaSize)
 		if _, ok := t.streamSendQuota[s.id]; ok {

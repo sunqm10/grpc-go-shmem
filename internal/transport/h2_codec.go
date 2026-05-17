@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
@@ -1324,6 +1325,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				holder.pendingFrameEndStream = endStream
 			}
 			if msg != nil {
+				atomic.AddUint64(&shmAccReadFire, 1)
 				// MORE flag: see readFrameH2's matching block.
 				msgFlags := MessageFlagMORE
 				if endStream && len(leftover) == 0 {
@@ -1477,6 +1479,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
 					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
+						atomic.AddUint64(&shmZCReadFire, 1)
 						// Arm the ZC anchor with the post-frame target, then
 						// don't call commitPayload.Commit — the deferred
 						// target already accounts for these bytes.
@@ -1531,6 +1534,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					}
 					bodyLen := int(binary.BigEndian.Uint32(hdr[1:5]))
 					if 5+bodyLen == payloadLen {
+						atomic.AddUint64(&shmCopyReadFire, 1)
 						var buf mem.Buffer
 						if len(pSecond) == 0 {
 							buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
@@ -1654,6 +1658,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
+					atomic.AddUint64(&shmAccReadFire, 1)
 					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
@@ -1702,6 +1707,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
+					atomic.AddUint64(&shmAccReadFire, 1)
 					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
@@ -2020,6 +2026,7 @@ func writeH2Single(ctx context.Context, tx *ShmRing, h2t H2FrameType, h2f byte, 
 // next chunk while the reader is still consuming the previous,
 // avoiding stall under back-pressure.
 func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, body []byte, baseFlags byte) error {
+	atomic.AddUint64(&shmChunkedWriteFire, 1)
 	maxChunk := shmMaxFrameSize
 	if maxChunk > h2MaxFramePayload {
 		maxChunk = h2MaxFramePayload
@@ -2080,6 +2087,7 @@ func writeFrameH2Message(
 	lpmHdr []byte,
 	data mem.BufferSlice,
 ) error {
+	atomic.AddUint64(&shmVectoredWriteFire, 1)
 	bodyLen := len(lpmHdr) + data.Len()
 	total := h2FrameHeaderSize + bodyLen
 
@@ -2206,10 +2214,12 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	// Skip ZC for messages that won't fit in a single frame.
 	// cap/3 budget keeps headroom for the chunking-path writer.
 	if uint64(total) > tx.Capacity()/3 {
+		atomic.AddUint64(&shmZCWriteSkipBudget, 1)
 		return false, nil
 	}
 	if uint64(total) > h2MaxFramePayload+h2FrameHeaderSize {
 		// Single H2 DATA frame can't carry more than 16MB-1 of body.
+		atomic.AddUint64(&shmZCWriteSkipBudget, 1)
 		return false, nil
 	}
 	// Honour the configurable shmMaxFrameSize too — under a fair-
@@ -2219,10 +2229,12 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	// caller falls back to writeFrameBuffers which respects the
 	// knob via writeFrameH2DataChunked.
 	if total > h2FrameHeaderSize+shmMaxFrameSize {
+		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
 		return false, nil
 	}
 	// Non-blocking contiguous-space check.
 	if tx.ContiguousWriteSpace() < uint64(total) {
+		atomic.AddUint64(&shmZCWriteSkipSpace, 1)
 		return false, nil
 	}
 
@@ -2268,5 +2280,6 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 		return false, fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
 	}
 
+	atomic.AddUint64(&shmZCWriteFire, 1)
 	return true, res.Commit(total)
 }

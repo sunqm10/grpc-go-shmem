@@ -1343,6 +1343,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	streamQ, hasStreamQ := t.streamSendQuota[s.id]
 	if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
 		t.sendQuotaMu.Unlock()
+		atomic.AddUint64(&shmZCWriteSkipQuota, 1)
 		return false, nil
 	}
 	t.sendQuotaMu.Unlock()
@@ -1385,6 +1386,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	}
 	if !t.frameWriter.inlineMu.TryLock() {
 		t.frameWriter.closeMu.RUnlock()
+		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 		// Writer goroutine is busy — release quota and let caller fall back
 		// to the standard write path (which goes through enqueueAndWait).
 		t.sendQuotaMu.Lock()
