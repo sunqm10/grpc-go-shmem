@@ -119,6 +119,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
 	ctlTx.SetSegmentID(ctlSeg.Path)
 	ctlRx.SetSegmentID(ctlSeg.Path)
+	ctlSeg.RegisterRing(ctlTx)
+	ctlSeg.RegisterRing(ctlRx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
 	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
@@ -182,6 +184,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			rxRing := NewShmRingFromSegment(segment.B, segment.Mem)
 			txRing.SetSegmentID(segment.Path)
 			rxRing.SetSegmentID(segment.Path)
+			segment.RegisterRing(txRing)
+			segment.RegisterRing(rxRing)
 
 			// Open events for rings (Windows)
 			txEvents, _ := OpenRingEvents(segName, "A")

@@ -331,6 +331,8 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// SetSegmentID for rationale.
 	clientToServer.SetSegmentID(segment.Path)
 	serverToClient.SetSegmentID(segment.Path)
+	segment.RegisterRing(clientToServer)
+	segment.RegisterRing(serverToClient)
 
 	// Create events for cross-mapping synchronization (Windows).
 	// Server creates events. On Linux, these are no-ops returning nil events.

@@ -21,6 +21,7 @@ package transport
 import (
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -560,6 +561,18 @@ type Segment struct {
 	Path string    // File path
 
 	closed atomic.Bool
+
+	// rings tracks ShmRing structs that wrap this segment's mmap.
+	// Segment.Close() walks this list and sets each ring's local
+	// closed flag BEFORE unmapping memory, so a reader / writer
+	// returning from a wake call observes localClosed=1 and skips
+	// the header access that would otherwise touch unmapped memory.
+	//
+	// Registered via Segment.RegisterRing; safe for concurrent
+	// append (registration happens during transport construction,
+	// before any goroutine is touching the ring).
+	ringsMu sync.Mutex
+	rings   []*ShmRing
 }
 
 // hdrView provides typed access to the segment header via pointer arithmetic
@@ -573,10 +586,58 @@ type ringView struct {
 	offset  uint64         // Offset to the ring header within the segment
 }
 
+// RegisterRing records r as wrapping this segment's mmap. On
+// Segment.Close, every registered ring has its local closed flag
+// set BEFORE the segment is unmapped, so any reader / writer
+// returning from a wake call observes r.closed=1 and skips the
+// header access that would otherwise touch unmapped memory.
+//
+// Idempotent; safe to call from transport / dialer / listener
+// construction paths regardless of how many of them happen to wrap
+// the same segment.
+func (s *Segment) RegisterRing(r *ShmRing) {
+	if r == nil || s == nil {
+		return
+	}
+	s.ringsMu.Lock()
+	for _, existing := range s.rings {
+		if existing == r {
+			s.ringsMu.Unlock()
+			return
+		}
+	}
+	s.rings = append(s.rings, r)
+	s.ringsMu.Unlock()
+}
+
 // Close unmaps the memory and closes the file
 func (s *Segment) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+
+	// Set the local closed flag on every Ring that wraps this segment
+	// BEFORE unmapping. Readers / writers parked in waitForData /
+	// waitForSpace re-check `r.closed` after wake and skip any
+	// further header access if set, avoiding use-after-unmap when
+	// the segment tears down with a wait outstanding.
+	s.ringsMu.Lock()
+	for _, r := range s.rings {
+		atomic.StoreUint32(&r.closed, 1)
+	}
+	registered := s.rings
+	s.rings = nil
+	s.ringsMu.Unlock()
+
+	// Wake any waiters so they return from waitFor* and observe the
+	// localClosed flag set above. Use the abstracted wake APIs so the
+	// inproc-wake path (Go channels) and the futex / events path both
+	// drain correctly.
+	for _, r := range registered {
+		hdr := r.header()
+		r.signalData(&hdr.dataSeq)
+		r.signalSpace(&hdr.spaceSeq)
+		r.signalContig(&hdr.contigSeq)
 	}
 
 	// Release any same-process wake channels registered against this

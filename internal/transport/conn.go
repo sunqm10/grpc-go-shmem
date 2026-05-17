@@ -64,6 +64,8 @@ func NewServerConn(seg *Segment) *ShmConn {
 	writeR := NewShmRingFromSegment(seg.B, seg.Mem)
 	readR.SetSegmentID(seg.Path)
 	writeR.SetSegmentID(seg.Path)
+	seg.RegisterRing(readR)
+	seg.RegisterRing(writeR)
 
 	// Create events for cross-mapping synchronization (Windows).
 	// Server creates events. On Linux, these are no-ops.
@@ -95,6 +97,8 @@ func NewClientConn(seg *Segment) *ShmConn {
 	writeR := NewShmRingFromSegment(seg.A, seg.Mem)
 	readR.SetSegmentID(seg.Path)
 	writeR.SetSegmentID(seg.Path)
+	seg.RegisterRing(readR)
+	seg.RegisterRing(writeR)
 
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens existing events created by server.

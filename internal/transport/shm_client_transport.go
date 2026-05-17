@@ -399,6 +399,8 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// addresses, so vaddr-keying fails.
 	clientToServer.SetSegmentID(segment.Path)
 	serverToClient.SetSegmentID(segment.Path)
+	segment.RegisterRing(clientToServer)
+	segment.RegisterRing(serverToClient)
 
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by the server. On Linux, these are no-ops.
