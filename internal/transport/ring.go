@@ -681,9 +681,9 @@ func (r *ShmRing) DebugState() RingState {
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) error {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		return getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wait(ctx, timeout)
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
 	}
 	if r.events != nil {
 		return r.events.WaitData(addr, val, timeout)
@@ -698,9 +698,9 @@ func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) e
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) error {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		return getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wait(ctx, timeout)
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
 	}
 	if r.events != nil {
 		return r.events.WaitSpace(addr, val, timeout)
@@ -715,9 +715,9 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		return getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wait(ctx, timeout)
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
 	}
 	if r.events != nil {
 		return r.events.WaitContig(addr, val, timeout)
@@ -732,8 +732,10 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalData(addr *uint32) {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wake()
-		return
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
 	}
 	if r.events != nil {
 		r.events.SignalData()
@@ -746,8 +748,10 @@ func (r *ShmRing) signalData(addr *uint32) {
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalSpace(addr *uint32) {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wake()
-		return
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
 	}
 	if r.events != nil {
 		r.events.SignalSpace()
@@ -760,8 +764,10 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalContig(addr *uint32) {
 	if shmInprocWakeEnabled && r.segmentID != "" {
-		getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr).Wake()
-		return
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
 	}
 	if r.events != nil {
 		r.events.SignalContig()

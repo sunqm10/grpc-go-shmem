@@ -65,11 +65,13 @@ func startZCProbe(b *testing.B) func() {
 		return func() {}
 	}
 	before := transport.LoadShmPathCounters()
+	beforeWake := transport.LoadShmInprocWakeCounters()
 	return func() {
 		if b.N <= 0 {
 			return
 		}
 		delta := transport.LoadShmPathCounters().Sub(before)
+		wakeDelta := transport.LoadShmInprocWakeCounters().Sub(beforeWake)
 		n := float64(b.N)
 		report := func(name string, v uint64) {
 			if v == 0 {
@@ -88,5 +90,12 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-read/op", delta.ZCReadFire)
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
+		// In-proc wake diagnostics (zero on Windows / when
+		// SHM_INPROC_WAKE != 1):
+		report("wake-calls/op", wakeDelta.WakeCallsTotal)
+		report("wake-sys/op", wakeDelta.WakeSyscalls)
+		report("wait-calls/op", wakeDelta.WaitCallsTotal)
+		report("wait-sys/op", wakeDelta.WaitSyscalls)
+		report("wait-ret/op", wakeDelta.WaitSyscallReturned)
 	}
 }
