@@ -160,6 +160,8 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	l.ctlSegment = ctlSeg
 	l.ctlRx = NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+	l.ctlRx.SetSegmentID(ctlSeg.Path)
+	l.ctlTx.SetSegmentID(ctlSeg.Path)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
 	l.ctlRxEvents, _ = CreateRingEvents(ctlEventName, "A")
@@ -235,6 +237,8 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		// when client opens the segment and creates its transport.
 		readRing := NewShmRingFromSegment(segment.A, segment.Mem)
 		writeRing := NewShmRingFromSegment(segment.B, segment.Mem)
+		readRing.SetSegmentID(segment.Path)
+		writeRing.SetSegmentID(segment.Path)
 
 		// Create events for this segment. On Linux, these are no-ops.
 		// Must happen before ACCEPT so client's OpenRingEvents finds them.

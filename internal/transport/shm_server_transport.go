@@ -325,6 +325,13 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
 
+	// Tag both rings with the segment path so the same-process wake
+	// registry (SHM_INPROC_WAKE=1 experimental path) can match
+	// producer / consumer by (segmentID, byte-offset). See ring.go
+	// SetSegmentID for rationale.
+	clientToServer.SetSegmentID(segment.Path)
+	serverToClient.SetSegmentID(segment.Path)
+
 	// Create events for cross-mapping synchronization (Windows).
 	// Server creates events. On Linux, these are no-ops returning nil events.
 	readEvents, _ := CreateRingEvents(segmentName, "A")

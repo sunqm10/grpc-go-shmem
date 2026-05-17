@@ -67,6 +67,8 @@ func NewShmUnaryClient(seg *Segment) *ShmUnaryClient {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.B, seg.Mem)
+	tx.SetSegmentID(seg.Path)
+	rx.SetSegmentID(seg.Path)
 
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by server. On Linux, these are no-ops.

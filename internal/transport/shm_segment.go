@@ -579,6 +579,12 @@ func (s *Segment) Close() error {
 		return nil
 	}
 
+	// Release any same-process wake channels registered against this
+	// segment so subsequent tests / connections don't reuse stale
+	// entries pointing into the about-to-unmap region. No-op on the
+	// futex path (registry is empty).
+	dropInprocWakersForSegment(s.Path)
+
 	var firstErr error
 
 	// IMPORTANT: Do not implicitly close rings here.

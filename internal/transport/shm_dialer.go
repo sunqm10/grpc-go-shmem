@@ -117,6 +117,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+	ctlTx.SetSegmentID(ctlSeg.Path)
+	ctlRx.SetSegmentID(ctlSeg.Path)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
 	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
@@ -178,6 +180,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// Create rings for handshake - client writes to A, reads from B
 			txRing := NewShmRingFromSegment(segment.A, segment.Mem)
 			rxRing := NewShmRingFromSegment(segment.B, segment.Mem)
+			txRing.SetSegmentID(segment.Path)
+			rxRing.SetSegmentID(segment.Path)
 
 			// Open events for rings (Windows)
 			txEvents, _ := OpenRingEvents(segName, "A")

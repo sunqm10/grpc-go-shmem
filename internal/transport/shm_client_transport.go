@@ -391,6 +391,15 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
 
+	// Tag both rings with the segment path so the same-process wake
+	// registry (SHM_INPROC_WAKE=1 experimental path) can match the
+	// producer's signalData with the consumer's waitForData by
+	// (segmentID, byte-offset) instead of by vaddr. Different mmap
+	// calls of the same /dev/shm file return different virtual
+	// addresses, so vaddr-keying fails.
+	clientToServer.SetSegmentID(segment.Path)
+	serverToClient.SetSegmentID(segment.Path)
+
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by the server. On Linux, these are no-ops.
 	writeEvents, _ := OpenRingEvents(segmentName, "A")
