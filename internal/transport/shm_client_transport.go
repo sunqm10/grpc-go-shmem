@@ -868,6 +868,18 @@ func (t *ShmClientTransport) Close(err error) {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
 
+		// Stop the reader goroutine. Under SHM_DATASEG_WAKE the reader
+		// is parked in shmDataSegWaker.WaitForChange (an *os.File.Read
+		// on the eventfd via Go netpoll); ring.Close above set
+		// hdr.Closed but the parker has no way to observe that without
+		// a wake. Closing the eventfd makes Read return EBADF, which
+		// WaitForChange surfaces as ErrRingClosed, and the reader
+		// outer-loop exits. No-op on the per-address eventfd / futex
+		// path (signal* above already woke same-side parkers there).
+		if t.segment != nil {
+			t.segment.UnblockSameSideParkers()
+		}
+
 		t.readerWG.Wait()
 
 		// Close the named events (Windows)

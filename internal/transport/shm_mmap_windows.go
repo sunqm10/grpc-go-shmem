@@ -112,6 +112,10 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.B.SetReadIndex(0)
 	segment.B.SetClosed(false)
 
+	// SHM_DATASEG_WAKE no-op on Windows. Kept for cross-platform
+	// symbol parity.
+	setupDataSegWakeForCreator(segment)
+
 	return segment, nil
 }
 
@@ -166,6 +170,9 @@ func OpenSegment(name string) (*Segment, error) {
 	// SetClientReadyAndSignal() after WaitForServer completes.
 	// This ensures the event exists before we try to signal it.
 	segment.H.SetClientReady(true)
+
+	// SHM_DATASEG_WAKE no-op on Windows.
+	setupDataSegWakeForOpener(segment)
 
 	return segment, nil
 }

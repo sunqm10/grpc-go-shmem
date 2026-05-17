@@ -102,6 +102,15 @@ type ShmRing struct {
 	// outside the SHM_INPROC_WAKE=1 path.
 	segmentID string
 
+	// dataSegWaker is the per-data-segment per-direction eventfd
+	// waker (2 eventfds per segment, 1 read fd held per side per
+	// direction), propagated from the owning Segment at RegisterRing
+	// time. Used by waitFor*/signal* when non-nil; otherwise falls
+	// through to the per-address eventfd registry / Windows events /
+	// Linux futex path. Always nil for control segments and when
+	// SHM_DATASEG_WAKE is off.
+	dataSegWaker *shmDataSegWaker
+
 	// Adaptive spin state for minimizing latency on fast paths.
 	// These are process-local and help tune spin duration based on workload.
 	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
@@ -615,6 +624,16 @@ func (r *ShmRing) SetSegmentID(id string) {
 	r.segmentID = id
 }
 
+// SetDataSegWaker attaches the per-data-segment per-direction
+// eventfd waker (one read fd on this side) to this ring. Called by
+// Segment.RegisterRing, which propagates the segment-level waker to
+// all rings registered against it. Passing nil disables the per-
+// data-segment fast path (callers fall through to the per-address
+// eventfd registry / events / futex).
+func (r *ShmRing) SetDataSegWaker(w *shmDataSegWaker) {
+	r.dataSegWaker = w
+}
+
 // header returns a pointer to the RingHeader in shared memory
 func (r *ShmRing) header() *RingHeader {
 	return (*RingHeader)(unsafe.Pointer(uintptr(unsafe.Pointer(&r.mem[0])) + r.hdrOff))
@@ -680,6 +699,9 @@ func (r *ShmRing) DebugState() RingState {
 // waitForData waits until data is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			return w.Wait(timeout)
@@ -697,6 +719,9 @@ func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) e
 // waitForSpace waits until space is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			return w.Wait(timeout)
@@ -714,6 +739,9 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 // waitForContig waits until contiguous space improves.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			return w.Wait(timeout)
@@ -731,6 +759,19 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 // signalData signals that new data is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalData(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// Also issue a futex_wake on the same address so peers using a
+		// different wake primitive (raw-ring tests that bypass
+		// RegisterRing; cross-process peers until Phase 2 SCM_RIGHTS
+		// passes the eventfds across) still observe the signal. Safe:
+		// futex_wake on an address with no waiters is a cheap kernel
+		// hash lookup (~150 ns) -- negligible against the ~100 us
+		// per-RPC cost. Use the on-Linux primitive directly so the
+		// Windows events path is not double-fired.
+		futexWake(addr, 1)
+		return
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			w.Wake()
@@ -747,6 +788,12 @@ func (r *ShmRing) signalData(addr *uint32) {
 // signalSpace signals that space is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalSpace(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// See signalData for the futex_wake-after-dataSegWaker rationale.
+		futexWake(addr, 1)
+		return
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			w.Wake()
@@ -763,6 +810,12 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 // signalContig signals that contiguous space improved.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalContig(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// See signalData for the futex_wake-after-dataSegWaker rationale.
+		futexWake(addr, 1)
+		return
+	}
 	if shmInprocWakeEnabled && r.segmentID != "" {
 		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
 			w.Wake()

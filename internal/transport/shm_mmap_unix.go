@@ -124,6 +124,11 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		segment.B.SetReadIndex(0)
 		segment.B.SetClosed(false)
 
+		// If SHM_DATASEG_WAKE=1 and this is a non-control segment,
+		// allocate a SOCK_STREAM socketpair and stash one endpoint
+		// for the matching OpenSegment to claim. No-op otherwise.
+		setupDataSegWakeForCreator(segment)
+
 		return segment, nil
 	}
 
@@ -196,6 +201,12 @@ func OpenSegment(name string) (*Segment, error) {
 	// Set client PID and ready flag
 	segment.H.SetClientPID(uint32(os.Getpid()))
 	segment.H.SetClientReady(true)
+
+	// Claim the stashed per-data-segment socketpair endpoint (if
+	// SHM_DATASEG_WAKE=1 and a matching CreateSegment ran in this
+	// process). No-op for control segments / cross-process / when
+	// the wake mode is off.
+	setupDataSegWakeForOpener(segment)
 
 	return segment, nil
 }

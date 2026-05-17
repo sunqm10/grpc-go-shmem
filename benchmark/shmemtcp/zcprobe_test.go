@@ -66,12 +66,14 @@ func startZCProbe(b *testing.B) func() {
 	}
 	before := transport.LoadShmPathCounters()
 	beforeWake := transport.LoadShmInprocWakeCounters()
+	beforeDS := transport.LoadShmDataSegWakeCounters()
 	return func() {
 		if b.N <= 0 {
 			return
 		}
 		delta := transport.LoadShmPathCounters().Sub(before)
 		wakeDelta := transport.LoadShmInprocWakeCounters().Sub(beforeWake)
+		dsDelta := transport.LoadShmDataSegWakeCounters().Sub(beforeDS)
 		n := float64(b.N)
 		report := func(name string, v uint64) {
 			if v == 0 {
@@ -97,5 +99,18 @@ func startZCProbe(b *testing.B) func() {
 		report("wait-calls/op", wakeDelta.WaitCallsTotal)
 		report("wait-sys/op", wakeDelta.WaitSyscalls)
 		report("wait-ret/op", wakeDelta.WaitSyscallReturned)
+		// Per-data-segment socketpair waker diagnostics (zero on
+		// non-Linux / when SHM_DATASEG_WAKE != 1).
+		report("ds-wake/op", dsDelta.WakeCallsTotal)
+		report("ds-wake-sys/op", dsDelta.WakeSyscalls)
+		report("ds-wait/op", dsDelta.WaitCallsTotal)
+		report("ds-wait-sys/op", dsDelta.WaitSyscalls)
+		report("ds-wait-nil/op", dsDelta.WaitReturnNil)
+		report("ds-wait-timeout/op", dsDelta.WaitReturnTimeout)
+		report("ds-wait-closed/op", dsDelta.WaitReturnClosed)
+		report("ds-wait-eof/op", dsDelta.WaitReturnEOF)
+		report("ds-wait-other/op", dsDelta.WaitReturnOther)
+		report("ds-rewake/op", dsDelta.RewakeLocal)
+		report("ds-fanout-bail/op", dsDelta.FanOutBailout)
 	}
 }
