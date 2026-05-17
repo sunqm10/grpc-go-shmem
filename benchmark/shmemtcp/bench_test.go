@@ -44,6 +44,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,6 +83,41 @@ func (e *grpcBenchEnv) close() {
 	for i := len(e.cleanups) - 1; i >= 0; i-- {
 		e.cleanups[i]()
 	}
+}
+
+// logBenchEnvOnce prints the env vars and resolved settings that
+// determine the bench harness's transport configuration. Called from
+// the first newShmEnv / newTCPEnv / newUnixEnv invocation so the
+// chosen profile, wake mode, spin state, and HTTP/2 windows are
+// visible at the top of the bench output. Reviewers (Doug, Mark)
+// can verify spin=0 and HTTP-settings parity from the log without
+// reading the harness source.
+var logBenchEnvOnceOnce sync.Once
+
+func logBenchEnvOnce(b *testing.B) {
+	logBenchEnvOnceOnce.Do(func() {
+		prof := loadBenchProfile()
+		spin := os.Getenv("SHM_SPIN_ITERS")
+		if spin == "" {
+			spin = "0 (default, no spin)"
+		}
+		dsWake := os.Getenv("SHM_DATASEG_WAKE")
+		if dsWake == "" {
+			dsWake = "0 (off)"
+		}
+		inprocWake := os.Getenv("SHM_INPROC_WAKE")
+		if inprocWake == "" {
+			inprocWake = "0 (off, futex fallback)"
+		}
+		bProf := os.Getenv("BENCH_PROFILE")
+		if bProf == "" {
+			bProf = "shm-tuned (SHM keeps 2 GiB quota, TCP/UDS HTTP/2 defaults)"
+		}
+		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
+			bProf, dsWake, inprocWake, spin,
+			prof.initialWindowSize, prof.maxFrameSize, prof.applyToShm,
+		)
+	})
 }
 
 // benchProfile controls HTTP/2 flow-control window sizes applied
@@ -194,6 +230,7 @@ func (p benchProfile) serverOpts(transport string) []grpc.ServerOption {
 // newShmEnv creates a full gRPC server+client over shared memory transport.
 func newShmEnv(b *testing.B) *grpcBenchEnv {
 	profile := loadBenchProfile()
+	logBenchEnvOnce(b)
 	// Apply the bench profile's window size to the SHM-specific
 	// flow-control knobs (shmInitialWindowSize, shmWindowUpdateThreshold)
 	// BEFORE constructing any transport. The dial-option plumbing
@@ -280,6 +317,7 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 // newTCPEnv creates a full gRPC server+client over TCP loopback.
 func newTCPEnv(b *testing.B) *grpcBenchEnv {
 	profile := loadBenchProfile()
+	logBenchEnvOnce(b)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatalf("Listen: %v", err)
@@ -321,6 +359,7 @@ func newTCPEnv(b *testing.B) *grpcBenchEnv {
 // newUnixEnv creates a full gRPC server+client over a Unix domain socket.
 func newUnixEnv(b *testing.B) *grpcBenchEnv {
 	profile := loadBenchProfile()
+	logBenchEnvOnce(b)
 	sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("bench_grpc_%d.sock", time.Now().UnixNano()))
 	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
