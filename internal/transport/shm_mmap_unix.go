@@ -129,6 +129,23 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		// for the matching OpenSegment to claim. No-op otherwise.
 		setupDataSegWakeForCreator(segment)
 
+		// Close the backing file fd: the mmap holds an independent
+		// inode reference, so the mapped region stays valid for the
+		// segment's lifetime. Saves 1 FD/segment (2 FDs/conn over
+		// control + data segments). Path is preserved in segment.Path
+		// for path-based unlink via RemoveSegment / Segment.Close.
+		//
+		// Phase 2 cross-process: SCM_RIGHTS handshake must complete
+		// BEFORE this close. Phase 1 is single-process / handle-by-
+		// path, so the fd is no longer needed after mmap.
+		if err := file.Close(); err != nil {
+			munmapImpl(mem)
+			os.Remove(tryPath)
+			lastErr = fmt.Errorf("close fd after mmap: %w", err)
+			continue
+		}
+		segment.File = nil
+
 		return segment, nil
 	}
 
@@ -207,6 +224,16 @@ func OpenSegment(name string) (*Segment, error) {
 	// process). No-op for control segments / cross-process / when
 	// the wake mode is off.
 	setupDataSegWakeForOpener(segment)
+
+	// Close the backing file fd: the mmap holds an independent
+	// inode reference, so the mapped region stays valid for the
+	// segment's lifetime. Saves 1 FD/segment. See CreateSegment
+	// for the full rationale.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		return nil, fmt.Errorf("close fd after mmap: %w", err)
+	}
+	segment.File = nil
 
 	return segment, nil
 }

@@ -34,30 +34,35 @@ import (
 //
 // Persistent FDs per SHM connection per process, on Linux:
 //
-//   1 × FD  → /dev/shm/grpc_shm_<name>  — the mmap'd segment file.
-//                                         Kept open for resize and
-//                                         unlink-on-close semantics.
-//   0 × eventfd — SHM uses native futex(2) on a uint32 in shared
-//                 memory, not eventfd, so no per-direction FD is
-//                 needed for wake-ups.
-//   0 × extras after mmap; both rings reuse the same mapping.
+//   0 × FD  → /dev/shm/grpc_shm_<name>  — the mmap'd segment file fd
+//                                         is closed immediately after
+//                                         mmap. The kernel keeps the
+//                                         inode alive via the VMA
+//                                         mapping, so the segment
+//                                         remains valid. RemoveSegment
+//                                         uses path-based unlink, no
+//                                         fd needed.
+//   0 × eventfd — by default (futex fallback path). With
+//                 SHM_INPROC_WAKE=1, a small number of eventfds
+//                 (one per (segmentID, address) lazily allocated)
+//                 are used for netpoll-integrated waits. See
+//                 TestShmFDCountEnd2End for live numbers.
 //
-// Total: ONE FD per process per connection (data plane). If a security
-// handshake is established on a separate control segment, that adds ONE
-// more FD, for a total of 2.
+// Total persistent SHM-file FDs per process per connection: ZERO.
 //
 // Compare to:
 //   TCP loopback : 1 socket FD per side
 //   UDS          : 1 socket FD per side
 //
-// So SHM is parity with TCP/UDS for the data plane. Reviewers sizing
-// ulimit -n for N concurrent SHM connections should budget the same FD
-// count as for N TCP connections, plus N if security handshake is used.
+// SHM is now strictly better than TCP/UDS for the data plane FD
+// footprint (zero persistent FDs for the segment files themselves).
+// The wake primitive's FD cost is documented separately by
+// TestShmFDCountEnd2End under different SHM_*_WAKE flag combinations.
 //
 // The reviewer's underlying concern is FD exhaustion under many
 // concurrent shmem connections (e.g. a service-mesh sidecar with
-// thousands of peers). The answer is: same order of magnitude as TCP,
-// modest predictable overhead.
+// thousands of peers). The answer is: better than TCP/UDS for the
+// data path; per-conn wake FDs bounded at 2 (per-direction eventfd).
 func TestShmFDCount(t *testing.T) {
 	before := snapshotProcFDs(t)
 	if before == nil {
@@ -82,10 +87,14 @@ func TestShmFDCount(t *testing.T) {
 		}
 	}
 	t.Logf("Total FDs opened by CreateSegment: %d", len(delta))
-	t.Logf("Of those backed by /dev/shm/grpc_shm_*: %d", shmFDs)
+	t.Logf("Of those backed by /dev/shm/grpc_shm_*: %d (expected 0; fd closed after mmap)", shmFDs)
 
-	if shmFDs != 1 {
-		t.Errorf("expected exactly 1 /dev/shm FD per SHM segment; got %d", shmFDs)
+	// Post-optimisation: CreateSegment closes the backing fd
+	// immediately after mmap. The mapping holds the inode alive, so
+	// the segment remains usable while consuming zero persistent
+	// FDs for the shm file itself.
+	if shmFDs != 0 {
+		t.Errorf("expected 0 /dev/shm FDs per SHM segment (closed after mmap); got %d", shmFDs)
 	}
 
 	if err := seg.Close(); err != nil {
