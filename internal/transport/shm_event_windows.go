@@ -215,14 +215,29 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 // pointer -- including the in-process bench harness where both the
 // listener (Create side) and the dialer (Open side) end up sharing
 // the same *RingEvents via the registry.
+//
+// The decrement-to-zero transition AND the registry deletion both
+// happen under ringEventsMu. This is required because
+// CreateRingEvents / OpenRingEvents bump refCount while holding the
+// same mutex; doing the Add(-1) outside the lock would allow a
+// concurrent Create/Open between the decrement and the lock to
+// resurrect a doomed entry, then we would close its handles out
+// from under the new caller.
 func (e *RingEvents) Close() error {
-	if n := e.refCount.Add(-1); n > 0 {
+	ringEventsMu.Lock()
+	n := e.refCount.Add(-1)
+	if n > 0 {
+		ringEventsMu.Unlock()
 		return nil
 	}
-
-	ringEventsMu.Lock()
-	// Only delete if the registry still points at us; a concurrent
-	// Create/Open after refCount went to zero would have replaced it.
+	if n < 0 {
+		// Double Close on the same reference. Don't underflow further
+		// and don't release handles that may already have been freed
+		// by the first decrement-to-zero caller.
+		e.refCount.Add(1)
+		ringEventsMu.Unlock()
+		return nil
+	}
 	if ringEventsRegistry[e.namePrefix] == e {
 		delete(ringEventsRegistry, e.namePrefix)
 	}

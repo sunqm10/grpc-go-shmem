@@ -461,6 +461,24 @@ func (c *shmConn) Close() error {
 			c.listener.mu.Unlock()
 		}
 
+		// Release the listener-owned ring event refs. These were
+		// taken in ShmListener.Accept (one ref each from
+		// CreateRingEvents). The server transport holds its own,
+		// independent ref pair via NewShmServerTransport and
+		// releases them in (*ShmServerTransport).Close above. On
+		// Linux these are no-op nil events; on Windows skipping
+		// this leaks named-event handles and registry entries per
+		// accepted connection. See shm_event_windows.go for the
+		// refcount contract.
+		if c.readEvents != nil {
+			_ = c.readEvents.Close()
+			c.readEvents = nil
+		}
+		if c.writeEvents != nil {
+			_ = c.writeEvents.Close()
+			c.writeEvents = nil
+		}
+
 		// Then close and clean up the segment
 		if c.segment != nil {
 			c.segment.Close()
