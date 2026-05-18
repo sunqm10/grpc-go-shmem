@@ -84,6 +84,14 @@ var (
 	// materialised heap buffer.
 	shmChunkedWriteFire uint64
 
+	// shmChunkedWriteVecFire: writeFrameH2DataChunkedVec ran —
+	// vectored chunked path that emits H2 DATA frames straight from
+	// (lpmHdr + mem.BufferSlice) without first materialising into a
+	// single contiguous heap buffer. Saves one full producer-side
+	// memcpy per LargeUnary / large MESSAGE relative to the legacy
+	// shmChunkedWriteFire path.
+	shmChunkedWriteVecFire uint64
+
 	// Read-path counters (anchored at readFrameViewH2's three
 	// fast paths — ZC, single-frame copy, slow accumulator).
 
@@ -118,6 +126,7 @@ type ShmPathCounters struct {
 	ZCWriteSkipInlineBusy uint64
 	VectoredWriteFire     uint64
 	ChunkedWriteFire      uint64
+	ChunkedWriteVecFire   uint64
 	ZCReadFire            uint64
 	CopyReadFire          uint64
 	AccReadFire           uint64
@@ -135,6 +144,7 @@ func LoadShmPathCounters() ShmPathCounters {
 		ZCWriteSkipInlineBusy: atomic.LoadUint64(&shmZCWriteSkipInlineBusy),
 		VectoredWriteFire:     atomic.LoadUint64(&shmVectoredWriteFire),
 		ChunkedWriteFire:      atomic.LoadUint64(&shmChunkedWriteFire),
+		ChunkedWriteVecFire:   atomic.LoadUint64(&shmChunkedWriteVecFire),
 		ZCReadFire:            atomic.LoadUint64(&shmZCReadFire),
 		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
 		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
@@ -153,6 +163,7 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		ZCWriteSkipInlineBusy: a.ZCWriteSkipInlineBusy - before.ZCWriteSkipInlineBusy,
 		VectoredWriteFire:     a.VectoredWriteFire - before.VectoredWriteFire,
 		ChunkedWriteFire:      a.ChunkedWriteFire - before.ChunkedWriteFire,
+		ChunkedWriteVecFire:   a.ChunkedWriteVecFire - before.ChunkedWriteVecFire,
 		ZCReadFire:            a.ZCReadFire - before.ZCReadFire,
 		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
 		AccReadFire:           a.AccReadFire - before.AccReadFire,

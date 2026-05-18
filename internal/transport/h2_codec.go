@@ -2067,6 +2067,155 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 	return nil
 }
 
+// writeFrameH2DataChunkedVec is the vectored cousin of
+// writeFrameH2DataChunked. It emits a multi-DATA-frame MESSAGE directly
+// from the (lpmHdr + mem.BufferSlice) inputs without first materialising
+// them into one contiguous heap buffer. Each chunk reserves
+// shmMaxFrameSize+9 bytes in the ring and copies straight from the
+// source segments via ringSegWriter, saving one full producer-side
+// memcpy of body bytes per RPC.
+//
+// Constraints mirror writeFrameH2DataChunked: chunk size capped by
+// shmMaxFrameSize, h2MaxFramePayload, and tx.Capacity()/4. END_STREAM
+// flows only onto the final chunk.
+func writeFrameH2DataChunkedVec(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	lpmHdr []byte,
+	data mem.BufferSlice,
+	baseFlags byte,
+) error {
+	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
+
+	maxChunk := shmMaxFrameSize
+	if maxChunk > h2MaxFramePayload {
+		maxChunk = h2MaxFramePayload
+	}
+	if uint64(maxChunk) > tx.Capacity()/4 {
+		maxChunk = int(tx.Capacity() / 4)
+	}
+	if maxChunk == 0 {
+		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
+	}
+
+	total := len(lpmHdr) + data.Len()
+	// vecCursor walks the (lpmHdr || data segments) virtual byte
+	// stream a chunk at a time without merging into one slice. Each
+	// chunk consumes from the current segment, advancing across
+	// segment boundaries automatically.
+	cur := vecCursor{lpmHdr: lpmHdr, data: data}
+
+	multi := total > maxChunk
+	if multi {
+		tx.BeginBatch()
+		defer tx.EndBatch()
+	}
+
+	for written := 0; written < total; {
+		chunk := total - written
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+		flags := byte(0)
+		if written+chunk == total {
+			flags = baseFlags
+		}
+		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, &cur); err != nil {
+			return err
+		}
+		written += chunk
+	}
+	return nil
+}
+
+// writeH2DataFromCursor reserves one H2 DATA frame's worth of ring
+// bytes and writes the 9-byte header plus `payloadLen` bytes pulled
+// from cur (across segment boundaries as needed). Used by
+// writeFrameH2DataChunkedVec.
+func writeH2DataFromCursor(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	h2flags byte,
+	payloadLen int,
+	cur *vecCursor,
+) error {
+	total := h2FrameHeaderSize + payloadLen
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+	var hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&hdr, H2FrameHeader{
+		Length:   uint32(payloadLen),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	rw := ringSegWriter{first: res.First, second: res.Second}
+	rw.write(hdr[:])
+	if err := cur.writeTo(&rw, payloadLen); err != nil {
+		_ = res.Commit(0)
+		return err
+	}
+	if rw.err != nil {
+		_ = res.Commit(0)
+		return rw.err
+	}
+	return res.Commit(total)
+}
+
+// vecCursor is a forward-only iterator over (lpmHdr || data.segments).
+// It feeds writeFrameH2DataChunkedVec's per-chunk emitter without
+// materialising the virtual stream into one slice. Total bytes consumed
+// must not exceed len(lpmHdr) + data.Len() — callers compute exact
+// chunk sizes up-front.
+type vecCursor struct {
+	lpmHdr []byte // remaining LPM-header bytes; shrinks as consumed
+	data   mem.BufferSlice
+	segOff int // bytes consumed in data[0]
+}
+
+// writeTo copies the next n bytes from the cursor into rw, advancing
+// the cursor across segment boundaries as needed.
+func (c *vecCursor) writeTo(rw *ringSegWriter, n int) error {
+	for n > 0 {
+		if len(c.lpmHdr) > 0 {
+			take := n
+			if take > len(c.lpmHdr) {
+				take = len(c.lpmHdr)
+			}
+			rw.write(c.lpmHdr[:take])
+			c.lpmHdr = c.lpmHdr[take:]
+			n -= take
+			continue
+		}
+		if len(c.data) == 0 {
+			return fmt.Errorf("vecCursor: out of bytes, %d remaining", n)
+		}
+		seg := c.data[0].ReadOnlyData()
+		if c.segOff >= len(seg) {
+			c.data = c.data[1:]
+			c.segOff = 0
+			continue
+		}
+		avail := len(seg) - c.segOff
+		take := n
+		if take > avail {
+			take = avail
+		}
+		rw.write(seg[c.segOff : c.segOff+take])
+		c.segOff += take
+		n -= take
+		if c.segOff == len(seg) {
+			c.data = c.data[1:]
+			c.segOff = 0
+		}
+	}
+	return nil
+}
+
 // writeFrameH2Message writes a single H2 DATA frame for a MESSAGE
 // whose body is composed of a gRPC LPM 5-byte header prefix plus the
 // segments of a mem.BufferSlice. The header, prefix, and each segment

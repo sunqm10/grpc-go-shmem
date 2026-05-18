@@ -84,6 +84,7 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-write/op", delta.ZCWriteFire)
 		report("vec-write/op", delta.VectoredWriteFire)
 		report("chunked-write/op", delta.ChunkedWriteFire)
+		report("chunked-write-vec/op", delta.ChunkedWriteVecFire)
 		report("skip-quota/op", delta.ZCWriteSkipQuota)
 		report("skip-inline/op", delta.ZCWriteSkipInlineBusy)
 		report("skip-frame/op", delta.ZCWriteSkipMaxFrame)
