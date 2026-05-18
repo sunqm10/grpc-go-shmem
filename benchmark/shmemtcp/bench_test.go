@@ -106,7 +106,19 @@ func TestMain(m *testing.M) {
 
 // sweepStaleShmSegments removes leftover grpc_shm_* files from prior
 // bench runs. Errors are ignored: the cleanup is best-effort.
+//
+// Safety: files modified within the last sweepStaleAge are considered
+// "live" and skipped. Without this guard, two bench binaries running
+// concurrently (e.g. the same package from two terminals, or another
+// shm test package in a parallel CI shard) would race: binary B's
+// TestMain on startup could unlink the freshly-created segment of
+// binary A between A's CreateSegment and the peer's OpenSegment,
+// breaking A. Already-mapped segments survive unlink on Linux but the
+// missing inode causes lookups in tests that re-open by name to fail,
+// and on Windows the unlink may itself fail.
 func sweepStaleShmSegments() {
+	const sweepStaleAge = 5 * time.Minute
+	cutoff := time.Now().Add(-sweepStaleAge)
 	dirs := []string{"/dev/shm", os.TempDir()}
 	seen := map[string]bool{}
 	for _, dir := range dirs {
@@ -119,6 +131,13 @@ func sweepStaleShmSegments() {
 			continue
 		}
 		for _, p := range matches {
+			info, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(cutoff) {
+				continue
+			}
 			_ = os.Remove(p)
 		}
 	}
