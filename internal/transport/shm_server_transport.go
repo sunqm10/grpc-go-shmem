@@ -115,12 +115,6 @@ type ShmServerTransport struct {
 	pendingConnWU   uint32
 	pendingStreamWU map[uint32]uint32
 
-	// messageBurst counts MESSAGE frames delivered without a cooperative
-	// yield. Touched only by the single processIncomingData goroutine, so
-	// no synchronisation is needed. See handleMessage for the burst-cap
-	// rationale.
-	messageBurst int
-
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -492,6 +486,13 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		}
 	}()
 
+	// messageBurst counts MESSAGE frames delivered without a cooperative
+	// yield. Local to this goroutine — no synchronisation needed and no
+	// risk of races with handlers invoked from elsewhere (e.g. tests).
+	// Reset to 0 after every yield. See the FrameTypeMESSAGE case below
+	// for the burst-cap rationale.
+	var messageBurst int
+
 	for {
 		if t.closed.Load() {
 			if shmDebugEnabled {
@@ -578,12 +579,34 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			continue
 		case FrameTypeMESSAGE:
 			// Transfer ownership to the stream to avoid copying when possible.
+			var sz uint32
+			var delivered bool
 			if payloadBuf != nil {
 				payloadTransferred = true
-				t.handleMessageBuffer(fh.StreamID, fh.Flags, payloadBuf)
+				sz, delivered = t.handleMessageBuffer(fh.StreamID, fh.Flags, payloadBuf)
 				payloadBuf = nil
 			} else {
-				t.handleMessage(fh.StreamID, fh.Flags, payload)
+				sz, delivered = t.handleMessage(fh.StreamID, fh.Flags, payload)
+			}
+			// Co-locate the handler G on this M (see ShmClientTransport
+			// processIncomingData for the wakep-avoidance rationale).
+			//
+			// Gated on (1) the ring being drained, (2) a bounded burst
+			// limit, and (3) payload size. At N=1000+ streams with tiny
+			// payloads the reader's ring keeps producing fresh frames
+			// from many different streams; yielding 1000 times per RPC
+			// round forces the scheduler through 1000 park/unpark
+			// cycles. Keep draining for small payloads. For medium /
+			// large payloads the parallel app goroutine work outweighs
+			// the wakep cost, so always yield.
+			if delivered {
+				messageBurst++
+				if sz > shmYieldSkipMaxPayload ||
+					messageBurst >= shmServerMaxMessageBurst ||
+					!t.clientToServer.HasPendingData() {
+					runtime.Gosched()
+					messageBurst = 0
+				}
 			}
 		case FrameTypeHALFCLOSE:
 			// Client signalled it is done sending. The H2 codec emits this
@@ -809,7 +832,7 @@ func (t *ShmServerTransport) handleHalfClose(streamID uint32) {
 	s.write(recvMsg{err: io.EOF})
 }
 
-func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) {
+func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) (uint32, bool) {
 	// Fast path: if we have a cached single stream, skip map lookup + RLock.
 	var s *ServerStream
 	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
@@ -820,7 +843,7 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 		s, exists = t.streams[streamID]
 		t.mu.RUnlock()
 		if !exists {
-			return
+			return 0, false
 		}
 	}
 
@@ -856,31 +879,14 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	if flags&MessageFlagMORE == 0 {
 		s.write(recvMsg{err: io.EOF})
 	}
-	// Co-locate the handler G on this M (see ShmClientTransport
-	// processIncomingData for the wakep-avoidance rationale).
-	//
-	// Gated on (1) the ring being drained, (2) a bounded burst limit,
-	// and (3) payload size. At N=1000+ streams with tiny payloads the
-	// reader's ring keeps producing fresh frames from many different
-	// streams; yielding 1000 times per RPC round forces the scheduler
-	// through 1000 park/unpark cycles. Keep draining for small payloads.
-	// For medium/large payloads the parallel app goroutine work outweighs
-	// the wakep cost, so always yield.
-	t.messageBurst++
-	yield := sz > shmYieldSkipMaxPayload ||
-		t.messageBurst >= shmServerMaxMessageBurst ||
-		!t.clientToServer.HasPendingData()
-	if yield {
-		runtime.Gosched()
-		t.messageBurst = 0
-	}
+	return sz, true
 }
 
 // handleMessageBuffer mirrors handleMessage but transfers ownership of the
 // provided ring-backed buffer to the stream to avoid copying.
-func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, buf mem.Buffer) {
+func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, buf mem.Buffer) (uint32, bool) {
 	if buf == nil {
-		return
+		return 0, false
 	}
 	payload := buf.ReadOnlyData()
 	// Fast path: if we have a cached single stream, skip map lookup + RLock.
@@ -894,7 +900,7 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		t.mu.RUnlock()
 		if !exists {
 			buf.Free()
-			return
+			return 0, false
 		}
 	}
 
@@ -922,16 +928,7 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	if flags&MessageFlagMORE == 0 {
 		s.write(recvMsg{err: io.EOF})
 	}
-	// Co-locate the handler G on this M. See handleMessage for the
-	// high-concurrency gating rationale.
-	t.messageBurst++
-	yield := sz > shmYieldSkipMaxPayload ||
-		t.messageBurst >= shmServerMaxMessageBurst ||
-		!t.clientToServer.HasPendingData()
-	if yield {
-		runtime.Gosched()
-		t.messageBurst = 0
-	}
+	return sz, true
 }
 
 // handlePing processes a PING frame, sends PONG, and enforces keepalive policy.
