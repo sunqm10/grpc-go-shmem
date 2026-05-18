@@ -2037,31 +2037,55 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 	if maxChunk == 0 {
 		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
-	// Batch the per-DATA-frame writes so the reader sees one
-	// IncrementDataSequence + at most one signalData call across the
-	// whole multi-frame message, instead of one per chunk. Under
-	// fair-default (16 KiB MAX_FRAME_SIZE) a 64 KiB window-bounded
-	// caller chunk emits 4 DATA frames; without batching that's 4×
-	// (atomic increment + futex-wake check). With batching it's 1.
-	multi := len(body) > maxChunk
-	if multi {
-		tx.BeginBatch()
-		defer tx.EndBatch()
+	// Signal-batch threshold: see emitH2DataFromCursor for design.
+	// Mirrors .NET's RingFrameStream cap/8 chunkSize -- enables
+	// producer / consumer pipelining when the message exceeds ring
+	// capacity instead of locking into a "fill -> drain -> fill"
+	// sequential pattern.
+	signalBatch := int(tx.Capacity() / 8)
+	if signalBatch < maxChunk {
+		signalBatch = maxChunk
 	}
+
+	multi := len(body) > maxChunk
+	batchOpen := false
+	batchBytes := 0
+	closeBatch := func() {
+		if batchOpen {
+			tx.EndBatch()
+			batchOpen = false
+			batchBytes = 0
+		}
+	}
+
 	for off := 0; off < len(body); off += maxChunk {
 		end := off + maxChunk
 		if end > len(body) {
 			end = len(body)
 		}
+		isLast := end == len(body)
+
+		if multi && !batchOpen && !isLast {
+			tx.BeginBatch()
+			batchOpen = true
+			batchBytes = 0
+		}
+
 		// Don't propagate END_STREAM to intermediate chunks — only the
 		// last one (if baseFlags carries it). gRPC SHM never sets
 		// END_STREAM on MESSAGE; TRAILERS ends the stream.
 		flags := byte(0)
-		if end == len(body) {
+		if isLast {
 			flags = baseFlags
 		}
 		if err := writeH2Single(ctx, tx, H2FrameDATA, flags, streamID, body[off:end]); err != nil {
+			closeBatch()
 			return err
+		}
+		batchBytes += end - off
+
+		if batchOpen && (batchBytes >= signalBatch || isLast) {
+			closeBatch()
 		}
 	}
 	return nil
@@ -2108,6 +2132,25 @@ func writeFrameH2DataChunkedVec(
 // materialising the source into one contiguous buffer. The slow-path
 // chunked client write (shm_client_transport.go) uses this to skip a
 // 16-MB-class producer memcpy under fair-default.
+//
+// Pipelining design: emits are grouped into signal-batches of
+// ring.Capacity()/8 bytes each (matching .NET's RingFrameStream
+// chunkSize). Within a signal-batch, per-chunk Commit's wake is
+// suppressed via BeginBatch so the reader gets one wake per ~ring/8
+// of progress instead of one per H2 DATA frame. Between batches the
+// writer pauses to EndBatch (which fires the wake) and immediately
+// re-opens a new batch for the next group. This gives ~8 reader-wake
+// points per ring traversal -- enough to keep the consumer overlapping
+// with the producer when the message exceeds ring capacity, but
+// coarse enough to amortise the futex cost over many H2 frames.
+//
+// The pre-pipelining code wrapped the entire `length` of bytes in a
+// single BeginBatch / EndBatch pair. That collapsed throughput by 2-3x
+// for messages >= ring capacity because the reader could not start
+// draining until the producer finished the whole logical MESSAGE.
+// BenchmarkGRPCShmLargeUnary/size=64MB on a 64-MiB ring went from
+// ~650 MB/s (16 MB message, fits in ring) to ~270 MB/s (64 MB message,
+// exactly fills ring) under that regime.
 func emitH2DataFromCursor(
 	ctx context.Context,
 	tx *ShmRing,
@@ -2129,10 +2172,27 @@ func emitH2DataFromCursor(
 		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
 
+	// Signal-batch threshold: how many bytes we let accumulate before
+	// EndBatch fires the reader wake. ring/8 mirrors the .NET
+	// RingFrameStream design (see grpc-dotnet-shm
+	// ShmFrameWriter.WriteInlineDirectMultiFrame). Bound below by
+	// maxChunk so a single H2 DATA frame is always emitted under one
+	// batch, and above by length so we do not over-promise the
+	// caller more pipeline points than there is data for.
+	signalBatch := int(tx.Capacity() / 8)
+	if signalBatch < maxChunk {
+		signalBatch = maxChunk
+	}
+
 	multi := length > maxChunk
-	if multi {
-		tx.BeginBatch()
-		defer tx.EndBatch()
+	batchOpen := false
+	batchBytes := 0
+	closeBatch := func() {
+		if batchOpen {
+			tx.EndBatch()
+			batchOpen = false
+			batchBytes = 0
+		}
 	}
 
 	for written := 0; written < length; {
@@ -2140,14 +2200,36 @@ func emitH2DataFromCursor(
 		if chunk > maxChunk {
 			chunk = maxChunk
 		}
+		isLast := written+chunk == length
+
+		// Open a fresh signal-batch when we are about to emit more
+		// than one frame in this batch's window. Skip the batch when
+		// the current chunk is the last one (single Commit fires its
+		// own wake anyway).
+		if multi && !batchOpen && !isLast {
+			tx.BeginBatch()
+			batchOpen = true
+			batchBytes = 0
+		}
+
 		flags := byte(0)
-		if written+chunk == length {
+		if isLast {
 			flags = baseFlags
 		}
 		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, cur); err != nil {
+			closeBatch()
 			return err
 		}
 		written += chunk
+		batchBytes += chunk
+
+		// Close the batch (firing the reader wake) when we have
+		// accumulated enough bytes, or when this was the final chunk.
+		// `isLast` covers the case where the final chunk was emitted
+		// under a still-open batch.
+		if batchOpen && (batchBytes >= signalBatch || isLast) {
+			closeBatch()
+		}
 	}
 	return nil
 }
