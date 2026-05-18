@@ -1205,6 +1205,20 @@ func (r *ShmRing) Available() uint64 {
 	return r.effectiveAvailable()
 }
 
+// HasPendingData reports whether the ring has data that the reader has not
+// yet picked up. Cheap: two atomic loads, no syscall. Intended for hot-path
+// gating decisions (e.g. "should the reader yield after delivering a MESSAGE
+// to the application or keep draining?"). May briefly disagree with the true
+// state because of relaxed atomic ordering with the writer; that's fine for
+// the use cases that only need a best-effort hint.
+func (r *ShmRing) HasPendingData() bool {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return false
+	}
+	hdr := r.header()
+	return hdr.WriteIndex() > atomic.LoadUint64(&r.pendingReadIdx)
+}
+
 // effectiveAvailable returns the bytes available for writing, deducting
 // speculativeReserved so the writer cannot overwrite ring memory still
 // referenced by zero-copy reader buffers.

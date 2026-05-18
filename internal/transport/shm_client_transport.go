@@ -588,6 +588,14 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		}
 	}()
 
+	// Bounded burst counter: number of MESSAGE frames delivered since the
+	// last cooperative yield. When the ring keeps producing data the reader
+	// stays on-CPU to drain it, but we cap the burst so app goroutines that
+	// just got data on their recvBuffer get a chance to run and post their
+	// next Send. See shmClientMaxMessageBurst doc-comment for the cap value
+	// rationale.
+	messageBurst := 0
+
 	for {
 		if t.closed.Load() {
 			if shmDebugEnabled {
@@ -792,7 +800,21 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			// on the app's next Send), so co-locating the two Gs on this M
 			// strictly wins. The runtime.Gosched is a cooperative yield, not
 			// a spin: it costs no CPU when no other G is runnable.
-			runtime.Gosched()
+			//
+			// AT HIGH STREAM CONCURRENCY (N=1000+), this unconditional yield
+			// costs N park/unpark cycles per RPC round. Skip the yield when
+			// more frames are immediately ready in the ring — keep draining
+			// instead of round-tripping through the scheduler. The ping-pong
+			// win is preserved because in the 1-stream case the ring is
+			// almost always empty after the MESSAGE is delivered. A burst
+			// cap (maxMessageBurst) bounds how many frames the reader will
+			// process without yielding so that app goroutines waiting on
+			// recvBuffer don't starve in medium-payload streaming.
+			messageBurst++
+			if messageBurst >= shmClientMaxMessageBurst || !t.serverToClient.HasPendingData() {
+				runtime.Gosched()
+				messageBurst = 0
+			}
 			if shmDebugEnabled {
 				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
 			}

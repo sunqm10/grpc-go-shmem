@@ -115,6 +115,12 @@ type ShmServerTransport struct {
 	pendingConnWU   uint32
 	pendingStreamWU map[uint32]uint32
 
+	// messageBurst counts MESSAGE frames delivered without a cooperative
+	// yield. Touched only by the single processIncomingData goroutine, so
+	// no synchronisation is needed. See handleMessage for the burst-cap
+	// rationale.
+	messageBurst int
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -852,7 +858,18 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	}
 	// Co-locate the handler G on this M (see ShmClientTransport
 	// processIncomingData for the wakep-avoidance rationale).
-	runtime.Gosched()
+	//
+	// Gated on the ring being drained and a bounded burst limit. At
+	// N=1000+ streams the reader's ring keeps producing fresh frames
+	// from many different streams; yielding 1000 times per RPC round
+	// forces the scheduler through 1000 park/unpark cycles. Keep
+	// draining; the burst cap prevents app goroutines on recvBuffer
+	// from starving in medium-payload streaming.
+	t.messageBurst++
+	if t.messageBurst >= shmServerMaxMessageBurst || !t.clientToServer.HasPendingData() {
+		runtime.Gosched()
+		t.messageBurst = 0
+	}
 }
 
 // handleMessageBuffer mirrors handleMessage but transfers ownership of the
@@ -901,8 +918,13 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	if flags&MessageFlagMORE == 0 {
 		s.write(recvMsg{err: io.EOF})
 	}
-	// Co-locate the handler G on this M.
-	runtime.Gosched()
+	// Co-locate the handler G on this M. See handleMessage for the
+	// high-concurrency gating rationale.
+	t.messageBurst++
+	if t.messageBurst >= shmServerMaxMessageBurst || !t.clientToServer.HasPendingData() {
+		runtime.Gosched()
+		t.messageBurst = 0
+	}
 }
 
 // handlePing processes a PING frame, sends PONG, and enforces keepalive policy.

@@ -101,6 +101,7 @@ func benchConcurrentStreams(b *testing.B, client testgrpc.BenchmarkServiceClient
 	b.SetBytes(int64(size))
 	b.ResetTimer()
 	endCPU := startCPUProbe(b)
+	endZC := startZCProbe(b)
 
 	// One goroutine per stream. Each runs b.N ping-pong rounds. The
 	// outer goroutine waits for all to finish before stopping the
@@ -145,6 +146,7 @@ func benchConcurrentStreams(b *testing.B, client testgrpc.BenchmarkServiceClient
 	wg.Wait()
 	b.StopTimer()
 	endCPU()
+	endZC()
 
 	if firstErr != nil {
 		b.Fatalf("concurrent stream failure: %v", firstErr)
