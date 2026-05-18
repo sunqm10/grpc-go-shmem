@@ -85,6 +85,45 @@ func (e *grpcBenchEnv) close() {
 	}
 }
 
+// TestMain wraps `go test` so we can defensively sweep stale SHM
+// segment files from prior crashed / killed bench runs. On Linux the
+// segments live under /dev/shm and stale entries are usually harmless,
+// but on Windows the segments are backed by regular files in TEMP and
+// accumulate to tens of GB if benches are killed (e.g. timeout, ^C,
+// IDE process kill). A large pool of stale files also makes Defender
+// scans dominate filesystem syscalls and can stall fresh segment
+// creates during multi-iteration bench runs.
+//
+// This sweeper is conservative: it only deletes files matching
+// `grpc_shm_*` in /dev/shm and the OS temp dir, leaves anything else
+// alone, and runs once at startup and once on exit.
+func TestMain(m *testing.M) {
+	sweepStaleShmSegments()
+	code := m.Run()
+	sweepStaleShmSegments()
+	os.Exit(code)
+}
+
+// sweepStaleShmSegments removes leftover grpc_shm_* files from prior
+// bench runs. Errors are ignored: the cleanup is best-effort.
+func sweepStaleShmSegments() {
+	dirs := []string{"/dev/shm", os.TempDir()}
+	seen := map[string]bool{}
+	for _, dir := range dirs {
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		matches, err := filepath.Glob(filepath.Join(dir, "grpc_shm_*"))
+		if err != nil {
+			continue
+		}
+		for _, p := range matches {
+			_ = os.Remove(p)
+		}
+	}
+}
+
 // logBenchEnvOnce prints the env vars and resolved settings that
 // determine the bench harness's transport configuration. Called from
 // the first newShmEnv / newTCPEnv / newUnixEnv invocation so the
