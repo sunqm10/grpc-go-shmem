@@ -241,6 +241,34 @@ func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
 	return nil
 }
 
+// emitMessageInlineVec emits `length` bytes from cur as one MESSAGE
+// (chunked into H2 DATA frames per shmMaxFrameSize) under inlineMu,
+// blocking the caller until the write completes. fh.Flags is
+// translated to H2 flags once and applied to the FINAL chunk only.
+//
+// Used by the chunked client write slow path
+// (shm_client_transport.go) so each per-window iteration emits
+// straight from the source (hdr || data BufferSlice) cursor, skipping
+// the contiguous materialise step that the legacy
+// frameEntry{payload: buf[off:end]} path required. Saves one
+// payload-size memcpy on the producer hot path for fair-default
+// LargeUnary (16 MB → ~3 ms latency reduction).
+//
+// The cursor advances by exactly `length` bytes on success. Callers
+// keep the cursor alive across iterations to walk the entire logical
+// (hdr || data) stream without re-indexing.
+func (w *shmFrameWriter) emitMessageInlineVec(ctx context.Context, fh FrameHeader, cur *vecCursor, length int) error {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed.Load() {
+		return ErrConnClosing
+	}
+	_, h2f := translateCustomToH2(fh)
+	w.inlineMu.Lock()
+	defer w.inlineMu.Unlock()
+	return emitH2DataFromCursor(ctx, w.tx, fh.StreamID, cur, length, h2f)
+}
+
 // tryEnqueueNonBlocking attempts to send a frame without blocking.
 // Used for best-effort frames (GOAWAY) in Close() where blocking would
 // deadlock if the channel is full (writer goroutine stuck on ring write).

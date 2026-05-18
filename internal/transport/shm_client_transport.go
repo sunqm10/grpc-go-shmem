@@ -1710,22 +1710,21 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.write: chunked write, got %d / %d on first acquire", got, payloadLen)
 	}
-	// Materialise hdr + data into one contiguous slice so we can hand
-	// payload[off:end] to enqueueAndWait without re-indexing across
-	// the hdr / segment boundary. Take it from shmLpmPool (the same
-	// dirty pool the receive-side accumulator uses) — a fresh
-	// make([]byte, 0, payloadLen) here triggers a runtime.memclr of
-	// the full payload size on every RPC, which profiling showed at
-	// ~20% of total CPU for a 1 MiB write under fair-default. The
-	// slice is dirty, but we immediately overwrite every byte with
-	// hdr+data via append below, so the zero is pure waste.
-	bufPtr := shmLpmPool.Get(payloadLen)
-	buf := (*bufPtr)[:0:cap(*bufPtr)]
-	defer shmLpmPool.Put(bufPtr)
-	buf = append(buf, hdr...)
-	for _, b := range data {
-		buf = append(buf, b.ReadOnlyData()...)
-	}
+	// v3.4 P5: emit each per-window iteration directly from a vecCursor
+	// over (hdr || data BufferSlice) so the producer never has to
+	// materialise the LPM into one contiguous buffer first. The
+	// pre-P5 code allocated a payloadLen-sized slice from shmLpmPool
+	// and copied hdr+data into it once before iterating — that
+	// materialise step costs one full payload-size memcpy per RPC,
+	// which at fair-default's 65535-byte initial window and 16 MB
+	// LargeUnary contributes ~3 ms of producer-side latency.
+	//
+	// The cursor's invariant is that emitMessageInlineVec advances it
+	// by exactly the requested chunk length on success, so we can
+	// walk the entire (hdr || data) once across however many
+	// flow-control grants we need. Errors abort early; the cursor's
+	// position is then meaningless but we don't reuse it.
+	cur := vecCursor{lpmHdr: hdr, data: data}
 	off := 0
 	for {
 		end := off + got
@@ -1745,11 +1744,7 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 			// Final chunk of the LAST message on the stream.
 			fh.Flags = MessageFlagEndStream
 		}
-		if err := t.frameWriter.enqueueAndWait(frameEntry{
-			ctx:     s.ctx,
-			fh:      fh,
-			payload: buf[off:end],
-		}); err != nil {
+		if err := t.frameWriter.emitMessageInlineVec(s.ctx, fh, &cur, got); err != nil {
 			if shmDebugEnabled {
 				shmDebugf("[ERROR] ShmClientTransport.write: chunk write failed at off=%d: %v", off, err)
 			}

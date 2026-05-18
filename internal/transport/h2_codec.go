@@ -2086,6 +2086,36 @@ func writeFrameH2DataChunkedVec(
 	data mem.BufferSlice,
 	baseFlags byte,
 ) error {
+	// vecCursor walks the (lpmHdr || data segments) virtual byte
+	// stream a chunk at a time without merging into one slice. Each
+	// chunk consumes from the current segment, advancing across
+	// segment boundaries automatically.
+	cur := vecCursor{lpmHdr: lpmHdr, data: data}
+	return emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+}
+
+// emitH2DataFromCursor emits `length` bytes from cur into the ring as
+// one or more H2 DATA frames (chunked per shmMaxFrameSize / ring
+// capacity). baseFlags is applied to the FINAL emitted DATA frame only
+// (typically used to carry END_STREAM on the last chunk of a logical
+// MESSAGE). The cursor is advanced by exactly `length` bytes on
+// success; on error the cursor's position is undefined and the caller
+// must not reuse it for further emits.
+//
+// Exposed as a primitive so callers that already hold a vecCursor
+// straddling multiple flow-control / window-grant chunks can keep
+// emitting from the same cursor across iterations without
+// materialising the source into one contiguous buffer. The slow-path
+// chunked client write (shm_client_transport.go) uses this to skip a
+// 16-MB-class producer memcpy under fair-default.
+func emitH2DataFromCursor(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	cur *vecCursor,
+	length int,
+	baseFlags byte,
+) error {
 	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
 
 	maxChunk := shmMaxFrameSize
@@ -2099,29 +2129,22 @@ func writeFrameH2DataChunkedVec(
 		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
 
-	total := len(lpmHdr) + data.Len()
-	// vecCursor walks the (lpmHdr || data segments) virtual byte
-	// stream a chunk at a time without merging into one slice. Each
-	// chunk consumes from the current segment, advancing across
-	// segment boundaries automatically.
-	cur := vecCursor{lpmHdr: lpmHdr, data: data}
-
-	multi := total > maxChunk
+	multi := length > maxChunk
 	if multi {
 		tx.BeginBatch()
 		defer tx.EndBatch()
 	}
 
-	for written := 0; written < total; {
-		chunk := total - written
+	for written := 0; written < length; {
+		chunk := length - written
 		if chunk > maxChunk {
 			chunk = maxChunk
 		}
 		flags := byte(0)
-		if written+chunk == total {
+		if written+chunk == length {
 			flags = baseFlags
 		}
-		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, &cur); err != nil {
+		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, cur); err != nil {
 			return err
 		}
 		written += chunk
