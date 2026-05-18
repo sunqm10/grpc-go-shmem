@@ -366,6 +366,20 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment.Close()
 			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
+
+			// Release the listener's reference on the control-ring events.
+			// On Linux these are nil; on Windows the refcount in RingEvents
+			// keeps them alive until both this Close and the dialer's
+			// deferred Close have run, so the SetEvent signals issued by
+			// ctlRx.Close above always reach the parked Accept goroutine.
+			if l.ctlRxEvents != nil {
+				l.ctlRxEvents.Close()
+				l.ctlRxEvents = nil
+			}
+			if l.ctlTxEvents != nil {
+				l.ctlTxEvents.Close()
+				l.ctlTxEvents = nil
+			}
 		}
 
 		// Clean up all active connections to ensure rings close before unmapping.
