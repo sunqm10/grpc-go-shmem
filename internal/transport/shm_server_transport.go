@@ -179,6 +179,10 @@ func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 	if delta == 0 {
 		return
 	}
+	if shmNoWU() {
+		// v3.4 P1a: no quota tracking; nothing to add.
+		return
+	}
 	t.sendQuotaMu.Lock()
 	if streamID == 0 {
 		t.connSendQuota += int64(delta)
@@ -193,6 +197,14 @@ func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 
 func (t *ShmServerTransport) acquireSendQuota(ctx context.Context, streamID uint32, n int) error {
 	if n == 0 {
+		return nil
+	}
+	if shmNoWU() {
+		// v3.4 P1a: skip quota; ring backpressure is the only limit.
+		shmQuotaSkips.Add(1)
+		if t.closed.Load() {
+			return ErrConnClosing
+		}
 		return nil
 	}
 	t.sendQuotaMu.Lock()
@@ -232,6 +244,11 @@ func (t *ShmServerTransport) acquireSendQuota(ctx context.Context, streamID uint
 
 func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
+		return
+	}
+	if shmNoWU() {
+		// v3.4 P1a: do not emit WU frames between SHM peers.
+		shmWUFramesElided.Add(1)
 		return
 	}
 	// Batch WindowUpdate deltas: only send a frame when the accumulated
@@ -581,6 +598,12 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			t.handlePing(ctx, payload)
 			release()
 		case FrameTypeWindowUpdate:
+			if shmNoWU() {
+				// v3.4 P1a: SHM peers MUST NOT emit WU. If we get one, ignore.
+				shmWUFramesIgnored.Add(1)
+				release()
+				continue
+			}
 			if len(payload) >= 4 {
 				// RFC 7540 §6.9.1: increment is big-endian. Senders
 				// (sendWindowUpdate above) write BigEndian so this matches.
@@ -1288,14 +1311,17 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	// acquireSendQuota is atomic on quotaSize and deadlocks when the
 	// stream window is smaller. The fallback write() path chunks
 	// under flow control via acquireUpToSendQuota.
-	t.sendQuotaMu.Lock()
-	streamQ, hasStreamQ := t.streamSendQuota[s.id]
-	if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
+	if !shmNoWU() {
+		t.sendQuotaMu.Lock()
+		streamQ, hasStreamQ := t.streamSendQuota[s.id]
+		if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
+			t.sendQuotaMu.Unlock()
+			atomic.AddUint64(&shmZCWriteSkipQuota, 1)
+			return false, nil
+		}
 		t.sendQuotaMu.Unlock()
-		atomic.AddUint64(&shmZCWriteSkipQuota, 1)
-		return false, nil
 	}
-	t.sendQuotaMu.Unlock()
+	// In shmNoWU mode, skip window pre-check; ring backpressure handles it.
 
 	// Flow control: account only the gRPC payload (5-byte LPM + proto body).
 	// The 9-byte H2 frame header is NOT included in WINDOW_UPDATE.
