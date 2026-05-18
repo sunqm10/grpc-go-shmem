@@ -55,6 +55,18 @@ type shmFrameWriter struct {
 	// The writer goroutine also holds this when active, ensuring no two
 	// writers access the ring simultaneously.
 	inlineMu sync.Mutex
+
+	// onAsyncError, if non-nil, is invoked when an entry without a doneCh
+	// (fire-and-forget enqueue, used by the SHM_NO_WU=1 client MESSAGE
+	// path and by HEADERS / GOAWAY senders elsewhere) fails to write to
+	// the ring. Without this hook the error would be silently dropped
+	// after data.Free(), leaving the peer waiting forever for bytes that
+	// were never sent. The callback is fired at most once per writer to
+	// avoid amplifying a single ring failure into N close attempts when a
+	// queue full of doomed entries drains. Set via setAsyncErrorHandler
+	// after construction; nil callback means "swallow" (legacy behaviour).
+	onAsyncError func(error)
+	errReported  atomic.Bool
 }
 
 // frameEntry represents a single frame to be written to the ring.
@@ -90,6 +102,16 @@ func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 	w.wg.Add(1)
 	go w.writeLoop()
 	return w
+}
+
+// setAsyncErrorHandler registers a callback to be invoked at most once
+// when a fire-and-forget entry (no doneCh) fails to write to the ring.
+// The handler is expected to run in its own goroutine if it needs to
+// tear down the owning transport (which would otherwise deadlock on
+// frame writer close). Must be called before the first enqueue. Pass
+// nil to clear (no-op for the test path).
+func (w *shmFrameWriter) setAsyncErrorHandler(fn func(error)) {
+	w.onAsyncError = fn
 }
 
 // writeLoop is the single writer goroutine. It drains the channel and writes
@@ -144,6 +166,11 @@ func (w *shmFrameWriter) writeLoop() {
 // processEntry writes a single frame entry to the ring and signals
 // completion to the caller if doneCh is set. If entry.freeData is true,
 // the writer Free()s the buffer slice after writing (async-write path).
+//
+// Fire-and-forget entries (doneCh == nil) have no caller waiting for
+// the result. If the ring write failed, we surface the error via
+// onAsyncError (fired at most once per writer) so the owning transport
+// can tear down rather than silently drop bytes.
 func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	var err error
 	if entry.data != nil {
@@ -156,6 +183,10 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	}
 	if entry.doneCh != nil {
 		entry.doneCh <- err
+		return
+	}
+	if err != nil && w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+		w.onAsyncError(err)
 	}
 }
 

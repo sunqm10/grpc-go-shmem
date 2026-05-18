@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -497,6 +498,26 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 	// Start the dedicated frame writer goroutine for the client→server ring.
 	t.frameWriter = newShmFrameWriter(clientToServer)
+	// Surface async write failures (SHM_NO_WU=1 fire-and-forget MESSAGE
+	// path, and async HEADERS/GOAWAY) by tearing down the transport.
+	// Without this hook the writer goroutine would silently drop bytes
+	// after data.Free(), and the peer would wait forever for a MESSAGE
+	// that was never sent. The handler runs in a fresh goroutine so it
+	// can safely call Close (which waits for the writer goroutine that
+	// is currently invoking the callback). Close is guarded by
+	// closeOnce so concurrent invocations are idempotent.
+	t.frameWriter.setAsyncErrorHandler(func(err error) {
+		// Context cancellation on the per-stream context is benign —
+		// the stream is gone and the client doesn't need the bytes.
+		// Ring closed errors mean we are already tearing down.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return
+		}
+		if t.closed.Load() {
+			return
+		}
+		go t.Close(fmt.Errorf("shm client: async write failed: %w", err))
+	})
 
 	// Initialize dormancy condition variable.
 	t.kpDormancyCond = sync.NewCond(&t.mu)
