@@ -1611,6 +1611,31 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		if shmDebugEnabled {
 			shmDebugf("[DEBUG] ShmClientTransport.write: writing single frame (fast path)")
 		}
+		// v3.4 P1a-async: under SHM_NO_WU mode, fire-and-forget the
+		// MESSAGE frame. Take ownership via data.Ref() so the caller's
+		// `defer data.Free()` does NOT prematurely release buffers
+		// the writer goroutine still needs.
+		//
+		// Errors are surfaced asynchronously: a failed ring write closes
+		// the transport, which marks all streams errored; the next stream
+		// operation observes the error. This matches stock grpc-go's
+		// loopyWriter pattern (sender does not wait for socket write ack).
+		if shmNoWU() {
+			data.Ref()
+			if err := t.frameWriter.enqueue(frameEntry{
+				ctx:      s.ctx,
+				fh:       fh,
+				hdr:      hdr,
+				data:     data,
+				freeData: true, // writer Free()s; balances our Ref()
+			}); err != nil {
+				// enqueue failed (transport closed): writer won't see
+				// the entry, so balance the Ref() here.
+				data.Free()
+				return err
+			}
+			return nil
+		}
 		if err := t.frameWriter.enqueueAndWait(frameEntry{
 			ctx:  s.ctx,
 			fh:   fh,

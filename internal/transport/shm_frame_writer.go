@@ -65,12 +65,20 @@ type frameEntry struct {
 	hdr     []byte          // optional header prefix for BufferSlice payloads
 	data    mem.BufferSlice // zero-copy payload (MESSAGE)
 	doneCh  chan error      // if non-nil, writer sends result and caller waits
+	// freeData, when true, causes the writer goroutine to invoke data.Free()
+	// after the frame has been written to the ring. This is used by the
+	// async fire-and-forget path (v3.4 P1a-async): the caller has already
+	// invoked data.Ref() to hand ownership of the buffer slice to the writer,
+	// so writer must Free() after writing to balance the Ref.
+	freeData bool
 }
 
 const (
 	// frameWriterQueueSize is the channel buffer size. Large enough to absorb
 	// bursts without blocking callers, small enough to bound memory.
-	frameWriterQueueSize = 256
+	// At N=1000 concurrent streams, 256 is too small — senders block on
+	// channel full. Raised to 2048 for the v3.4 P1a-async path.
+	frameWriterQueueSize = 2048
 )
 
 // newShmFrameWriter creates and starts a frame writer for the given ring.
@@ -134,13 +142,17 @@ func (w *shmFrameWriter) writeLoop() {
 }
 
 // processEntry writes a single frame entry to the ring and signals
-// completion to the caller if doneCh is set.
+// completion to the caller if doneCh is set. If entry.freeData is true,
+// the writer Free()s the buffer slice after writing (async-write path).
 func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	var err error
 	if entry.data != nil {
 		err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
 	} else {
 		err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+	}
+	if entry.freeData && entry.data != nil {
+		entry.data.Free()
 	}
 	if entry.doneCh != nil {
 		entry.doneCh <- err
