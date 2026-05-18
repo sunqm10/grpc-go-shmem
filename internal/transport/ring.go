@@ -1208,9 +1208,15 @@ func (r *ShmRing) Available() uint64 {
 // HasPendingData reports whether the ring has data that the reader has not
 // yet picked up. Cheap: two atomic loads, no syscall. Intended for hot-path
 // gating decisions (e.g. "should the reader yield after delivering a MESSAGE
-// to the application or keep draining?"). May briefly disagree with the true
-// state because of relaxed atomic ordering with the writer; that's fine for
-// the use cases that only need a best-effort hint.
+// to the application or keep draining?").
+//
+// This is a best-effort scheduling hint, not a synchronisation primitive:
+// the answer can be stale on either side (a freshly-committed write may not
+// yet be visible; a freshly-advanced read may still appear pending). Stale
+// `false` causes one extra cooperative yield; stale `true` causes one extra
+// loop iteration that will then either find the frame or fall into the real
+// wait-with-sequence-snapshot path in ReadSlices. Both outcomes are
+// performance-only and cannot cause a missed wake or a deadlock.
 func (r *ShmRing) HasPendingData() bool {
 	if atomic.LoadUint32(&r.closed) != 0 {
 		return false

@@ -410,16 +410,18 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	if len(hdr) == 0 && dataLen == 0 {
 		return writeFrame(ctx, tx, fh, nil)
 	}
-	if len(hdr) == 0 && len(payload) == 1 {
-		// Fast path: single buffer, no header prefix.
-		return writeFrame(ctx, tx, fh, payload[0].ReadOnlyData())
-	}
 	// Vectored fast path for MESSAGE frames: writes hdr + segments
 	// directly into the ring reservation when the body fits in a
 	// single H2 DATA frame. Use shmMaxFrameSize (the configurable
 	// per-DATA-frame ceiling) instead of h2MaxFramePayload (the RFC
 	// absolute limit) so a fair-comparison bench profile that sets
 	// max frame to 16384 actually chunks here too.
+	//
+	// Order matters: this must come BEFORE the generic single-buffer
+	// shortcut below, otherwise a MESSAGE with no LPM hdr and one
+	// large BufferSlice element (rare but possible from custom
+	// callers / tests) would fall back to the legacy materialise +
+	// chunked path and bypass the producer-ZC optimisation.
 	if fh.Type == FrameTypeMESSAGE {
 		bodyLen := len(hdr) + dataLen
 		if bodyLen <= shmMaxFrameSize && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
@@ -437,6 +439,11 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 			_, h2f := translateCustomToH2(fh)
 			return writeFrameH2DataChunkedVec(ctx, tx, fh.StreamID, hdr, payload, h2f)
 		}
+	}
+	if len(hdr) == 0 && len(payload) == 1 {
+		// Fast path: single buffer, no header prefix. Applies only to
+		// non-MESSAGE frame types here (MESSAGE is handled above).
+		return writeFrame(ctx, tx, fh, payload[0].ReadOnlyData())
 	}
 	buf := make([]byte, len(hdr)+dataLen)
 	copy(buf, hdr)
