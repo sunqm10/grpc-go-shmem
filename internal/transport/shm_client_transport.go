@@ -807,11 +807,21 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			// instead of round-tripping through the scheduler. The ping-pong
 			// win is preserved because in the 1-stream case the ring is
 			// almost always empty after the MESSAGE is delivered. A burst
-			// cap (maxMessageBurst) bounds how many frames the reader will
-			// process without yielding so that app goroutines waiting on
-			// recvBuffer don't starve in medium-payload streaming.
+			// cap (shmClientMaxMessageBurst) bounds how many frames the
+			// reader will process without yielding so that app goroutines
+			// waiting on recvBuffer don't starve.
+			//
+			// SIZE-AWARE: only the small-payload case wins from skipping
+			// the yield. At medium payloads (e.g. N=100 streams sending
+			// 64 KiB messages) the parallel app goroutine work outweighs
+			// the wakep cost — let work-stealing pick up the recvBuffer
+			// reader on another P. Always yield when the just-delivered
+			// payload is above shmYieldSkipMaxPayload bytes.
 			messageBurst++
-			if messageBurst >= shmClientMaxMessageBurst || !t.serverToClient.HasPendingData() {
+			yield := sz > shmYieldSkipMaxPayload ||
+				messageBurst >= shmClientMaxMessageBurst ||
+				!t.serverToClient.HasPendingData()
+			if yield {
 				runtime.Gosched()
 				messageBurst = 0
 			}

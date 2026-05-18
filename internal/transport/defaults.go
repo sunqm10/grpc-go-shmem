@@ -62,6 +62,17 @@ const (
 	shmClientMaxMessageBurst = 32
 	// shmServerMaxMessageBurst — same as the client cap, see comment above.
 	shmServerMaxMessageBurst = 32
+
+	// shmYieldSkipMaxPayload is the payload-size ceiling below which the
+	// receiver may skip its post-MESSAGE cooperative yield (see
+	// shm{Client,Server}MaxMessageBurst). At small payloads the app
+	// goroutine's recv work is negligible compared to the wakep cost, so
+	// staying on-CPU to drain the ring wins. At larger payloads the
+	// parallel work warrants yielding so other Ps can pick up app
+	// goroutines via work-stealing. 4 KiB is chosen empirically: below
+	// it the N=1000/64B latency improvement dominates; above it the
+	// N=100/64KB throughput would otherwise regress.
+	shmYieldSkipMaxPayload = uint32(4096)
 )
 
 // MaxStreamID is the upper bound for the stream ID before the current

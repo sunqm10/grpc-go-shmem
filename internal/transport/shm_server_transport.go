@@ -859,14 +859,18 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	// Co-locate the handler G on this M (see ShmClientTransport
 	// processIncomingData for the wakep-avoidance rationale).
 	//
-	// Gated on the ring being drained and a bounded burst limit. At
-	// N=1000+ streams the reader's ring keeps producing fresh frames
-	// from many different streams; yielding 1000 times per RPC round
-	// forces the scheduler through 1000 park/unpark cycles. Keep
-	// draining; the burst cap prevents app goroutines on recvBuffer
-	// from starving in medium-payload streaming.
+	// Gated on (1) the ring being drained, (2) a bounded burst limit,
+	// and (3) payload size. At N=1000+ streams with tiny payloads the
+	// reader's ring keeps producing fresh frames from many different
+	// streams; yielding 1000 times per RPC round forces the scheduler
+	// through 1000 park/unpark cycles. Keep draining for small payloads.
+	// For medium/large payloads the parallel app goroutine work outweighs
+	// the wakep cost, so always yield.
 	t.messageBurst++
-	if t.messageBurst >= shmServerMaxMessageBurst || !t.clientToServer.HasPendingData() {
+	yield := sz > shmYieldSkipMaxPayload ||
+		t.messageBurst >= shmServerMaxMessageBurst ||
+		!t.clientToServer.HasPendingData()
+	if yield {
 		runtime.Gosched()
 		t.messageBurst = 0
 	}
@@ -921,7 +925,10 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	// Co-locate the handler G on this M. See handleMessage for the
 	// high-concurrency gating rationale.
 	t.messageBurst++
-	if t.messageBurst >= shmServerMaxMessageBurst || !t.clientToServer.HasPendingData() {
+	yield := sz > shmYieldSkipMaxPayload ||
+		t.messageBurst >= shmServerMaxMessageBurst ||
+		!t.clientToServer.HasPendingData()
+	if yield {
 		runtime.Gosched()
 		t.messageBurst = 0
 	}
