@@ -1880,6 +1880,32 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
 		free := r.effectiveSpace(writeIdx, readIdx)
+
+		// Deadlock guard: if we're inside an open BeginBatch session
+		// and about to park waiting for space, we must first flush
+		// the deferred data signal. Otherwise the reader -- which is
+		// the only party that can free space for us -- may be parked
+		// on a DataSequence value the batch has not yet
+		// incremented, and our committed bytes are invisible to it
+		// as "new data". Net effect: ring is full from our side,
+		// reader is asleep with stale seq, neither makes progress.
+		//
+		// Triggered when a chunked writer (writeFrameH2DataChunked,
+		// emitH2DataFromCursor) batches a logical MESSAGE whose
+		// total bytes exceed effective ring capacity -- the same
+		// pattern that caused BenchmarkGRPCShmLargeUnary/size=64MB
+		// to hang on a 64-MiB ring.
+		//
+		// The flushed increment may pair with the eventual EndBatch
+		// to fire two signals instead of one; the reader's loop
+		// tolerates that by re-checking writeIdx after each wake.
+		if atomic.LoadUint32(&r.batchDepth) > 0 {
+			hdr.IncrementDataSequence()
+			if hdr.DataWaiters() > 0 {
+				r.signalData(&hdr.dataSeq)
+			}
+		}
+
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()

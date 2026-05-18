@@ -167,12 +167,18 @@ func logBenchEnvOnce(b *testing.B) {
 		if inprocWake == "" {
 			inprocWake = "0 (off, futex fallback)"
 		}
+		noWU := os.Getenv("SHM_NO_WU")
+		if noWU == "" {
+			noWU = "0 (off, flow control + WU active)"
+		} else if noWU == "1" {
+			noWU = "1 (WU elided, send-quota skipped; fast-path async fire-and-forget)"
+		}
 		bProf := os.Getenv("BENCH_PROFILE")
 		if bProf == "" {
 			bProf = "shm-tuned (SHM keeps 2 GiB quota, TCP/UDS HTTP/2 defaults)"
 		}
-		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
-			bProf, dsWake, inprocWake, spin,
+		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_NO_WU=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
+			bProf, noWU, dsWake, inprocWake, spin,
 			prof.initialWindowSize, prof.maxFrameSize, prof.applyToShm,
 		)
 	})

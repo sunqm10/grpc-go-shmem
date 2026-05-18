@@ -813,6 +813,107 @@ func TestShmBatchSignalSuppression(t *testing.T) {
 	}
 }
 
+// TestShmBatchDeadlockGuard verifies that a writer inside an active
+// BeginBatch session does NOT deadlock when its working set exceeds
+// ring capacity. Without the deadlock guard in ReserveWrite, this
+// scenario hangs forever: writer's per-frame Commits suppress the
+// DataSequence increment under batch mode, leaving any already-parked
+// reader sleeping on a stale sequence; the writer then fills the ring,
+// blocks in ReserveWrite, and neither side makes progress because the
+// only party that can free space (the reader) cannot see the new data.
+//
+// Regression test for BenchmarkGRPCShmLargeUnary/size=64MB on the
+// 64 MiB ring used by the bench harness.
+//
+// Uses raw ReserveWrite / ReadSlices to isolate the guard logic from
+// the H2 codec layer (which enforces HEADERS-before-DATA and would
+// otherwise reject the synthetic frames produced here).
+func TestShmBatchDeadlockGuard(t *testing.T) {
+	const ringSize = 64 * 1024 // 64 KiB ring keeps the test fast
+	segName := testSegName("test_batch_dl")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Pre-park a reader so the writer's batched commits land while the
+	// reader is asleep on dataSeq. Without this the reader may drain
+	// eagerly via spin and the deadlock window never opens.
+	const chunkCount = 5
+	const chunkSize = 16 * 1024 // 16 KiB; 5 × 16 KiB = 80 KiB > 64 KiB ring
+	readerDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var consumed int
+		buf := make([]byte, chunkSize)
+		for consumed < chunkCount*chunkSize {
+			first, second, rc, err := rx.ReadSlices(ctx, 1)
+			if err != nil {
+				readerDone <- fmt.Errorf("ReadSlices at %d: %w", consumed, err)
+				return
+			}
+			n := len(first) + len(second)
+			if n > chunkSize {
+				n = chunkSize
+			}
+			// Copy what we got (we don't actually inspect it; only space
+			// freeing matters for the deadlock check).
+			off := copy(buf, first)
+			if off < n {
+				copy(buf[off:], second[:n-off])
+			}
+			rc.Commit(n)
+			consumed += n
+		}
+		readerDone <- nil
+	}()
+
+	// Give the reader a moment to enter the futex wait. The deadlock
+	// guard only matters when the reader is already parked when the
+	// writer enters its batch.
+	time.Sleep(100 * time.Millisecond)
+
+	writerCtx, writerCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer writerCancel()
+
+	tx.BeginBatch()
+	chunk := make([]byte, chunkSize)
+	for i := 0; i < chunkCount; i++ {
+		chunk[0] = byte(i)
+		res, err := tx.ReserveWrite(writerCtx, chunkSize)
+		if err != nil {
+			tx.EndBatch()
+			t.Fatalf("ReserveWrite %d: %v", i, err)
+		}
+		// Copy chunk into reservation slices (handles wrap).
+		off := copy(res.First, chunk)
+		if off < chunkSize {
+			copy(res.Second, chunk[off:])
+		}
+		if err := res.Commit(chunkSize); err != nil {
+			tx.EndBatch()
+			t.Fatalf("Commit %d: %v", i, err)
+		}
+	}
+	tx.EndBatch()
+
+	select {
+	case err := <-readerDone:
+		if err != nil {
+			t.Fatalf("reader: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not finish: deadlock guard regressed")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Single stream cache tests
 // ---------------------------------------------------------------------------
