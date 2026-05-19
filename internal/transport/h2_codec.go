@@ -1523,6 +1523,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				// Single mem.Copy gives us one alloc + one memcpy, matching
 				// readFrameView parity.
 				//
+				// Pool choice: shmLpmPool (dirty, no memclr-on-Get) instead
+				// of mem.DefaultBufferPool. The default pool zero-fills
+				// every returned buffer; under 1000-stream concurrent
+				// ping-pong at 64 KiB the cumulative memclr dominates the
+				// CPU profile (~40% of total cycles, per WSL EPYC pprof)
+				// and crushes shm-tuned single-frame throughput. The
+				// accumulator path (used for chunked frames) was already
+				// on the dirty pool; bringing the single-frame copy path
+				// here onto the same pool gives both code paths matching
+				// allocation cost.
+				//
 				// Reads the 5-byte LPM header from the (possibly split) ring
 				// slice via a small stack array so the fast path applies
 				// even when the body wraps.
@@ -1537,13 +1548,12 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						atomic.AddUint64(&shmCopyReadFire, 1)
 						var buf mem.Buffer
 						if len(pSecond) == 0 {
-							buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
+							buf = mem.Copy(pFirst[:payloadLen], shmLpmPool)
 						} else {
-							pool := mem.DefaultBufferPool()
-							poolBuf := pool.Get(payloadLen)
+							poolBuf := shmLpmPool.Get(payloadLen)
 							cn := copy(*poolBuf, pFirst)
 							copy((*poolBuf)[cn:], pSecond)
-							buf = mem.NewBuffer(poolBuf, pool)
+							buf = mem.NewBuffer(poolBuf, shmLpmPool)
 						}
 						commitPayload.Commit(payloadLen)
 						// MORE flag based on END_STREAM (see ZC fast
