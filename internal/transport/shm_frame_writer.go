@@ -116,8 +116,36 @@ func (w *shmFrameWriter) setAsyncErrorHandler(fn func(error)) {
 
 // writeLoop is the single writer goroutine. It drains the channel and writes
 // frames to the ring sequentially, eliminating the need for writeMu.
-// When multiple frames are pending, it uses batch mode to suppress per-frame
-// signals and issue a single reader wakeup after the batch.
+//
+// Batching: when multiple frames are pending in the channel we wrap the
+// loop in BeginBatch / EndBatch so per-Commit reader wakes are suppressed
+// across the burst, paying one wake at EndBatch instead of one per frame.
+// That's fine for small bursts (a dozen control frames + a few MESSAGEs)
+// but turns into a producer/consumer LOCKSTEP when the burst contains
+// many large MESSAGE entries: the writer can fill the ring while the
+// reader is still parked on the pre-batch DataSequence, blocks waiting
+// for space, and only a single deadlock-guard wake from ReserveWrite
+// lets the reader make progress before the entire batch finishes.
+//
+// Empirical evidence: BenchmarkGRPCShmConcurrent / 1000 streams /
+// size=65536 under shm-tuned dropped from ~1280 MB/s (fair-default,
+// 16 KiB H2 frames) to ~460 MB/s (shm-tuned, single 64 KiB frames).
+// Adding SHM_MAX_FRAME_SIZE=16384 on top of shm-tuned recovered to
+// ~1240 MB/s, isolating the variable to H2 frame cadence -- i.e. the
+// reader's per-Commit wake granularity. With chunking the inner
+// emitH2DataFromCursor already opens nested ring/8 signal-batches,
+// but those inner EndBatch calls only DECREMENT batchDepth (the
+// signal still waits for the outer EndBatch). So chunking only helps
+// because each entry's body is committed in finer reservation chunks,
+// making the deadlock-guard wake fire earlier in single-entry mode.
+// To pipeline at the writer-loop scale we need to release the batch
+// every signalBatchBytes of accumulated body, opening a fresh one
+// immediately so subsequent entries continue under suppression.
+//
+// signalBatchBytes is bounded to ring.Capacity()/8 to mirror the
+// inner emitH2DataFromCursor pacing (and .NET's RingFrameStream
+// chunkSize). Smaller values would amortise the wake cost too
+// thinly; larger values bring back the lockstep.
 func (w *shmFrameWriter) writeLoop() {
 	defer w.wg.Done()
 
@@ -146,14 +174,33 @@ func (w *shmFrameWriter) writeLoop() {
 		// Check if more frames are queued behind this one.
 		pending := len(w.ch)
 		if pending > 0 {
+			signalBatchBytes := int(w.tx.Capacity() / 8)
+			batchBytes := 0
 			w.tx.BeginBatch()
+			// entryBytes MUST be computed BEFORE processEntry:
+			// processEntry frees entry.data on the SHM_NO_WU=1
+			// fire-and-forget path, after which entry.data.Len()
+			// panics with "read freed buffer".
+			eb := entryBytes(entry)
 			w.processEntry(entry)
+			batchBytes += eb
 			for i := 0; i < pending; i++ {
 				next, ok := <-w.ch
 				if !ok {
 					break
 				}
+				neb := entryBytes(next)
 				w.processEntry(next)
+				batchBytes += neb
+				// Periodically release the batch so the reader gets a
+				// wake mid-burst and can drain in parallel with the
+				// next group's writes, instead of waiting for the
+				// entire pending queue to complete.
+				if batchBytes >= signalBatchBytes && i < pending-1 {
+					w.tx.EndBatch()
+					w.tx.BeginBatch()
+					batchBytes = 0
+				}
 			}
 			w.tx.EndBatch()
 		} else {
@@ -161,6 +208,17 @@ func (w *shmFrameWriter) writeLoop() {
 		}
 		w.inlineMu.Unlock()
 	}
+}
+
+// entryBytes returns an estimate of how many ring bytes a frameEntry
+// consumes when written. Used by writeLoop's signal-batch flush
+// accounting. Cheap to compute (no allocations) and only a hint --
+// off-by-a-few-bytes is harmless since the threshold is ring/8.
+func entryBytes(e frameEntry) int {
+	if e.data != nil {
+		return len(e.hdr) + e.data.Len()
+	}
+	return len(e.payload)
 }
 
 // processEntry writes a single frame entry to the ring and signals

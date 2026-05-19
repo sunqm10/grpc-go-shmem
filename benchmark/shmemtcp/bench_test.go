@@ -313,6 +313,19 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	if profile.applyToShm && profile.maxFrameSize > 0 {
 		transport.ConfigureShmMaxFrameSizeForBench(profile.maxFrameSize)
 	}
+	// SHM_MAX_FRAME_SIZE env var overrides whatever BENCH_PROFILE set
+	// (or the default). Lets a reviewer isolate the H2 DATA frame
+	// cadence variable from BENCH_PROFILE's other levers
+	// (initialWindowSize, applyToShm) when investigating per-frame
+	// chunking effects, e.g. why shm-tuned + 1000 streams x 64 KiB
+	// underperforms fair-default at the same concurrency.
+	if v := os.Getenv("SHM_MAX_FRAME_SIZE"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			b.Fatalf("SHM_MAX_FRAME_SIZE=%q invalid: %v", v, perr)
+		}
+		transport.ConfigureShmMaxFrameSizeForBench(n)
+	}
 	// SHM_SPIN_ITERS lets reviewers compare SHM under "no spin" (the
 	// default — matches UDS behaviour by paying a futex syscall per
 	// wake) vs operator-tuned "spin opted-in" (skips both sides'
