@@ -57,11 +57,14 @@ import (
 var benchConcurrencyLevels = []int{10, 100, 1000}
 
 // concurrentStreamSizes is the per-message payload set used by the
-// concurrent benchmarks. Kept smaller than the single-stream
-// benchmarks to bound total bytes through the transport when
-// concurrency × size × b.N is large (e.g. 1000 streams × 64 KiB × 1k
-// rounds = 64 GiB through one ring; not what we want).
-var concurrentStreamSizes = []int{64, 4096, 65536}
+// concurrent benchmarks. Kept SMALLER than the single-stream benchmarks
+// because concurrent total bytes scales as numStreams x size x b.N:
+// for 1000 streams x 1 MiB x just b.N=10 that is already 10 GiB of ring
+// traffic per sub-bench. Anything > 1 MiB makes the matrix run for
+// tens of minutes without adding new information beyond what
+// BenchmarkGRPC*Stream and BenchmarkGRPC*Unary already cover at the
+// large end.
+var concurrentStreamSizes = []int{64, 4096, 65536, 262144, 1048576}
 
 // benchConcurrentStreams runs numStreams concurrent ping-pong streams,
 // each doing b.N rounds in its own goroutine. Per-stream stream setup

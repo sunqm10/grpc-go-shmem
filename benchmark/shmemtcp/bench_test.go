@@ -566,81 +566,67 @@ func benchUnary(b *testing.B, client testgrpc.BenchmarkServiceClient, size int) 
 	endZC()
 }
 
-// Standard payload sizes (64 B to 1 MiB).
-var benchStreamSizes = []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576}
-
-// Unary payload sizes (64 B to 4 KiB) — small payloads where per-call overhead dominates.
-var benchUnarySizes = []int{64, 256, 1024, 4096}
-
-// Large payload sizes (1 MiB to 256 MiB). H2 chunking on the SHM
-// transport splits messages whose total wire size exceeds ring
-// capacity into multiple DATA frames, so a 256 MiB payload on a
-// 64 MiB ring is well-formed and round-trips correctly. The
-// historical 16 MiB cap was a workaround for the legacy Custom16
-// MORE-flag chunking path which no longer exists.
-var benchLargeSizes = []struct {
+// benchPayloadSizes is the unified payload-size table used by all
+// non-concurrent bench functions. Stream and Unary share the same
+// table so the matrix is symmetric and reviewers do not have to
+// cross-reference two name-spaces. The earlier split into
+// BenchmarkGRPC*Stream / BenchmarkGRPC*LargeStream (and the Unary
+// twin) was a historical artefact of a since-removed Custom16
+// MORE-flag chunking path; the underlying transport code is
+// identical for every entry below.
+//
+// Labels keep the previous repo convention so existing bench
+// histories continue to match: raw byte counts for < 1 MiB, MB
+// suffix for >= 1 MiB.
+var benchPayloadSizes = []struct {
 	bytes int
 	label string
 }{
-	{1 * 1024 * 1024, "1MB"},
-	{4 * 1024 * 1024, "4MB"},
-	{16 * 1024 * 1024, "16MB"},
-	{64 * 1024 * 1024, "64MB"},
-	{256 * 1024 * 1024, "256MB"},
+	{64, "64"},
+	{256, "256"},
+	{1024, "1024"},
+	{4096, "4096"},
+	{16 << 10, "16384"},
+	{64 << 10, "65536"},
+	{256 << 10, "262144"},
+	{1 << 20, "1MB"},
+	{4 << 20, "4MB"},
+	{16 << 20, "16MB"},
+	{64 << 20, "64MB"},
+	{256 << 20, "256MB"},
 }
 
 // =============================================================================
 // SHM Transport — Full gRPC Stack
 // =============================================================================
 
-// BenchmarkGRPCShmStream measures streaming ping-pong through the full gRPC stack
-// over the shared memory transport.
+// BenchmarkGRPCShmStream measures streaming ping-pong through the full gRPC
+// stack over the shared memory transport, sweeping every entry of
+// benchPayloadSizes (64 B through 256 MiB). One env is created and reused
+// across all sizes so we measure steady-state per-message throughput rather
+// than connection-setup amortised into the first size.
 func BenchmarkGRPCShmStream(b *testing.B) {
-	for _, size := range benchStreamSizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			env := newShmEnv(b)
-			defer env.close()
-			benchStream(b, env.client, size)
+	env := newShmEnv(b)
+	defer env.close()
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchStream(b, env.client, p.bytes)
 		})
 	}
 }
 
-// BenchmarkGRPCShmUnary measures unary RPC latency through the full gRPC stack
-// over the shared memory transport.
+// BenchmarkGRPCShmUnary measures unary RPC latency through the full gRPC
+// stack over the shared memory transport, sweeping every entry of
+// benchPayloadSizes (64 B through 256 MiB). Like the Stream variant the
+// env is reused across sizes.
 func BenchmarkGRPCShmUnary(b *testing.B) {
 	env := newShmEnv(b)
 	defer env.close()
-	for _, size := range benchUnarySizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			benchUnary(b, env.client, size)
-		})
-	}
-}
-
-// BenchmarkGRPCShmLargeStream measures streaming with large payloads (1–256 MiB)
-// through the full gRPC stack over shared memory.
-func BenchmarkGRPCShmLargeStream(b *testing.B) {
-	env := newShmEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchStream(b, env.client, ls.bytes)
-		})
-	}
-}
-
-// BenchmarkGRPCShmLargeUnary measures unary RPC with large payloads (1–256 MiB)
-// through the full gRPC stack over shared memory.
-func BenchmarkGRPCShmLargeUnary(b *testing.B) {
-	env := newShmEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchUnary(b, env.client, ls.bytes)
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchUnary(b, env.client, p.bytes)
 		})
 	}
 }
@@ -649,54 +635,28 @@ func BenchmarkGRPCShmLargeUnary(b *testing.B) {
 // TCP Transport — Full gRPC Stack
 // =============================================================================
 
-// BenchmarkGRPCTCPStream measures streaming ping-pong through the full gRPC stack
-// over TCP loopback.
+// BenchmarkGRPCTCPStream measures streaming ping-pong through the full gRPC
+// stack over TCP loopback, covering the same size range as the SHM variant.
 func BenchmarkGRPCTCPStream(b *testing.B) {
 	env := newTCPEnv(b)
 	defer env.close()
-	for _, size := range benchStreamSizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			benchStream(b, env.client, size)
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchStream(b, env.client, p.bytes)
 		})
 	}
 }
 
-// BenchmarkGRPCTCPUnary measures unary RPC latency through the full gRPC stack
-// over TCP loopback.
+// BenchmarkGRPCTCPUnary measures unary RPC latency through the full gRPC
+// stack over TCP loopback, covering the same size range as the SHM variant.
 func BenchmarkGRPCTCPUnary(b *testing.B) {
 	env := newTCPEnv(b)
 	defer env.close()
-	for _, size := range benchUnarySizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			benchUnary(b, env.client, size)
-		})
-	}
-}
-
-// BenchmarkGRPCTCPLargeStream measures streaming with large payloads (1–256 MiB)
-// through the full gRPC stack over TCP loopback.
-func BenchmarkGRPCTCPLargeStream(b *testing.B) {
-	env := newTCPEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchStream(b, env.client, ls.bytes)
-		})
-	}
-}
-
-// BenchmarkGRPCTCPLargeUnary measures unary RPC with large payloads (1–256 MiB)
-// through the full gRPC stack over TCP loopback.
-func BenchmarkGRPCTCPLargeUnary(b *testing.B) {
-	env := newTCPEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchUnary(b, env.client, ls.bytes)
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchUnary(b, env.client, p.bytes)
 		})
 	}
 }
@@ -705,54 +665,30 @@ func BenchmarkGRPCTCPLargeUnary(b *testing.B) {
 // Unix Socket Transport — Full gRPC Stack
 // =============================================================================
 
-// BenchmarkGRPCUnixStream measures streaming ping-pong through the full gRPC stack
-// over a Unix domain socket.
+// BenchmarkGRPCUnixStream measures streaming ping-pong through the full gRPC
+// stack over a Unix domain socket, covering the same size range as the SHM
+// variant.
 func BenchmarkGRPCUnixStream(b *testing.B) {
 	env := newUnixEnv(b)
 	defer env.close()
-	for _, size := range benchStreamSizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			benchStream(b, env.client, size)
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchStream(b, env.client, p.bytes)
 		})
 	}
 }
 
-// BenchmarkGRPCUnixUnary measures unary RPC latency through the full gRPC stack
-// over a Unix domain socket.
+// BenchmarkGRPCUnixUnary measures unary RPC latency through the full gRPC
+// stack over a Unix domain socket, covering the same size range as the SHM
+// variant.
 func BenchmarkGRPCUnixUnary(b *testing.B) {
 	env := newUnixEnv(b)
 	defer env.close()
-	for _, size := range benchUnarySizes {
-		size := size
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			benchUnary(b, env.client, size)
-		})
-	}
-}
-
-// BenchmarkGRPCUnixLargeStream measures streaming with large payloads (1–256 MiB)
-// through the full gRPC stack over a Unix domain socket.
-func BenchmarkGRPCUnixLargeStream(b *testing.B) {
-	env := newUnixEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchStream(b, env.client, ls.bytes)
-		})
-	}
-}
-
-// BenchmarkGRPCUnixLargeUnary measures unary RPC with large payloads (1–256 MiB)
-// through the full gRPC stack over a Unix domain socket.
-func BenchmarkGRPCUnixLargeUnary(b *testing.B) {
-	env := newUnixEnv(b)
-	defer env.close()
-	for _, ls := range benchLargeSizes {
-		ls := ls
-		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
-			benchUnary(b, env.client, ls.bytes)
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchUnary(b, env.client, p.bytes)
 		})
 	}
 }
