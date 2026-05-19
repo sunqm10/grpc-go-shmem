@@ -100,30 +100,39 @@ func (e *grpcBenchEnv) close() {
 // `grpc_shm_*` in /dev/shm and the OS temp dir, leaves anything else
 // alone, and runs once at startup and once on exit.
 func TestMain(m *testing.M) {
-	// SHM_DIRTY_POOL=1 swaps grpc-go's default buffer pool to a
-	// dirty (no-memclr-on-Get) version. Targets the dominant memclr
-	// cost identified by pprof: BinaryTieredBufferPool.sizedBufferPool
-	// with shouldZero=true clears the ENTIRE tier capacity on every
-	// Get -- so a 64 KiB request from the 1 MiB tier memclrs 1 MiB.
-	// At 1000 concurrent streams × 64 KiB this becomes ~1 GiB of
-	// memclr per round per direction, dominating CPU (~46% of samples
-	// in pprof). The caller (proto.MarshalAppend, mem.Copy, the SHM
-	// lpmAccumulator) always overwrites the buffer immediately, so
-	// the zeroing is pure waste.
+	// BENCH_DIRTY_DEFAULT_POOL=1 swaps grpc-go's process-wide default
+	// buffer pool to a dirty (no-memclr-on-Get) variant via the
+	// already-public experimental.SetDefaultBufferPool API. This is
+	// NOT a SHM-specific optimisation -- it changes the pool used by
+	// codec.Marshal / codec.Unmarshal / MaterializeToBuffer for ALL
+	// transports in this test binary (SHM, TCP, UDS, in-proc).
 	//
-	// Why opt-in: experimental.SetDefaultBufferPool is a process-wide
-	// switch that affects ALL grpc transports in the test binary, not
-	// just SHM. Keeping it default-off preserves the fair-comparison
-	// reference numbers (everyone pays grpc-go's stock memclr cost).
-	// Set SHM_DIRTY_POOL=1 to see the upper bound when the dirty pool
-	// is opted in.
-	if os.Getenv("SHM_DIRTY_POOL") == "1" {
+	// Why the toggle exists: pprof of SHM bench showed memclr
+	// dominating CPU. Root cause is grpc-go's stock
+	// BinaryTieredBufferPool.sizedBufferPool with shouldZero=true:
+	// it clears the ENTIRE tier capacity on every Get, so a 64 KiB
+	// request from the 1 MiB tier memclrs 1 MiB. At 1000 concurrent
+	// streams × 64 KiB this becomes ~1 GiB of memclr per round per
+	// direction (~46% of samples). The zeroing is pure waste because
+	// every grpc caller (proto.MarshalAppend, mem.Copy,
+	// MaterializeToBuffer, decompress) overwrites the returned buffer
+	// before any reader observes it. shouldZero=true is grpc-go's
+	// defensive default for multi-tenant deployments where a bug
+	// could leak stale bytes across trust boundaries; single-tenant
+	// applications can safely opt out.
+	//
+	// Why default off: the swap is process-wide so it speeds up TCP
+	// and UDS too. Leaving it off keeps the reference numbers grounded
+	// in stock grpc-go behaviour every user pays. Flip the env to 1
+	// to A/B compare and observe that the speedup is cross-transport,
+	// not SHM-only.
+	if os.Getenv("BENCH_DIRTY_DEFAULT_POOL") == "1" {
 		// Mirror grpc-go's default pool tier list (256 B, 4 KiB,
 		// 16 KiB, 32 KiB, 1 MiB) but on the dirty constructor so
 		// per-Get clear() is skipped.
 		dirty, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
 		if err != nil {
-			panic(fmt.Sprintf("SHM_DIRTY_POOL init failed: %v", err))
+			panic(fmt.Sprintf("BENCH_DIRTY_DEFAULT_POOL init failed: %v", err))
 		}
 		experimental.SetDefaultBufferPool(dirty)
 	}
@@ -202,17 +211,17 @@ func logBenchEnvOnce(b *testing.B) {
 		} else if noWU == "1" {
 			noWU = "1 (WU elided, send-quota skipped; fast-path async fire-and-forget)"
 		}
-		dirtyPool := os.Getenv("SHM_DIRTY_POOL")
+		dirtyPool := os.Getenv("BENCH_DIRTY_DEFAULT_POOL")
 		if dirtyPool == "" {
-			dirtyPool = "0 (off, grpc-go default pool memclrs each Get)"
+			dirtyPool = "0 (off, grpc-go stock pool: shouldZero=true clears tier on every Get -- applies to ALL transports)"
 		} else if dirtyPool == "1" {
-			dirtyPool = "1 (default pool swapped to dirty; codec.Marshal + recv skip per-Get memclr)"
+			dirtyPool = "1 (grpc-go process-wide default pool swapped to dirty -- speeds up ALL transports, not SHM only)"
 		}
 		bProf := os.Getenv("BENCH_PROFILE")
 		if bProf == "" {
 			bProf = "shm-tuned (SHM keeps 2 GiB quota, TCP/UDS HTTP/2 defaults)"
 		}
-		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_NO_WU=%s SHM_DIRTY_POOL=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
+		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_NO_WU=%s BENCH_DIRTY_DEFAULT_POOL=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
 			bProf, noWU, dirtyPool, dsWake, inprocWake, spin,
 			prof.initialWindowSize, prof.maxFrameSize, prof.applyToShm,
 		)
