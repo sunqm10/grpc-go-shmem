@@ -4,7 +4,9 @@ set -u
 OUTROOT=~/bench_out/v34_fair
 RES="$OUTROOT/resources"
 mkdir -p "$RES"
-cd ~/grpc-go-phase1 || exit 1
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO" || { echo "Cannot cd to $REPO"; exit 1; }
+echo "using REPO=$REPO"
 
 clean_shm() {
     ls /dev/shm 2>/dev/null | grep -E '^grpc_shm_' | xargs -r -I{} rm -f /dev/shm/{}

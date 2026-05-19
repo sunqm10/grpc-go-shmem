@@ -4,7 +4,10 @@
 set -u
 OUTROOT=~/bench_out/v34_fair
 mkdir -p "$OUTROOT"
-cd ~/grpc-go-phase1 || exit 1
+# Repo root = parent of this script's tools/ dir, or override with REPO env var.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO" || { echo "Cannot cd to $REPO"; exit 1; }
+echo "using REPO=$REPO"
 
 clean_shm() {
     ls /dev/shm 2>/dev/null | grep -E '^grpc_shm_' | xargs -r -I{} rm -f /dev/shm/{}

@@ -1,6 +1,12 @@
 #!/bin/bash
 # Summarize resource snapshots
-cd ~/bench_out/v34_fair/resources || exit 1
+RES=~/bench_out/v34_fair/resources
+if [ ! -d "$RES" ]; then
+    echo "No resource snapshots found at $RES."
+    echo "Run tools/fair_bench_with_resources_linux.sh or tools/sample_resources_linux.sh first."
+    exit 1
+fi
+cd "$RES" || exit 1
 printf "%-25s %-7s %-9s %-7s %-7s %-7s %-9s %-10s %-12s\n" "CELL" "fd_tot" "fd_evfd" "fd_sock" "fd_anon" "fd_shm" "mmaps" "shm_kib" "rss"
 for dir in */; do
     label="${dir%/}"

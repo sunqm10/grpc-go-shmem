@@ -3,7 +3,9 @@
 set -u
 OUTROOT=~/bench_out/v34_fair/cpuprof
 mkdir -p "$OUTROOT"
-cd ~/grpc-go-phase1 || exit 1
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO" || { echo "Cannot cd to $REPO"; exit 1; }
+echo "using REPO=$REPO"
 
 unset SHM_INPROC_WAKE
 export SHM_NO_WU=1 BENCH_PROFILE=fair-default SHM_DATASEG_WAKE=1 SHM_BENCH_CPU=1
