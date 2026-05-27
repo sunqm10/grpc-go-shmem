@@ -55,6 +55,7 @@ import (
 	"google.golang.org/grpc/experimental/shm"
 	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/mem"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -128,13 +129,12 @@ func TestMain(m *testing.M) {
 	// to A/B compare and observe that the speedup is cross-transport,
 	// not SHM-only.
 	if os.Getenv("BENCH_DIRTY_DEFAULT_POOL") == "1" {
-		// Mirror grpc-go's default pool tier list (256 B, 4 KiB,
-		// 16 KiB, 32 KiB, 128 KiB, 512 KiB, 1 MiB) but on the dirty
-		// constructor so per-Get clear() is skipped. Tiers 17 (128 KiB)
-		// and 19 (512 KiB) are fork-local additions in mem/buffer_pool.go;
-		// keep this list in sync with mem.defaultBufferPoolSizeExponents
-		// so the dirty-pool A/B comparison is apples-to-apples.
-		dirty, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 17, 19, 20)
+		// Build the dirty variant from the same tier list the stock
+		// mem.DefaultBufferPool() uses, so the A/B comparison isolates
+		// just the per-Get memclr cost (dirty skips it). The tier list
+		// is sourced from mem.DefaultBufferPoolSizeExponents() to avoid
+		// drift between this bench and the production pool definition.
+		dirty, err := imem.NewDirtyBinaryTieredBufferPool(mem.DefaultBufferPoolSizeExponents()...)
 		if err != nil {
 			panic(fmt.Sprintf("BENCH_DIRTY_DEFAULT_POOL init failed: %v", err))
 		}

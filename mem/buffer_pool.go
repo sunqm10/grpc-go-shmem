@@ -43,33 +43,44 @@ var (
 	// DefaultBufferPool. Each entry is a log2 byte size; the pool
 	// returns the smallest tier that fits a Get(size) request.
 	//
-	// Tiers 17 (128 KiB) and 19 (512 KiB) were added in this fork on
-	// top of the upstream {8, 12, 14, 15, 20} set to close the 32 KiB →
-	// 1 MiB gap that hurts mid-size message Marshal/MaterializeToBuffer
-	// throughput. A 64 KiB proto Marshal previously landed in the 1 MiB
-	// tier (16× over-allocation), causing memclr of 1 MiB on every
-	// pool miss; with the 128 KiB tier the Marshal now allocates
-	// 128 KiB (2× over-allocation). The change benefits all transports
-	// that use this pool (TCP, UDS, SHM, in-process); SHM is the
-	// largest beneficiary because its receive-side accumulator
-	// (lpmAccumulator) also allocates per-LPM contiguous buffers
-	// sized to the full message length.
+	// The 32 KiB → 1 MiB gap in a {8, 12, 14, 15, 20} tier set causes
+	// any Get(size) with 32 KiB < size ≤ 1 MiB to snap to the 1 MiB
+	// tier, which the pool zeroes on every Get. A 64 KiB Marshal
+	// therefore pays a 1 MiB memclr per allocation — 16× the requested
+	// size. Tiers 17 (128 KiB) and 19 (512 KiB) close that gap and
+	// reduce the worst-case overshoot from 16× to 2× across the
+	// 32 KiB–1 MiB range. The 17/19 split was picked so neither sub-
+	// range exceeds 2× overshoot while keeping the total tier count
+	// (and therefore per-P sync.Pool headroom) small.
 	//
 	// Tradeoff: each additional tier holds its own sync.Pool per P,
-	// so memory headroom grows modestly with the number of tiers and
-	// CPU count. For most workloads this is more than offset by the
-	// reduced waste in the previously-overshot 32 KiB → 1 MiB gap.
+	// so idle memory grows modestly with tier count × GOMAXPROCS.
+	// For typical gRPC workloads — where unary and streaming sends
+	// in the 32 KiB–1 MiB range are common — the reduced per-Get
+	// memclr cost dominates the headroom cost.
 	defaultBufferPoolSizeExponents = []uint8{
 		8,
-		12, // Go page size, 4KB
-		14, // 16KB (max HTTP/2 frame size used by gRPC)
-		15, // 32KB (default buffer size for io.Copy)
-		17, // 128KB (fork-local: covers 32K+1..128K, e.g., 64KB Marshal + LPM hdr)
-		19, // 512KB (fork-local: covers 128K+1..512K)
-		20, // 1MB
+		12, // 4 KiB (Go page size)
+		14, // 16 KiB (max HTTP/2 frame size used by gRPC)
+		15, // 32 KiB (default buffer size for io.Copy)
+		17, // 128 KiB (covers 32 KiB+1 .. 128 KiB)
+		19, // 512 KiB (covers 128 KiB+1 .. 512 KiB)
+		20, // 1 MiB
 	}
 	defaultBufferPool BufferPool
 )
+
+// DefaultBufferPoolSizeExponents returns a copy of the log2 byte-size tier
+// set used by DefaultBufferPool. Callers that wrap or compose a buffer pool
+// (for example a "dirty" variant that skips per-Get zeroing for a hot path
+// whose buffer is fully overwritten immediately after Get) can use this to
+// stay in lock-step with the default tier set instead of duplicating the
+// list. The returned slice is a fresh copy and safe to retain or mutate.
+func DefaultBufferPoolSizeExponents() []uint8 {
+	out := make([]uint8, len(defaultBufferPoolSizeExponents))
+	copy(out, defaultBufferPoolSizeExponents)
+	return out
+}
 
 func init() {
 	var err error
