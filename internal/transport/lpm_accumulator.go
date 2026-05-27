@@ -37,11 +37,28 @@ import (
 // pre-alloc + cross-RPC pooling fixes showed memclr at ~20% of total
 // CPU; switching to a dirty pool eliminates it.
 //
-// Size tiers match mem.DefaultBufferPool: 256 B, 4 KiB, 16 KiB,
-// 32 KiB, 1 MiB. Requests above 1 MiB fall back to the dirty simple
-// pool which does sync.Pool reuse without the size-bucketing.
+// Size tiers: 256 B, 4 KiB, 16 KiB, 32 KiB, 128 KiB, 512 KiB, 1 MiB.
+//
+// The intermediate 128 KiB and 512 KiB tiers (added May 2026) are
+// SHM-specific and intentionally NOT mirrored into the upstream
+// mem.DefaultBufferPool. They close the 32 KiB → 1 MiB gap in the
+// stock tier set, which the SHM lpmAccumulator hits hard because it
+// allocates ONE contiguous buffer sized to the full LPM length —
+// e.g., a 64 KiB LPM (65541 bytes) used to land in the 1 MiB tier,
+// 16× over-allocation. The over-allocated bytes are live during the
+// receive window and inflate live heap, which directly drives GC
+// scan cost (observed: SHM 64K Stream pays ~7× UnixStream GC
+// overhead under fair-default before this fix). Intermediate tiers
+// reduce the 64K LPM allocation to 128 KiB and 256 KiB LPM to
+// 512 KiB, eliminating most of the over-allocation. UDS's recv path
+// does not hit the 32 K→1 M gap because it keeps each H2 DATA frame
+// as a separate 16 KiB-tier buffer instead of assembling into one
+// contiguous LPM.
+//
+// Requests above 1 MiB fall back to the dirty simple pool which
+// does sync.Pool reuse without the size-bucketing.
 var shmLpmPool = func() mem.BufferPool {
-	p, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
+	p, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 17, 19, 20)
 	if err != nil {
 		// Argument list is hardcoded above; failure here implies a
 		// programming error in imem itself.
