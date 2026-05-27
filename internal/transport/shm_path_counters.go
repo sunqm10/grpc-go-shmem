@@ -109,14 +109,6 @@ var (
 	// per chunk). Used when the LPM spans multiple DATA frames or
 	// when the candidate frame failed the ZC / single-copy guards.
 	shmAccReadFire uint64
-
-	// shmZCAnchorBudgetExceeded: multi-anchor BeginAnchor rejected
-	// because either the anchor-count budget or the in-flight-bytes
-	// budget was full. Caller falls back to the single-frame copy
-	// fast path (counted by shmCopyReadFire). High values signal that
-	// the multi-anchor budget needs tuning relative to the workload
-	// (e.g., raise zcAnchorBudgetCount or revisit zcMaxBytesBudget).
-	shmZCAnchorBudgetExceeded uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -138,7 +130,6 @@ type ShmPathCounters struct {
 	ZCReadFire            uint64
 	CopyReadFire          uint64
 	AccReadFire           uint64
-	ZCAnchorBudgetExceeded uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -157,7 +148,6 @@ func LoadShmPathCounters() ShmPathCounters {
 		ZCReadFire:            atomic.LoadUint64(&shmZCReadFire),
 		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
 		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
-		ZCAnchorBudgetExceeded: atomic.LoadUint64(&shmZCAnchorBudgetExceeded),
 	}
 }
 
@@ -177,6 +167,5 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		ZCReadFire:            a.ZCReadFire - before.ZCReadFire,
 		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
 		AccReadFire:           a.AccReadFire - before.AccReadFire,
-		ZCAnchorBudgetExceeded: a.ZCAnchorBudgetExceeded - before.ZCAnchorBudgetExceeded,
 	}
 }
