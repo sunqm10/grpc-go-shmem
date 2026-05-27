@@ -1905,7 +1905,13 @@ func (t *ShmClientTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if s == nil {
 		return
 	}
-	if w := s.fc.maybeAdjust(lpmSize); w > 0 {
+	// Use the additive variant: SHM's codec-driven pre-credit fires
+	// per LPM at parse time, so multiple pipelined LPMs can be
+	// in-flight before the application drains the recvBuffer. The
+	// stock maybeAdjust SETs f.delta and would lose previously
+	// outstanding pre-credit; maybeAdjustAdditive ADDs the
+	// incremental credit needed on top of any existing delta debt.
+	if w := s.fc.maybeAdjustAdditive(lpmSize); w > 0 {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}

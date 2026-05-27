@@ -1092,3 +1092,128 @@ func TestShmFlowControl_ConcurrentWholeMessageWrites(t *testing.T) {
 	}
 	t.Logf("completed %d concurrent whole-message writes", completed)
 }
+
+// TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs is a regression
+// test for a real correctness bug discovered in PR-level review:
+// the SHM codec-driven pre-credit path (onMessageStart) fires per
+// LPM at parse time, not per app-Read. When two large LPMs are
+// pipelined on a single stream and the application has not yet
+// drained the recvBuffer of the first one, the second LPM's
+// pre-credit hook would call stock inFlow.maybeAdjust which SETs
+// f.delta = n — overwriting the previously emitted pre-credit
+// debt. Subsequent onData accumulation for the second LPM would
+// then exceed (limit + delta) and falsely trip FLOW_CONTROL_ERROR.
+//
+// maybeAdjustAdditive fixes this by ADDing the incremental credit
+// needed on top of any outstanding delta, so the credit ledger
+// stays balanced across pipelined LPMs.
+//
+// Test scenario: limit = 64 KiB, two back-to-back 1 MiB messages
+// with no onRead in between (slow reader). The buggy
+// maybeAdjust-based path would reject the second onData; the
+// additive path accepts both.
+func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
+	const (
+		limit   uint32 = 65535      // 64 KiB-ish stream window
+		lpmSize uint32 = 1024 * 1024 // 1 MiB LPM
+	)
+
+	// Baseline: confirm the bug exists with stock maybeAdjust.
+	t.Run("maybeAdjust_overwrites_delta_and_rejects", func(t *testing.T) {
+		var f inFlow
+		f.limit = limit
+
+		// LPM 1: pre-credit fires.
+		w1 := f.maybeAdjust(lpmSize)
+		if w1 == 0 {
+			t.Fatalf("expected pre-credit for LPM 1, got 0")
+		}
+		// All DATA for LPM 1 arrives.
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 1 onData rejected unexpectedly: %v", err)
+		}
+		// Slow reader: app has NOT called onRead yet.
+
+		// LPM 2: pre-credit fires while pendingData is still inflated
+		// from LPM 1. maybeAdjust will SET f.delta = lpmSize (or 0),
+		// overwriting the previous pre-credit debt.
+		_ = f.maybeAdjust(lpmSize)
+
+		// DATA for LPM 2 arrives. Stock semantics: this should reject.
+		err := f.onData(lpmSize)
+		if err == nil {
+			t.Fatalf("baseline: expected onData to reject LPM 2 (pendingData=%d > limit+delta=%d), but it accepted; bug may be fixed elsewhere",
+				f.pendingData, uint64(f.limit)+uint64(f.delta))
+		}
+	})
+
+	// Fix: confirm maybeAdjustAdditive admits both LPMs correctly.
+	t.Run("maybeAdjustAdditive_accumulates_and_admits", func(t *testing.T) {
+		var f inFlow
+		f.limit = limit
+
+		// LPM 1: additive pre-credit.
+		w1 := f.maybeAdjustAdditive(lpmSize)
+		if w1 == 0 {
+			t.Fatalf("expected pre-credit for LPM 1, got 0")
+		}
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 1 onData rejected: %v (limit=%d, delta=%d, pendingData=%d)",
+				err, f.limit, f.delta, f.pendingData)
+		}
+		// Slow reader: no onRead.
+
+		// LPM 2: additive pre-credit, on top of LPM 1's outstanding delta.
+		w2 := f.maybeAdjustAdditive(lpmSize)
+		if w2 == 0 {
+			t.Fatalf("expected additive pre-credit for LPM 2, got 0 (delta=%d, pendingData=%d)",
+				f.delta, f.pendingData)
+		}
+		// DATA for LPM 2 arrives. Must NOT reject.
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 2 onData rejected after additive pre-credit: %v (limit=%d, delta=%d, pendingData=%d)",
+				err, f.limit, f.delta, f.pendingData)
+		}
+
+		// Now app drains both messages: onRead must repay the full
+		// outstanding delta debt before crediting WU.
+		_ = f.onRead(lpmSize)
+		_ = f.onRead(lpmSize)
+		// After both reads, delta and pendingData should be 0 (or near 0).
+		if f.pendingData != 0 {
+			t.Errorf("after draining: pendingData=%d, want 0", f.pendingData)
+		}
+		if f.delta != 0 {
+			t.Errorf("after draining: delta=%d, want 0", f.delta)
+		}
+	})
+
+	// maybeAdjustAdditive returns 0 when existing capacity already
+	// admits the LPM (no double-credit).
+	t.Run("maybeAdjustAdditive_no_credit_when_fits", func(t *testing.T) {
+		var f inFlow
+		f.limit = 1024 * 1024 * 2 // 2 MiB
+		w := f.maybeAdjustAdditive(lpmSize)
+		if w != 0 {
+			t.Errorf("expected 0 additive credit (LPM fits in limit), got %d", w)
+		}
+		if f.delta != 0 {
+			t.Errorf("delta should remain 0 when LPM fits, got %d", f.delta)
+		}
+	})
+
+	// maybeAdjustAdditive caps at maxWindowSize.
+	t.Run("maybeAdjustAdditive_caps_at_maxWindowSize", func(t *testing.T) {
+		var f inFlow
+		f.limit = 100
+		// Request an LPM near maxWindowSize.
+		big := uint32(1) << 30 // 1 GiB
+		w := f.maybeAdjustAdditive(big)
+		if uint64(f.limit)+uint64(f.delta) > uint64(maxWindowSize) {
+			t.Errorf("limit+delta=%d exceeded maxWindowSize=%d after additive call",
+				uint64(f.limit)+uint64(f.delta), maxWindowSize)
+		}
+		_ = w
+	})
+}
+
