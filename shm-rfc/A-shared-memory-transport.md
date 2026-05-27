@@ -332,9 +332,12 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
             | WireFormatCount(1B) | WireFormats(count B)
 ```
 
-- Version: control-frame encoding version (current = 1). This is
+- Version: control-frame encoding version (current = 2). This is
   independent of the segment header Version field, which describes the
-  segment binary layout.
+  segment binary layout. v2 introduces the Flags byte on CONNECT and
+  a reserved Flags byte on ACCEPT (see ACCEPT Payload). v1 peers that
+  omit these bytes MUST be rejected at the handshake boundary; the
+  protocol is pre-1.0 and does not preserve v1 wire compatibility.
 - RingACapacity / RingBCapacity: client's preferred ring sizes in bytes.
   A value of 0 means "use the server's default." The server is free to
   choose smaller capacities.
@@ -377,10 +380,11 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
   trailing bytes) MUST be treated as protocol-incompatible and rejected
   at the handshake boundary.
 
-#### ACCEPT Payload (variable, minimum 6 bytes)
+#### ACCEPT Payload (variable, minimum 7 bytes)
 
 ```
-Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8) | SelectedWire(1B)
+Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8)
+            | SelectedWire(1B) | Flags(1B)
 ```
 
 Contains the name of the data segment the server has allocated and the
@@ -392,6 +396,11 @@ ring capacities are read from the data segment's header.
 client's CONNECT advertisement. MUST be 0x01 (HTTP/2). Clients MUST
 treat any other value as a connection failure and continue on the
 bootstrap channel.
+
+`Flags` is a v2 reserved byte. Senders MUST set it to 0; receivers
+MUST accept any value for forward compatibility but MUST NOT
+interpret bits without a normative definition in a later revision
+of this gRFC.
 
 #### REJECT Payload (variable)
 
@@ -412,12 +421,13 @@ HTTP/2.
 Receivers MUST validate every control-frame payload before acting on
 it:
 
-- CONNECT: `NameLen > 0`, `NameLen + 6 + WireFormatCount ≤ Length`,
-  `DataSegmentName` is valid UTF-8, `WireFormatCount ≥ 1`, and the
-  WireFormats list fits within the remaining `Length`.
-- ACCEPT: `NameLen > 0`, `NameLen + 6 == Length`, `DataSegmentName` is
-  valid UTF-8, and `SelectedWire` is one of the codes the client
-  advertised in CONNECT.
+- CONNECT: payload length ≥ 20 (`Version(1) + RingACapacity(8) +
+  RingBCapacity(8) + Flags(1) + WireFormatCount(1) + WireFormats(≥1)`),
+  `WireFormatCount ≥ 1`, the WireFormats list fits within the remaining
+  `Length`, and the advertised list contains code 0x01 (HTTP/2).
+- ACCEPT: `NameLen > 0`, `NameLen + 7 == Length` (Version + NameLen +
+  Name + SelectedWire + Flags), `DataSegmentName` is valid UTF-8, and
+  `SelectedWire` is one of the codes the client advertised in CONNECT.
 - REJECT: `MsgLen + 5 == Length` and `ErrorMessage` is valid UTF-8.
 
 A payload that fails any check MUST be treated as a connection
@@ -518,10 +528,19 @@ be used. The Connection Establishment handshake on the control segment has
 already established a peer relationship by the time the data segment is
 mapped.
 
-After [Establishment Sequence](#establishment-sequence) step 7, both peers
-MUST send a SETTINGS frame as the first HTTP/2 frame on their respective
-data-segment ring, and MUST acknowledge the peer's SETTINGS with a
-SETTINGS frame carrying the ACK flag.
+After [Establishment Sequence](#establishment-sequence) step 7, peers
+MAY exchange HTTP/2 SETTINGS frames on the data-segment ring; receivers
+MUST be able to parse SETTINGS and SETTINGS ACK frames, and MUST NOT
+treat a SETTINGS frame as a protocol error. Because SHM peers run on
+the same host with full out-of-band configuration access, this gRFC
+does not require a SETTINGS preface: both endpoints MAY operate
+entirely from locally-configured defaults (e.g., `INITIAL_WINDOW_SIZE`
+from `grpc.WithInitialWindowSize` / `ServerConfig.InitialWindowSize`),
+provided the two sides are symmetrically configured. If a peer
+chooses to advertise SETTINGS, the other side MUST acknowledge per
+RFC 7540 §6.5. Wire-format normative SETTINGS exchange (the
+preface-and-ACK handshake required by RFC 7540 §3.5) is OPTIONAL
+in this gRFC and MAY be required by a future revision.
 
 ### SETTINGS
 
@@ -538,8 +557,13 @@ apply to parameters not explicitly advertised:
 | MAX_HEADER_LIST_SIZE (0x6) | 1,048,576 (1 MiB) | Bound on header list size |
 
 For parameters other than HEADER_TABLE_SIZE and ENABLE_PUSH, a peer MAY
-advertise smaller values. Senders MUST honor the peer's advertised
-values per RFC 7540 §6.5.
+advertise smaller values. When SETTINGS are advertised (see [Connection
+Preface](#connection-preface)), senders MUST honor the peer's advertised
+values per RFC 7540 §6.5. When SETTINGS are NOT advertised, both
+endpoints SHOULD be symmetrically configured to the same parameter
+values via local out-of-band configuration; implementations MUST NOT
+silently apply asymmetric values that would violate inbound enforcement
+(e.g., sending more than the peer's `INITIAL_WINDOW_SIZE`).
 
 ### HPACK
 

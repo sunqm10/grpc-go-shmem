@@ -1972,7 +1972,11 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if s == nil {
 		return
 	}
-	if w := s.fc.maybeAdjust(lpmSize); w > 0 {
+	// Use the additive variant; see ShmClientTransport.onMessageStart
+	// for the full rationale (SHM pipelines multiple in-flight LPMs
+	// per stream so the stock SET-based maybeAdjust would lose
+	// outstanding pre-credit debt).
+	if w := s.fc.maybeAdjustAdditive(lpmSize); w > 0 {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}

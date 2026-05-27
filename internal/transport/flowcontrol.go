@@ -216,6 +216,58 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 	return 0
 }
 
+// maybeAdjustAdditive is the SHM variant of maybeAdjust used by the
+// codec-driven pre-credit path (onMessageStart). Unlike maybeAdjust,
+// which assumes one active application read at a time and SETs
+// f.delta = n (stock HTTP/2 semantics), this method ADDs the
+// incremental credit needed to admit a new in-flight LPM of size n
+// on top of any outstanding pre-credit debt already present in
+// f.delta.
+//
+// Motivation: the SHM codec assembles each LPM at the transport
+// layer before the application sees it, so receiver-driven
+// pre-credit fires per LPM at parse time (not per-app-Read as in
+// stock HTTP/2). When two large LPMs are pipelined on a single
+// stream and the application has not yet consumed the first, the
+// pre-credit hook fires for the second LPM while f.pendingData is
+// still inflated by the first. A bare maybeAdjust call would
+// OVERWRITE f.delta with the second LPM's value, losing the
+// previously-emitted credit and causing onData to falsely trip
+// FLOW_CONTROL_ERROR on the second LPM's incoming DATA bytes.
+//
+// The additive variant computes the additional credit needed for
+// the new LPM (cap: maxWindowSize - limit - delta) and accumulates
+// it into f.delta. f.delta is drained by onRead as the application
+// consumes bytes (existing behaviour), so the credit ledger stays
+// balanced.
+//
+// Returns the additional credit (bytes) to emit as a stream-level
+// WINDOW_UPDATE, or 0 if existing capacity already admits the LPM.
+func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
+	if n > uint32(math.MaxInt32) {
+		n = uint32(math.MaxInt32)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// avail is the remaining receive capacity within current
+	// enforcement bounds: limit + delta - (pendingData + pendingUpdate).
+	avail := int64(f.limit) + int64(f.delta) - int64(f.pendingData) - int64(f.pendingUpdate)
+	need := int64(n) - avail
+	if need <= 0 {
+		return 0
+	}
+	// Cap so f.limit + f.delta does not exceed HTTP/2 31-bit window.
+	headroom := int64(maxWindowSize) - int64(f.limit) - int64(f.delta)
+	if need > headroom {
+		need = headroom
+	}
+	if need <= 0 {
+		return 0
+	}
+	f.delta += uint32(need)
+	return uint32(need)
+}
+
 // onData is invoked when some data frame is received. It updates pendingData.
 func (f *inFlow) onData(n uint32) error {
 	f.mu.Lock()
