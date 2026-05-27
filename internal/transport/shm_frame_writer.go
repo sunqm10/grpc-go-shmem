@@ -597,6 +597,8 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		if entry.doneCh != nil {
 			entry.doneCh <- ErrConnClosing
 		}
+		// Balance the Ref taken in enqueueMessageAndWait.
+		entry.data.Free()
 		return
 	}
 	payloadLen := len(entry.hdr) + entry.data.Len()
@@ -617,6 +619,8 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 			w.piggybackWUFn(fh.StreamID)
 		}
 		entry.doneCh <- err
+		// Balance the Ref taken in enqueueMessageAndWait.
+		entry.data.Free()
 		return
 	}
 	cur := &vecCursor{lpmHdr: entry.hdr, data: entry.data}
@@ -662,6 +666,8 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			default:
 			}
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.cur.data.Free()
 			return
 		}
 		// Observe ctx cancellation — the sender goroutine in
@@ -676,6 +682,8 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			default:
 			}
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.cur.data.Free()
 			return
 		}
 		streamQ := d.streamPtr.sendQuota.Load()
@@ -719,6 +727,8 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			w.connQuota.Add(grant)
 			d.doneCh <- err
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.cur.data.Free()
 			return
 		}
 		d.remaining -= int(grant)
@@ -729,6 +739,8 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 	// Fully sent.
 	d.doneCh <- nil
 	delete(w.deferred, streamID)
+	// Balance the Ref taken in enqueueMessageAndWait.
+	d.cur.data.Free()
 }
 
 // retryDeferred is called by the writeLoop on every wuRetryWake.
@@ -980,7 +992,22 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 		streamPtr: streamPtr,
 		isLast:    isLast,
 	}
+	// Bump the BufferSlice refcount BEFORE handing the entry to the
+	// writer. The writer's chunk-emit path (emitH2DataFromCursor via
+	// vecCursor) reads bytes from data after this function may have
+	// already returned via the ctx.Done() select branch below. If the
+	// caller Free()s on Write's early return, the writer would hit a
+	// use-after-free ("Cannot read freed buffer" panic). The extra
+	// Ref keeps the underlying buffer alive until the writer matches
+	// it with a Free() at every exit path (processWholeMessage early
+	// return, advanceDeferred success/streamDone/ctx.Err/emit-err, or
+	// close()-time drain). Buffers backed by mem.DefaultBufferPool are
+	// refcounted so the cost is one atomic add per call.
+	data.Ref()
 	if !w.trySend(entry) {
+		// trySend failed (writer closed before we enqueued); roll back
+		// the Ref so the caller's Free is balanced.
+		data.Free()
 		return ErrConnClosing
 	}
 	// Wait for the writer goroutine to either fully transmit the
@@ -992,6 +1019,8 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	// crash, transport close, or call-level cancellation). WL
 	// observes the same ctx via d.ctx and will clean up the
 	// deferred entry on its next retry pass (or close drain).
+	// Writer-side Free of the entry's data Ref happens in every
+	// such cleanup path; this select branch does NOT free.
 	select {
 	case err := <-doneCh:
 		return err
@@ -1042,6 +1071,8 @@ func (w *shmFrameWriter) close() {
 		default:
 		}
 		delete(w.deferred, sid)
+		// Balance the Ref taken in enqueueMessageAndWait.
+		d.cur.data.Free()
 	}
 }
 

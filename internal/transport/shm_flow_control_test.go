@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -1216,4 +1217,99 @@ func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
 		_ = w
 	})
 }
+
+// TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace stresses
+// the lifecycle contract between enqueueMessageAndWait's ctx.Done
+// select branch and the writer goroutine's ongoing chunk emission
+// (reading from the caller's BufferSlice via vecCursor).
+//
+// Race scenario (per /memories/repo/grpc-go-shm-enqueue-msg-ctx-race-may27.md):
+//  1. Sender pushes whole-message entry; writer starts emitH2DataFromCursor
+//     which reads bytes from data.
+//  2. Sender's ctx cancels (short timeout / explicit cancel); the ctx.Done
+//     branch fires, sender returns ContextErr.
+//  3. Caller Free()s the BufferSlice on Write's early return.
+//  4. Writer is STILL reading from data — use-after-free / data race.
+//
+// This test drives many concurrent writes with very short ctx
+// timeouts, explicitly Free()s the BufferSlice after Write returns,
+// and relies on the -race detector to flag any concurrent
+// read-vs-Free on the underlying buffer memory.
+//
+// Without the fix (data.Ref() in enqueueMessageAndWait + Free in
+// writer at every exit), the race detector fires on the writer's
+// memcpy reading from a buffer the caller already returned to its
+// pool. With the fix, the buffer's refcount keeps it alive until
+// the writer's matching Free balances the additional Ref.
+func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ctx-cancel race stress in -short mode")
+	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
+	segName := fmt.Sprintf("test-ctxcancel-race-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	// Generous ring so writes don't block on ring-full back-pressure.
+	serverSeg, _ := CreateSegment(segName, 4*1024*1024, 4*1024*1024)
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+	clientSeg, _ := OpenSegment(segName)
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, _ := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	defer srvTransport.Close(nil)
+	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	defer cliTransport.Close(nil)
+
+	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+		// Drain inbound but never reply — keeps streams open so
+		// sender's ctx cancellation is the only exit path.
+		<-testCtx.Done()
+	})
+
+	// Large enough that emitH2DataFromCursor's memcpy takes a
+	// non-trivial slice of time per chunk, widening the race window.
+	const payloadSize = 256 * 1024 // 256 KiB
+	body := make([]byte, payloadSize)
+	hdr := []byte{0, 0, 0x04, 0x00, 0x00} // 5-byte LPM hdr; body decoded as length-prefixed
+
+	const iterations = 200
+	const concurrency = 8
+
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(50+i%100)*time.Microsecond)
+
+				cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancelRace"}, nil)
+				if err != nil {
+					cancel()
+					continue
+				}
+
+				// Allocate a fresh buffer from the pool every iteration.
+				// The Free below returns it to the pool; if the writer
+				// is still reading from it, the race detector will flag.
+				buf := mem.Copy(body, mem.DefaultBufferPool())
+				data := mem.BufferSlice{buf}
+
+				_ = cs.Write(hdr, data, &WriteOptions{Last: true})
+				// Immediately Free on return, matching the lifecycle
+				// contract that callers own the buffer. If ctx cancelled
+				// Write while the writer was mid-emit, this Free races
+				// with the writer's memcpy without the Ref/Release fix.
+				data.Free()
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
 
