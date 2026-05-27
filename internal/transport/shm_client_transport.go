@@ -192,15 +192,15 @@ type ShmClientTransport struct {
 	wuThreshold atomic.Uint32
 
 	// pendingConnWU is the connection-level WindowUpdate credit
-	// accumulator. Producers (onMessageStart conn pre-credit,
-	// onDataFrameReceived drip via settleDebt, BDP updateFlowControl)
-	// Add(delta); the emission path Swap(0) to drain and emits a
-	// single streamID=0 WINDOW_UPDATE for the swept value. The
-	// per-stream equivalent lives on Stream.pendingWU. Together they
-	// replace the legacy `pendingStreamWU map[uint32]uint32` and the
-	// `pendingConnWU uint32` previously guarded by sendQuotaMu, so
-	// the WU hot path no longer contends with 1000 stream goroutines
-	// reserving outbound send quota.
+	// accumulator. Producers (onDataFrameReceived drip-on-receive,
+	// BDP updateFlowControl) Add(delta); the emission path Swap(0)
+	// to drain and emits a single streamID=0 WINDOW_UPDATE for the
+	// swept value. The per-stream equivalent lives on
+	// Stream.pendingWU. Together they replace the legacy
+	// `pendingStreamWU map[uint32]uint32` and the `pendingConnWU
+	// uint32` previously guarded by sendQuotaMu, so the WU hot path
+	// no longer contends with 1000 stream goroutines reserving
+	// outbound send quota.
 	pendingConnWU atomic.Uint32
 
 	// Error handling
@@ -557,14 +557,14 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 
 // sendWindowUpdateForce emits a WINDOW_UPDATE bypassing the
 // shmWindowUpdateThreshold drip-credit batching. Required for
-// maybeAdjust-style pre-credit (onMessageStart): the LPM cannot
-// complete until the peer's conn / stream window is large enough
-// for the announced message size, so the WU MUST go out
-// immediately, not be buffered until the next 16 KiB worth of
-// inbound bytes have accumulated. Drip credit driven by
-// inFlow.onRead / trInFlow.onData continues to use the batched
-// path via sendWindowUpdate so per-DATA-frame chatter stays at
-// HTTP/2 limit/4 cadence.
+// stream-level maybeAdjust-style pre-credit (onMessageStart):
+// the LPM cannot complete until the peer's stream window is
+// large enough for the announced message size, so the WU MUST
+// go out immediately, not be buffered until the next 16 KiB
+// worth of inbound bytes have accumulated. Drip credit driven
+// by inFlow.onRead / trInFlow.onData continues to use the
+// batched path via sendWindowUpdate so per-DATA-frame chatter
+// stays at HTTP/2 limit/4 cadence.
 func (t *ShmClientTransport) sendWindowUpdateForce(streamID uint32, delta uint32) {
 	if streamID == 0 {
 		t.sendConnWindowUpdate(delta, true)
@@ -1887,21 +1887,16 @@ func (t *ShmClientTransport) lookupStream(streamID uint32) *ClientStream {
 // Net behaviour matches TCP/UDS: a single message > window completes
 // in one round; the NEXT message is paced by App-Recv drip credit.
 //
-// Both stream AND connection pre-credit fire here. Stream alone is
-// not enough: a 1 MiB LPM sent over fair-default (65535 conn window)
-// would refill stream quota in one shot but still stall 64 times on
-// conn quota refill, each costing a frame-writer / ring-write /
-// scheduler round-trip. Connection pre-credit via trInFlow.maybeAdjust
-// removes those stalls while preserving strict HTTP/2 conn FC
-// semantics (debt is repaid by inbound DATA in trInFlow.onData;
-// peer's effective conn window settles back to baseline after the
-// message completes).
+// Stream-level pre-credit only — conn-level WindowUpdate is emitted
+// on-receive via onDataFrameReceived's drip path (the same
+// "decouple conn FC from app reads" design as stock HTTP/2;
+// see http2_client.go handleData).
 //
-// Both WUs are emitted via sendWindowUpdateForce so they bypass
-// the limit/4 drip-credit batching threshold; otherwise the
-// pre-credit (which is REQUIRED for the LPM to complete) could
-// be buffered indefinitely under small windows, never reaching
-// the 16+ KiB threshold and stalling the sender forever.
+// The WU is emitted via sendWindowUpdateForce so it bypasses the
+// limit/4 drip-credit batching threshold; otherwise the pre-credit
+// (which is REQUIRED for the LPM to complete under small windows)
+// could be buffered indefinitely, never reaching the threshold and
+// stalling the sender forever.
 func (t *ShmClientTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if lpmSize == 0 {
 		return
@@ -1914,40 +1909,33 @@ func (t *ShmClientTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}
-	if cw := t.connInFlow.maybeAdjust(lpmSize); cw > 0 {
-		shmConnPreCreditEmitted.Add(uint64(cw))
-		t.sendWindowUpdateForce(0, cw)
-	}
 }
 
 // onDataFrameReceived runs at parse-time for each H2 DATA frame
 // (BEFORE the body is fed to lpmAccumulator). It performs:
 //
-//   - Connection-level WU at parse-time (stock HTTP/2 decoupling of
-//     conn FC from app reads; without this multi-frame LPMs would
+//   - Connection-level WU drip on-receive (stock HTTP/2 decoupling
+//     of conn FC from app reads; without this multi-frame LPMs would
 //     starve the conn window while bytes buffer in the accumulator).
-//     Routed via trInFlow.onData: bytes first repay any outstanding
-//     pre-credit debt left over by onMessageStart, then accumulate
-//     towards the limit/4 drip-credit threshold.
-//   - Stream-level inFlow.onData accounting to track pendingData
-//     for maybeAdjust math; NO stream WU is emitted here. Stream
-//     crediting is driven by onMessageStart (receiver pre-credit
-//     once LPM size is known) and updateWindow (drip credit as the
-//     app consumes).
+//     Bytes accumulate towards the per-transport wuThreshold drip
+//     threshold inside sendConnWindowUpdate; the conn-level inFlow
+//     (`connInFlow`) is consulted only for the effectiveWindowSize
+//     counter, not for emission timing.
+//   - Stream-level inFlow.onData accounting + RFC 7540 §5.2.2 / §6.9.1
+//     enforcement (close stream on over-window receive).
 func (t *ShmClientTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	if size == 0 {
 		return
 	}
-	// Connection-level accounting. trInFlow.settleDebt repays any
-	// pre-credit debt left by onMessageStart and returns the bytes
-	// not absorbed by debt. Those residual bytes are routed through
-	// the SHM-tuned wuThreshold batching path (sendWindowUpdate) so
-	// per-DATA chatter stays bounded by our threshold (not by the
-	// conn inFlow's limit/4, which on default deployments is
-	// maxWindowSize/4 ≈ 512 MiB and would never trigger emission).
-	if residual := t.connInFlow.settleDebt(size); residual > 0 {
-		t.sendWindowUpdate(0, residual)
-	}
+	// Connection-level WU: drip on-receive at wuThreshold, matching
+	// stock HTTP/2's "conn FC decoupled from app reads" design.
+	// connInFlow.onData updates unacked + effectiveWindowSize but
+	// the SHM transport emits via its own batched
+	// sendConnWindowUpdate path (the inFlow drip return value is
+	// not used here because the SHM threshold can differ from
+	// limit/4; see shm_flow_control.go computeWUThreshold).
+	t.connInFlow.onData(size)
+	t.sendWindowUpdate(0, size)
 	// Stream-level: track pendingData and enforce the receive
 	// window per RFC 7540 §6.9.1 and §5.2.2. The CAS rollback path
 	// in the writer goroutine refunds quota BEFORE emit so it

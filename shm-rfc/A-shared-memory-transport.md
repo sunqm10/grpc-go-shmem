@@ -592,81 +592,46 @@ including the handling of frames received on closed streams.
 
 ### Flow Control
 
-SHM transports run an HTTP/2-compatible flow-control state machine
-that follows [RFC 7540 §5.2 and §6.9](https://httpwg.org/specs/rfc7540.html#FlowControl)
-wire semantics exactly. Stream-level `WINDOW_UPDATE` is paced by
-application consumption (i.e. driven from the receive side as the
-application reads); connection-level `WINDOW_UPDATE` is paced by
-parse-time accounting; `SETTINGS_INITIAL_WINDOW_SIZE` is honored.
-The `slow Recv → slow Send` migration contract from TCP/UDS holds
-unchanged.
+SHM transports use HTTP/2 flow control as defined in
+[RFC 7540 §5.2 and §6.9](https://httpwg.org/specs/rfc7540.html#FlowControl):
 
-The remainder of this section specifies the SHM-specific deltas.
+- `SETTINGS_INITIAL_WINDOW_SIZE` is honored in both directions
+  (see [SETTINGS](#settings)).
+- Stream-level `WINDOW_UPDATE` is paced by application consumption,
+  drip-credited at the receiver's `limit/4` threshold.
+- Connection-level `WINDOW_UPDATE` is paced by inbound DATA receive,
+  decoupled from application reads (matching stock HTTP/2 conn FC;
+  see [RFC 7540 §5.2.1](https://httpwg.org/specs/rfc7540.html#FlowControlConsiderations)).
+- Receivers MUST treat over-window inbound DATA as `STREAM_ERROR`
+  with `FLOW_CONTROL_ERROR` per [RFC 7540 §5.2.2](https://httpwg.org/specs/rfc7540.html#StreamErrorHandler).
 
-#### Ring is the physical-layer buffer
+Receivers MAY merge adjacent connection-level `WINDOW_UPDATE` frames
+within a single drain pass; HTTP/2 increments are additive so the
+merged frame is wire-equivalent.
 
-The SHM ring serves the role that the kernel socket buffer plays in
-stock HTTP/2 over TCP/UDS: bytes leave the ring (advancing
-`ReadIdx`) as the receiver's reader parses each H2 DATA frame, well
-before the application consumes the message. WU emission timing is
-unchanged from stock H2. Ring back-pressure (`SpaceSeq` /
-`DataSeq`, see [Wait/Wake](#waitwake)) is per direction, not per
-stream, and operates strictly below the HTTP/2 FC layer.
+#### Stream-level pre-credit at LPM parse (MUST)
 
-#### Ring capacity vs initial window (SHOULD)
+Stock HTTP/2 emits stream-level pre-credit when the application
+requests to read `N` bytes — its parser calls `Read(bodyLen)` and
+the transport advertises a `WINDOW_UPDATE` sufficient to admit the
+remainder of `N`. SHM transports aggregate DATA frames into a
+complete LPM at the codec layer before delivering to the application;
+the application read does not occur until assembly completes, which
+is too late to drive pre-credit while the message is in flight.
 
-The kernel socket buffer grows dynamically; the SHM ring is fixed
-capacity. Implementations SHOULD provision ring capacity ≥
-`SETTINGS_INITIAL_WINDOW_SIZE` per direction so the FC window is
-the binding constraint, not the ring. The reference implementation
-uses ring = 64 MiB and default initial window = 32 MiB.
+To preserve the stock HTTP/2 sender contract under this aggregation,
+SHM receivers MUST emit a stream-level `WINDOW_UPDATE` sufficient
+to admit the full LPM at LPM-header parse time whenever the
+announced LPM does not already fit within the remaining stream
+window, bypassing the regular `limit/4` drip threshold for that
+message. The wire effect is identical to stock HTTP/2 stream
+pre-credit; only the trigger location moves earlier.
 
-With ring < window the sender remains correct (data eventually
-arrives) but hits ring back-pressure before exhausting its FC
-credit, introducing implementation-internal stalling that the peer
-cannot observe via WU mechanics.
-
-#### Pre-credit at codec parse time
-
-Stock HTTP/2 emits pre-credit from the receive path as the
-application reads bytes from each DATA frame. The SHM codec
-aggregates DATA frames into a complete MESSAGE before handing it
-to the application, so SHM receivers SHOULD emit the
-stream-level (and, with bookkeeping, connection-level) credit
-increments for the full LPM payload at LPM-header parse time,
-bypassing the regular `limit/4` drip threshold for the announced
-message. The wire effect is identical to stock H2 pre-credit;
-only the trigger location differs.
-
-For connection-level pre-credit, the receiver records the
-parse-time increment as outstanding debt; subsequent per-DATA-frame
-accounting MUST repay the debt before counting bytes toward the
-regular drip threshold, so total credit emitted over a message's
-lifetime equals exactly the bytes consumed.
-
-#### Implementation choices (MAY)
-
-Implementations MAY merge adjacent connection-level `WINDOW_UPDATE`
-frames within a single drain pass (HTTP/2 increments are additive,
-so the merged frame is wire-equivalent; this reduces ring-write
-count under high stream concurrency).
-
-Per [RFC 7540 §5.2.2](https://httpwg.org/specs/rfc7540.html#StreamErrorHandler)
-receivers MUST treat over-window inbound DATA as `STREAM_ERROR`
-with `FLOW_CONTROL_ERROR`. Compliant senders never produce this
-condition, but receivers cannot assume the peer is compliant and
-MUST enforce the check.
-
-#### Window configuration
-
-`SETTINGS_INITIAL_WINDOW_SIZE` is exchanged via the standard HTTP/2
-SETTINGS frame (see [SETTINGS](#settings)). Each peer advertises its
-own receive window; senders MUST honor the peer's advertised value
-per [RFC 7540 §6.9.2](https://httpwg.org/specs/rfc7540.html#InitialWindowSize).
-Because the setting is directional, deployments do not require
-symmetric configuration for correctness, but configuring both
-endpoints with the same value is RECOMMENDED for predictable
-resource use.
+Connection-level pre-credit is NOT required: the receiver
+continuously drains DATA bytes from the ring as each frame arrives
+(advancing `ReadIdx`), independent of application read pace, which
+keeps connection-level inbound accounting flowing and lets
+drip-on-receive emit `WINDOW_UPDATE` at the receiver's own cadence.
 
 ### Receiver Back-Pressure
 
@@ -737,7 +702,10 @@ global default.
 ## Ring Sizing
 
 Ring capacities MUST be powers of two and MUST be at least 4 KiB.
-Reference implementations default to 64 MiB rings per direction
+Implementations SHOULD provision ring capacity ≥ `SETTINGS_INITIAL_WINDOW_SIZE`
+per direction so the HTTP/2 flow-control window remains the binding
+constraint rather than physical ring back-pressure. Reference
+implementations default to 64 MiB rings per direction
 (136 MiB total mapped segment, including both rings and headers).
 Smaller rings (~64 KiB) suit low-stream-count deployments; larger rings
 primarily increase the number of in-flight streams the transport can

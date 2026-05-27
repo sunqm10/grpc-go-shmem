@@ -473,8 +473,10 @@ func entryBytes(e frameEntry) int {
 // incoming increment would overflow, the accumulator first flushes
 // (emitting the existing pending as one WU) and then absorbs the new
 // entry into a fresh accumulator. In practice this never happens
-// for SHM workloads (1000 streams × 1 MiB pre-credit = 1 GiB total
-// << 2 GiB cap) but the guard is necessary for spec compliance.
+// for SHM workloads (a single drain pass sees drip-on-receive WUs
+// at limit/4 cadence whose sum is bounded by the negotiated conn
+// window, well under the 2 GiB cap) but the guard is necessary
+// for spec compliance.
 type connWUCoalescer struct {
 	w       *shmFrameWriter
 	pending uint64

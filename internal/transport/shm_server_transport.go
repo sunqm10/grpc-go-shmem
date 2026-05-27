@@ -1952,18 +1952,16 @@ func (t *ShmServerTransport) lookupStream(streamID uint32) *ServerStream {
 // onMessageStart is invoked by the h2 codec the moment it parses a
 // new gRPC LPM's 5-byte header (multi-DATA-frame case only). lpmSize
 // is `5 + bodyLen`; the message is NOT yet fully assembled in the
-// accumulator. The transport asks both inFlow.maybeAdjust (stream
-// pre-credit) and trInFlow.maybeAdjust (conn pre-credit) whether the
-// peer needs an upfront WINDOW_UPDATE to admit the rest of the LPM
-// and, if so, emits each via the force path (bypassing the limit/4
-// drip-credit batching threshold).
+// accumulator. The transport asks inFlow.maybeAdjust whether the
+// peer needs an upfront stream-level WINDOW_UPDATE to admit the rest
+// of the LPM and, if so, emits it via the force path (bypassing the
+// limit/4 drip-credit batching threshold).
 //
 // See ShmClientTransport.onMessageStart for the full design rationale.
-// Server-side rationale is identical: SHM's lpmAccumulator hides the
-// partial LPM from the app, so the receiver drives pre-credit on
-// both stream and conn windows. Conn pre-credit is required to avoid
-// the 64-cycle conn-quota refill stall when an LPM (e.g. 1 MiB) is
-// larger than fair-default's 65535-byte conn window.
+// Server-side is identical: SHM's lpmAccumulator hides the partial
+// LPM from the app, so the receiver drives the stream pre-credit.
+// Conn-level WindowUpdate is emitted on-receive via
+// onDataFrameReceived (matching stock HTTP/2 conn FC behaviour).
 //
 // Runs on the reader goroutine; MUST NOT block on the producer.
 func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
@@ -1978,32 +1976,28 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}
-	if cw := t.connInFlow.maybeAdjust(lpmSize); cw > 0 {
-		shmConnPreCreditEmitted.Add(uint64(cw))
-		t.sendWindowUpdateForce(0, cw)
-	}
 }
 
 // onDataFrameReceived runs at parse-time for each H2 DATA frame
 // (BEFORE the body is fed to lpmAccumulator). It performs:
 //
-//   - Connection-level accounting via trInFlow.onData: bytes first
-//     repay any pre-credit debt left by onMessageStart, then
-//     accumulate towards the limit/4 drip threshold. Returns the WU
-//     delta to emit (already netted against debt).
-//   - Stream-level inFlow.onData accounting; NO stream WU here.
-//     Stream credit is driven by onMessageStart (pre-credit once
-//     LPM size is known) and updateWindow (drip credit as app
-//     consumes).
+//   - Connection-level WU drip on-receive at the per-transport
+//     wuThreshold; this matches stock HTTP/2's "decouple conn FC
+//     from app reads" design (see http2_server.go handleData).
+//   - Stream-level inFlow.onData accounting + RFC 7540 §5.2.2 /
+//     §6.9.1 enforcement (cancel stream on over-window receive).
 //
 // Runs on the reader goroutine; MUST NOT block on the producer.
 func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	if size == 0 {
 		return
 	}
-	if residual := t.connInFlow.settleDebt(size); residual > 0 {
-		t.sendWindowUpdate(0, residual)
-	}
+	// Connection-level: update unacked/effectiveWindowSize via
+	// connInFlow.onData (return value ignored — SHM emits via its
+	// own batched wuThreshold path below) and emit drip-credit on
+	// the SHM cadence.
+	t.connInFlow.onData(size)
+	t.sendWindowUpdate(0, size)
 	s := t.lookupStream(streamID)
 	if s == nil {
 		return
