@@ -708,6 +708,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 		}
 		if !w.connQuota.CompareAndSwap(connQ, connQ-grant) {
 			d.streamPtr.sendQuota.Add(grant) // rollback
+			shmCASRollback.Add(1)
 			continue
 		}
 		// Determine the last-chunk flag: END_STREAM only fires when

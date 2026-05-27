@@ -25,9 +25,11 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
@@ -1312,4 +1314,243 @@ func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
 	wg.Wait()
 }
 
+// TestTryReserveSendQuota_CASRollbackUnderContention is a focused,
+// deterministic test for the two-resource CAS rollback path in
+// tryReserveSendQuota. The path is hard to trigger from black-box
+// integration tests (it requires conn-CAS to lose a race after
+// stream-CAS succeeded), so this test stresses it directly:
+//
+//  1. Initialize conn + stream send-quota atomics with comfortable
+//     headroom.
+//  2. Spawn one "mutator" goroutine that continuously credits the
+//     connQuota atomic via Add(+/-). This forces conn-CAS to lose
+//     the race for a fraction of concurrent reservation attempts.
+//  3. Spawn N "reserver" goroutines that loop calling
+//     tryReserveSendQuota with random byte counts. Each tracks
+//     successful vs failed reservations.
+//  4. After a fixed duration, stop all goroutines. Verify:
+//     - shmCASRollback counter incremented at least once (proves
+//       the rollback path was exercised).
+//     - Quota invariant: streamQ.Load() == initialStream -
+//       sum(successful reservations) + reverts. Conn similarly.
+//
+// Without the rollback Add(grant), stream quota would drift down
+// every time conn-CAS lost, eventually starving the reserver.
+// With correct rollback, stream quota balance is restored after
+// every failed reservation.
+func TestTryReserveSendQuota_CASRollbackUnderContention(t *testing.T) {
+	const (
+		initialConn   int64 = 1 << 30 // 1 GiB
+		initialStream int64 = 1 << 30
+		reservers           = 8
+		duration            = 200 * time.Millisecond
+	)
+
+	var connQ, streamQ atomic.Int64
+	connQ.Store(initialConn)
+	streamQ.Store(initialStream)
+
+	// Capture baseline counter (other tests may have run).
+	baseline := shmCASRollback.Load()
+
+	stop := make(chan struct{})
+	var totalSuccess int64
+	var totalAttempt int64
+
+	var wg sync.WaitGroup
+
+	// Mutator: hammer connQ with churning credits so conn-CAS
+	// races land between Load and CAS of concurrent reservers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Each iteration: credit then debit the same amount so
+			// the conn pool's running balance is preserved overall
+			// but the witnessed value changes between any given
+			// CAS Load and CAS attempt of a reserver.
+			connQ.Add(1024)
+			connQ.Add(-1024)
+		}
+	}()
+
+	for r := 0; r < reservers; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			var localSuccess, localAttempt int64
+			n := int64(64 + (seed * 11)) // small per-call ask, well within headroom
+			for {
+				select {
+				case <-stop:
+					atomic.AddInt64(&totalSuccess, localSuccess)
+					atomic.AddInt64(&totalAttempt, localAttempt)
+					return
+				default:
+				}
+				localAttempt++
+				if tryReserveSendQuota(&connQ, &streamQ, n) {
+					localSuccess++
+					// Immediately give the reserved quota back to
+					// keep the pool stable and concentrate test
+					// pressure on the CAS sequence itself.
+					connQ.Add(n)
+					streamQ.Add(n)
+				}
+			}
+		}(r)
+	}
+
+	time.Sleep(duration)
+	close(stop)
+	wg.Wait()
+
+	delta := shmCASRollback.Load() - baseline
+	if delta == 0 {
+		t.Fatalf("rollback path was not exercised under contention "+
+			"(reservers=%d, attempts=%d, successes=%d): "+
+			"shmCASRollback did not increment from %d",
+			reservers, totalAttempt, totalSuccess, baseline)
+	}
+
+	// Quota invariant: after all give-backs, balances must equal
+	// initial. Any rollback that forgot to restore stream quota
+	// would manifest as streamQ < initialStream.
+	if got := streamQ.Load(); got != initialStream {
+		t.Errorf("stream quota drift: got %d, want %d (delta=%d) — "+
+			"rollback path likely failed to restore stream side",
+			got, initialStream, initialStream-got)
+	}
+	if got := connQ.Load(); got != initialConn {
+		t.Errorf("conn quota drift: got %d, want %d (delta=%d)",
+			got, initialConn, initialConn-got)
+	}
+
+	t.Logf("rollbacks observed: %d (attempts=%d, successes=%d)",
+		delta, totalAttempt, totalSuccess)
+}
+
+// TestConnWaiterElem_CloseStreamUnblocksParkedAcquire is a regression
+// test for a deadlock in acquireSendQuota's slow path on the SHM
+// client transport. The scenario:
+//
+//  1. Goroutine G1 calls acquireSendQuota; both quotas insufficient,
+//     parks on stream-signal channel after registerConnWaiterLocked.
+//  2. closeStream runs (e.g., RST_STREAM from peer): unregisters G1
+//     from connWaiters FIFO, signals + DELETES the stream's entry
+//     from t.streamQuotaSignals.
+//  3. G1 wakes from <-streamCh, falls back to the for{} loop top.
+//  4. Quotas still insufficient. G1 takes sendQuotaMu and re-runs
+//     registerConnWaiterLocked. The new connWaiter captures
+//     t.streamQuotaSignals[streamID] which is now nil (map miss).
+//  5. G1 selects on a nil channel; only ctx.Done() or t.ctx.Done()
+//     can fire. If the caller's ctx is alive and the transport is
+//     still up, G1 deadlocks forever.
+//
+// The fix is to check s.getState() == streamDone at the top of the
+// for loop (after the wake) and return errStreamDone promptly.
+//
+// Without the fix this test hangs and is reaped by the test
+// timeout / -timeout flag. With the fix it returns within
+// milliseconds.
+func TestConnWaiterElem_CloseStreamUnblocksParkedAcquire(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
+	segName := fmt.Sprintf("test-connwaiter-close-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, _ := CreateSegment(segName, 65536, 65536)
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+	clientSeg, _ := OpenSegment(segName)
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, _ := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	defer srvTransport.Close(nil)
+	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	defer cliTransport.Close(nil)
+
+	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+		<-testCtx.Done()
+	})
+
+	// Caller ctx must stay alive — it's the only way the deadlock
+	// would manifest in production (caller hasn't cancelled).
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	defer callerCancel()
+
+	cs, err := cliTransport.NewStream(callerCtx, &CallHdr{Method: "/test/ConnWaiterClose"}, nil)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	// Drive both quotas to zero so the next acquireSendQuota parks.
+	cliTransport.connSendQuota.Store(0)
+	cs.sendQuota.Store(0)
+
+	// Park a goroutine in acquireSendQuota. It will register on
+	// connWaiters and block on the stream's signal channel.
+	acquireErr := make(chan error, 1)
+	go func() {
+		acquireErr <- cliTransport.acquireSendQuota(cs.ctx, cs.id, 1024)
+	}()
+
+	// Wait until the goroutine is parked (visible via connWaiterElem).
+	parked := false
+	for i := 0; i < 100; i++ {
+		cliTransport.sendQuotaMu.Lock()
+		registered := cs.connWaiterElem != nil
+		cliTransport.sendQuotaMu.Unlock()
+		if registered {
+			parked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !parked {
+		t.Fatal("goroutine did not register on connWaiters within 2s")
+	}
+
+	// Close the stream — this triggers the deadlock-prone path:
+	// closeStream signals + deletes streamQuotaSignals[id], unregister
+	// + nils connWaiterElem. The parked goroutine wakes, falls back
+	// to the for{} loop. Without the fix, it re-parks on a nil
+	// channel.
+	cliTransport.closeStream(cs, errStreamDone, false, http2.ErrCodeNo,
+		status.New(codes.Canceled, "test close"), nil, false)
+
+	// With the fix, the goroutine returns promptly (errStreamDone
+	// or ErrConnClosing). Without the fix, the goroutine deadlocks
+	// and this select times out.
+	select {
+	case err := <-acquireErr:
+		t.Logf("acquireSendQuota returned: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("acquireSendQuota deadlocked after closeStream — " +
+			"parked goroutine did not return within 2s. " +
+			"This indicates the connWaiterElem lifecycle hole: " +
+			"after wake, re-parking on nil signal channel.")
+	}
+
+	// Verify lifecycle invariant: connWaiterElem must be nil and
+	// connWaiters FIFO must not retain a stale entry for the
+	// closed stream.
+	cliTransport.sendQuotaMu.Lock()
+	leftover := cs.connWaiterElem
+	fifoLen := cliTransport.connWaiters.Len()
+	cliTransport.sendQuotaMu.Unlock()
+	if leftover != nil {
+		t.Errorf("cs.connWaiterElem should be nil after close + acquire return, got %v", leftover)
+	}
+	if fifoLen != 0 {
+		t.Errorf("connWaiters FIFO should be empty after close + acquire return, got len=%d", fifoLen)
+	}
+}
 

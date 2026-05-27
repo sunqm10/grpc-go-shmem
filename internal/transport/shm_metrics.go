@@ -58,5 +58,20 @@ var (
 	// entries), not "N frames saved" — see writeLoop for the
 	// absorb/flush semantics.
 	shmConnWUCoalesced atomic.Uint64
+
+	// shmCASRollback counts two-resource CAS reservation rollbacks:
+	// the stream-side sendQuota CAS succeeded but the conn-side
+	// sendQuota CAS lost a race with a concurrent producer (most
+	// commonly the reader's addSendQuota crediting inbound
+	// WINDOW_UPDATE). Both tryReserveSendQuota and
+	// advanceDeferred increment this counter when they Add(grant)
+	// back to the stream side and retry. Non-zero values indicate
+	// CAS contention on the conn-quota atomic; large absolute
+	// values suggest the WU emission cadence or stream concurrency
+	// is high enough to make the two-CAS sequence a contention
+	// point. The counter is also referenced by the focused unit
+	// test that verifies the rollback path is reached under
+	// concurrent connQuota mutation.
+	shmCASRollback atomic.Uint64
 )
 

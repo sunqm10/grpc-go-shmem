@@ -468,6 +468,7 @@ func tryReserveSendQuota(connQuota, streamQuota *atomic.Int64, n int64) bool {
 	if !connQuota.CompareAndSwap(connQ, connQ-n) {
 		// Conn CAS lost the race — restore stream quota.
 		streamQuota.Add(n)
+		shmCASRollback.Add(1)
 		return false
 	}
 	return true
@@ -485,6 +486,16 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 	for {
 		if t.closed.Load() {
 			return ErrConnClosing
+		}
+		// Stream-state check: if closeStream has fired between our
+		// last park-wake and this iteration, the stream's signal
+		// channel has been deleted from t.streamQuotaSignals. A
+		// fresh registerConnWaiterLocked would capture a nil
+		// channel and the subsequent select would deadlock on
+		// <-nil (only ctx.Done() / t.ctx.Done() could wake it).
+		// Return promptly with errStreamDone instead.
+		if s.getState() == streamDone {
+			return errStreamDone
 		}
 		// Fast path: lock-free two-resource CAS reservation.
 		if tryReserveSendQuota(&t.connSendQuota, &s.sendQuota, want) {
