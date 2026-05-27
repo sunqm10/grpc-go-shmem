@@ -555,21 +555,21 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	t.sendStreamWindowUpdate(s, delta, false)
 }
 
-// sendWindowUpdateForce emits a WINDOW_UPDATE bypassing the
-// shmWindowUpdateThreshold drip-credit batching. Required for
-// stream-level maybeAdjust-style pre-credit (onMessageStart):
-// the LPM cannot complete until the peer's stream window is
-// large enough for the announced message size, so the WU MUST
-// go out immediately, not be buffered until the next 16 KiB
-// worth of inbound bytes have accumulated. Drip credit driven
-// by inFlow.onRead / trInFlow.onData continues to use the
-// batched path via sendWindowUpdate so per-DATA-frame chatter
-// stays at HTTP/2 limit/4 cadence.
+// sendWindowUpdateForce emits a stream-level WINDOW_UPDATE bypassing
+// the shmWindowUpdateThreshold drip-credit batching. Required for
+// stream-level maybeAdjust-style pre-credit (onMessageStart): the
+// LPM cannot complete until the peer's stream window is large
+// enough for the announced message size, so the WU MUST go out
+// immediately, not be buffered until the next 16 KiB worth of
+// inbound bytes have accumulated. Drip credit driven by
+// inFlow.onRead / trInFlow.onData continues to use the batched
+// path via sendWindowUpdate so per-DATA-frame chatter stays at
+// HTTP/2 limit/4 cadence.
+//
+// Conn-level pre-credit is not used by this transport; if a future
+// caller needs to force-emit a conn WU, route through
+// sendConnWindowUpdate(delta, true) directly.
 func (t *ShmClientTransport) sendWindowUpdateForce(streamID uint32, delta uint32) {
-	if streamID == 0 {
-		t.sendConnWindowUpdate(delta, true)
-		return
-	}
 	s := t.lookupStream(streamID)
 	if s == nil {
 		return

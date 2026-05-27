@@ -30,12 +30,6 @@ import (
 //
 // Counters below are kept for bench/metrics visibility.
 var (
-	// shmWUFramesIgnored historically counted WU frames a NoWU receiver
-	// dropped. With the unified path, receivers always honor WU, so this
-	// counter is no longer incremented. Retained to keep the metric
-	// surface stable for tooling that already reads it.
-	shmWUFramesIgnored atomic.Uint64
-
 	// shmWUFramesBackpressured counts WU emissions that the frame writer
 	// was too busy to accept synchronously (channel full + inlineMu
 	// busy). On such failure the sender restores the captured delta

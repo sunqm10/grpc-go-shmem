@@ -439,14 +439,12 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 }
 
 // sendWindowUpdateForce mirrors the client-side method: bypass the
-// shmWindowUpdateThreshold drip batching for maybeAdjust-style
-// pre-credit which MUST go out at parse time, otherwise the LPM
-// cannot complete under small windows.
+// shmWindowUpdateThreshold drip batching for stream-level
+// maybeAdjust-style pre-credit which MUST go out at parse time,
+// otherwise the LPM cannot complete under small windows. Conn-level
+// force-emit is not used by this transport; if a future caller
+// needs one, route through sendConnWindowUpdate(delta, true).
 func (t *ShmServerTransport) sendWindowUpdateForce(streamID uint32, delta uint32) {
-	if streamID == 0 {
-		t.sendConnWindowUpdate(delta, true)
-		return
-	}
 	s := t.lookupStream(streamID)
 	if s == nil {
 		return
