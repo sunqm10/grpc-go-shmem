@@ -66,15 +66,10 @@ import (
 // h2 codec after this change.
 
 // zcAnchorBudgetCount caps the number of simultaneous ZC anchors held on
-// one ring direction. Empirically the multi-anchor benefit saturates
-// quickly (the reader pipeline only needs a few anchors of headroom to
-// keep working while the consumer drains), and each held anchor occupies
-// ring bytes that the writer cannot reclaim — too generous a cap turns
-// into writer-side back-pressure that outweighs the reader-side win
-// (see grpc-go-shm-d-lite-bug-2026-05-28). Keep this tight: 8 anchors
-// is enough to absorb a short consumer-side scheduling stall while
-// preserving most of the ring for the writer at all payload sizes.
-const zcAnchorBudgetCount = 8
+// one ring direction. 256 is generous for the expected workload (up to
+// ~1000 concurrent streams ping-ponging through one connection) without
+// risking unbounded memory if a single anchor is somehow leaked.
+const zcAnchorBudgetCount = 256
 
 // zcAnchorMulti tracks a single in-flight ring-backed buffer issued by
 // the multi-anchor ZC path. Lifetime: appended to the ring's anchor
@@ -88,13 +83,11 @@ type zcAnchorMulti struct {
 }
 
 // zcMaxBytesBudget returns the max bytes that may be held in-flight by
-// the multi-anchor queue. We cap at capacity/8 (12.5 % of the ring) so
-// that the writer always has ≥ 87 % of the ring available to make
-// progress. The previous cap of capacity/2 produced enough writer
-// back-pressure to net-regress small-payload throughput even when the
-// reader side hit 99 % ZC (see grpc-go-shm-d-lite-bug-2026-05-28).
+// the multi-anchor queue. Half of the ring capacity leaves at least 50 %
+// of the ring available for the writer at all times, bounding the worst-
+// case slow-consumer stall.
 func (r *ShmRing) zcMaxBytesBudget() uint64 {
-	return r.capacity / 8
+	return r.capacity / 2
 }
 
 // BeginAnchor reserves a multi-anchor ZC slot for the contiguous payload
