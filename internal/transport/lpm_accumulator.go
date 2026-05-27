@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/mem"
@@ -297,6 +298,84 @@ func (a *lpmAccumulator) releaseBuf(buf []byte) {
 	}
 	b := buf[:0]
 	a.pool.Put(&b)
+}
+
+// streamLocalBufPool wraps a fallback BufferPool with a single-slot
+// atomic cache so per-stream lpmAccumulator allocations reuse the
+// same backing buffer across consecutive LPMs on that stream.
+//
+// Problem this solves. Profiling at concurrent 4 KiB jumbo streams
+// showed ~38% of CPU in runtime.mallocgc + GC mark / assist / scan,
+// driven by the per-LPM allocation pattern of lpmAccumulator.allocBuf
+// calling shmLpmPool.Get(lpmSize). The backing pool
+// (NewDirtyBinaryTieredBufferPool) uses sync.Pool per size bucket,
+// which under N=100+ concurrent streams loses its per-P locality —
+// buffers stash on one P but are reclaimed on a different P, so
+// each Get often misses and triggers a fresh runtime.mallocgc. Tier
+// adjustments (Path Y / Y2) only change the SIZE of each alloc, not
+// the COUNT; the count is what drives GC pressure.
+//
+// Design. Each accumulator owns its own streamLocalBufPool wrapping
+// the global shmLpmPool. The wrapper holds at most one cached buf
+// via an atomic.Pointer slot. Get checks the slot first; on hit, it
+// reuses the buf with zero atomic-syscall + zero memclr. Put tries
+// to fill the slot (CAS); if the slot is occupied, the Put falls
+// through to the global pool. Because each accumulator emits at most
+// one in-flight msg at a time, the typical steady-state ping-pong
+// pattern is: Get from slot (hit) → emit msg → reader processes →
+// Buffer.Free → Put back into slot. Steady-state allocations: zero.
+//
+// Concurrency. allocBuf runs on the SHM reader goroutine
+// (single-threaded per-accumulator). Buffer.Free() / Put runs on
+// the gRPC consumer goroutine (different). atomic.Pointer ordering
+// is sufficient — there is no cross-goroutine invariant that would
+// require a mutex. CompareAndSwap on Put cleanly handles the rare
+// race where the slot is already filled (e.g., grow path released
+// the previous buf while another goroutine was about to fill).
+//
+// Failure modes / fallbacks. Cap mismatch (cached buf is too small
+// for the requested size) falls through to the fallback pool. This
+// is correct but loses one round of reuse. In the common
+// same-message-size ping-pong this never happens; in mixed-size
+// workloads it gracefully degrades to the prior (pool-only)
+// behaviour.
+type streamLocalBufPool struct {
+	fallback mem.BufferPool
+	cached   atomic.Pointer[[]byte]
+}
+
+func newStreamLocalBufPool(fallback mem.BufferPool) *streamLocalBufPool {
+	return &streamLocalBufPool{fallback: fallback}
+}
+
+// Get returns a buffer with cap >= size. Tries the local slot first;
+// falls back to the wrapped pool on slot-miss or cap-mismatch.
+func (p *streamLocalBufPool) Get(size int) *[]byte {
+	if c := p.cached.Swap(nil); c != nil {
+		if cap(*c) >= size {
+			// Reuse: caller treats the buffer as dirty (the SHM
+			// receive path overwrites every byte with DATA-frame
+			// content before exposing it).
+			b := (*c)[:size]
+			return &b
+		}
+		// Cap mismatch — return the cached buf to the global pool
+		// so its tier remains available, and Get fresh below.
+		p.fallback.Put(c)
+	}
+	return p.fallback.Get(size)
+}
+
+// Put returns the buffer to the slot if empty; otherwise to the
+// wrapped pool. Tolerates nil and zero-cap inputs.
+func (p *streamLocalBufPool) Put(buf *[]byte) {
+	if buf == nil || cap(*buf) == 0 {
+		return
+	}
+	if p.cached.CompareAndSwap(nil, buf) {
+		return
+	}
+	p.fallback.Put(buf)
 }
 
 // feedSplit is the two-slice analogue of feed: it consumes data from

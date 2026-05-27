@@ -260,7 +260,12 @@ func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
 		h.lastAcc = a
 		return a
 	}
-	a := &lpmAccumulator{pool: shmLpmPool}
+	// Per-stream local pool wrapping shmLpmPool: a single-slot
+	// atomic cache that lets consecutive LPMs on the same stream
+	// reuse the same backing buffer, sidestepping sync.Pool's per-P
+	// sharding under high concurrency. See streamLocalBufPool in
+	// lpm_accumulator.go for the rationale + design.
+	a := &lpmAccumulator{pool: newStreamLocalBufPool(shmLpmPool)}
 	h.lpmAccumulators[sid] = a
 	h.lastSid = sid
 	h.lastAcc = a
