@@ -91,16 +91,34 @@ func (r *ShmRing) zcMaxBytesBudget() uint64 {
 }
 
 // BeginAnchor reserves a multi-anchor ZC slot for the contiguous payload
-// at [baseIdx, baseIdx+totalBytes) of the ring. Returns the anchor
-// pointer on success (caller wraps it in a mem.Buffer and passes the
-// anchor to the release pool); returns nil if the budget is exceeded
-// (caller falls back to the single-frame copy path).
+// of size totalBytes whose first byte begins at the current running
+// reader-consumed offset. Returns the anchor pointer on success
+// (caller wraps it in a mem.Buffer and passes the anchor to the
+// release pool); returns nil if the budget is exceeded (caller falls
+// back to the single-frame copy fast path).
+//
+// baseIdx semantics. The caller provides the absolute ring index where
+// this frame's payload bytes begin, normally obtained from
+// ReadCommit.commitReadIdx (which itself reads the shared header
+// ReadIdx at the time of ReadSlices). This is AUTHORITATIVE only for
+// the FIRST anchor in the queue — header.ReadIdx is frozen for the
+// duration of the multi-anchor ZC hold, so on any subsequent anchor
+// the caller's baseIdx is stale (it just re-reads the SAME frozen
+// header.ReadIdx). For subsequent anchors we instead read the running
+// zcDeferredTarget under the mutex; that value tracks every Commit
+// (header bytes, non-ZC frames, prior anchor frames) and is the
+// correct start offset of this frame.
+//
+// Concurrency. zcAnchorsMu serialises anchor list mutations and the
+// read of zcDeferredTarget at append time. Reader-thread Commit's
+// AddUint64 on zcDeferredTarget runs lock-free but is single-threaded
+// on the reader side, so within one Begin/Commit sequence the values
+// are coherent. Consumer Buffer.Free → ReleaseAnchor takes the same
+// mutex to serialise the prefix walk against Begin.
 //
 // On success this method also:
-//   - bumps zcDeferredTarget by totalBytes (consistent with the
-//     single-anchor BeginSingleFrameZcCommit semantics so that
-//     subsequent reader-thread Commits AddUint64 onto a coherent value),
-//   - sets zcActive = 1 if this is the first anchor in the queue,
+//   - bumps zcDeferredTarget by totalBytes,
+//   - sets zcActive = 1 on the first anchor,
 //   - increments zcInFlight for backwards-compat with the
 //     ReleaseChainZcBuffer-style refcount used by zcChainReleasePool.
 func (r *ShmRing) BeginAnchor(baseIdx uint64, totalBytes int) *zcAnchorMulti {
@@ -117,9 +135,20 @@ func (r *ShmRing) BeginAnchor(baseIdx uint64, totalBytes int) *zcAnchorMulti {
 		return nil
 	}
 
+	// Resolve the true start offset of this frame's payload bytes.
+	// See method-level doc — caller's baseIdx is only authoritative for
+	// the first anchor; on subsequent anchors header.ReadIdx is frozen
+	// and zcDeferredTarget is the running consumed offset.
+	var start uint64
+	if len(r.zcAnchors) == 0 {
+		start = baseIdx
+	} else {
+		start = atomic.LoadUint64(&r.zcDeferredTarget)
+	}
+
 	a := &zcAnchorMulti{
-		start: baseIdx,
-		end:   baseIdx + uint64(totalBytes),
+		start: start,
+		end:   start + uint64(totalBytes),
 	}
 	r.zcAnchors = append(r.zcAnchors, a)
 	r.zcAnchorsBytes += uint64(totalBytes)
@@ -131,9 +160,6 @@ func (r *ShmRing) BeginAnchor(baseIdx uint64, totalBytes int) *zcAnchorMulti {
 		atomic.StoreUint32(&r.zcActive, 1)
 	} else {
 		// Additional anchor: extend zcDeferredTarget by this frame's bytes.
-		// The reader thread is single-threaded so any intervening Commit
-		// (non-ZC frame) bumps zcDeferredTarget independently; this Add
-		// captures the bytes the consumer will hold under THIS anchor.
 		atomic.AddUint64(&r.zcDeferredTarget, uint64(totalBytes))
 	}
 
