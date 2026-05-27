@@ -53,17 +53,29 @@ var (
 	// range exceeds 2× overshoot while keeping the total tier count
 	// (and therefore per-P sync.Pool headroom) small.
 	//
+	// The 4 KiB → 16 KiB gap has the same shape (4× overshoot for any
+	// allocation in (4 KiB, 16 KiB]) and matters more than its size
+	// suggests: a 4 KiB-payload gRPC message Marshal produces ~4104
+	// bytes (4 KiB payload + ~3 B proto wire overhead + 5 B gRPC LPM
+	// header), which lands in the 16 KiB tier and pays 4× the memclr
+	// cost. Profiling concurrent 4 KiB streams shows ~38 % of CPU in
+	// alloc/GC at this cell. Adding tier 13 (8 KiB) caps the worst-
+	// case overshoot in this range at 2× and substantially reduces
+	// the per-frame alloc cost for the very common 1–8 KiB message
+	// regime.
+	//
 	// Tradeoff: each additional tier holds its own sync.Pool per P,
 	// so idle memory grows modestly with tier count × GOMAXPROCS.
 	// For typical gRPC workloads — where unary and streaming sends
-	// in the 32 KiB–1 MiB range are common — the reduced per-Get
+	// in the 1 KiB–1 MiB range dominate — the reduced per-Get
 	// memclr cost dominates the headroom cost.
 	defaultBufferPoolSizeExponents = []uint8{
 		8,
 		12, // 4 KiB (Go page size)
+		13, // 8 KiB  (covers 4 KiB+1 .. 8 KiB, e.g. 4 KiB Marshal + LPM hdr)
 		14, // 16 KiB (max HTTP/2 frame size used by gRPC)
 		15, // 32 KiB (default buffer size for io.Copy)
-		17, // 128 KiB (covers 32 KiB+1 .. 128 KiB)
+		17, // 128 KiB (covers 32 KiB+1 .. 128 KiB, e.g. 64 KiB Marshal + LPM hdr)
 		19, // 512 KiB (covers 128 KiB+1 .. 512 KiB)
 		20, // 1 MiB
 	}
