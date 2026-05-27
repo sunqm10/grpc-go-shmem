@@ -2026,7 +2026,12 @@ func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	// http2.ErrCodeFlowControl; the SHM equivalent is the
 	// cancellation path below.
 	if err := s.fc.onData(size); err != nil {
-		shmDebugf("[ERROR] ShmServerTransport.onDataFrameReceived: stream=%d flow-control violation (%v); cancelling stream", streamID, err)
+		lim, pd, pu, d := s.fc.snapshot()
+		cLim, cUnacked, cEff := t.connInFlow.snapshot()
+		shmDebugf("[FC-VIOLATION] server stream=%d frameSize=%d err=%v"+
+			" | stream{limit=%d pendingData=%d pendingUpdate=%d delta=%d}"+
+			" | conn{limit=%d unacked=%d effective=%d} cancelling stream",
+			streamID, size, err, lim, pd, pu, d, cLim, cUnacked, cEff)
 		s.cancel()
 	}
 }

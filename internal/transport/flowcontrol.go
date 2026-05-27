@@ -161,6 +161,14 @@ func (f *trInFlow) getSize() uint32 {
 	return atomic.LoadUint32(&f.effectiveWindowSize)
 }
 
+// snapshot returns a copy of the conn-level inflow state for
+// diagnostics. Locks briefly; safe to call from anywhere.
+func (f *trInFlow) snapshot() (limit, unacked, effective uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.limit, f.unacked, atomic.LoadUint32(&f.effectiveWindowSize)
+}
+
 // inFlow deals with inbound flow control
 type inFlow struct {
 	mu sync.Mutex
@@ -175,6 +183,14 @@ type inFlow struct {
 	// delta is the extra window update given by receiver when an application
 	// is reading data bigger in size than the inFlow limit.
 	delta uint32
+}
+
+// snapshot returns a copy of the inflow state for diagnostics.
+// Locks briefly; not safe to call from atomic write paths.
+func (f *inFlow) snapshot() (limit, pendingData, pendingUpdate, delta uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.limit, f.pendingData, f.pendingUpdate, f.delta
 }
 
 // newLimit updates the inflow window to a new value n.

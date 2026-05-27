@@ -1966,6 +1966,17 @@ func (t *ShmClientTransport) onDataFrameReceived(streamID uint32, size uint32) {
 		return
 	}
 	if err := s.fc.onData(size); err != nil {
+		// Snapshot stream + conn FC state before closing so a
+		// GRPC_SHM_DEBUG=1 run captures exactly what tripped the
+		// limit check. Useful for diagnosing the 1 MiB jumbo bug
+		// where stream-level pre-credit (onMessageStart) was
+		// expected to admit the LPM + 5 B header but didn't.
+		lim, pd, pu, d := s.fc.snapshot()
+		cLim, cUnacked, cEff := t.connInFlow.snapshot()
+		shmDebugf("[FC-VIOLATION] client stream=%d frameSize=%d err=%v"+
+			" | stream{limit=%d pendingData=%d pendingUpdate=%d delta=%d}"+
+			" | conn{limit=%d unacked=%d effective=%d}",
+			streamID, size, err, lim, pd, pu, d, cLim, cUnacked, cEff)
 		t.closeStream(s, io.EOF, true, http2.ErrCodeFlowControl,
 			status.New(codes.Internal, err.Error()), nil, false)
 	}
