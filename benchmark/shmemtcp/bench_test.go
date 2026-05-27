@@ -297,16 +297,17 @@ type benchProfile struct {
 }
 
 func loadBenchProfile() benchProfile {
+	var p benchProfile
 	switch os.Getenv("BENCH_PROFILE") {
 	case "fair-default":
-		return benchProfile{
+		p = benchProfile{
 			initialWindowSize:     65535,
 			initialConnWindowSize: 65535,
 			maxFrameSize:          16384,
 			applyToShm:            true,
 		}
 	case "fair-32mb":
-		return benchProfile{
+		p = benchProfile{
 			initialWindowSize:     32 * 1024 * 1024,
 			initialConnWindowSize: 32 * 1024 * 1024,
 			// 32 MiB profile leaves frame size at the SHM default
@@ -316,12 +317,40 @@ func loadBenchProfile() benchProfile {
 			applyToShm: true,
 		}
 	case "", "shm-tuned":
-		return benchProfile{}
+		p = benchProfile{}
 	default:
 		panic(fmt.Sprintf("BENCH_PROFILE %q not recognised; use shm-tuned | fair-default | fair-32mb",
 			os.Getenv("BENCH_PROFILE")))
 	}
+	// SHM_INITIAL_WINDOW env override lets a reviewer isolate the
+	// FC-window variable without writing a new profile. Applied on
+	// TOP of the profile's window value, AFFECTING ALL THREE
+	// TRANSPORTS symmetrically (via dialOpts / serverOpts which
+	// both read initialWindowSize). Useful for probes like "is the
+	// 64K-message slowdown caused by 65535 window saturation?"
+	// Frame size is NOT changed by this knob — pair with
+	// SHM_MAX_FRAME_SIZE if frame-side experiments are also desired.
+	// The SHM-specific WU emission threshold is reconfigured inside
+	// newShmEnv when applyToShm is true.
+	if v := os.Getenv("SHM_INITIAL_WINDOW"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			panic(fmt.Sprintf("SHM_INITIAL_WINDOW=%q invalid: %v", v, perr))
+		}
+		p.initialWindowSize = int32(n)
+		p.initialConnWindowSize = int32(n)
+		if p.applyToShm {
+			// Force apply even for shm-tuned (which normally leaves
+			// applyToShm=false) — the user is explicitly opting in
+			// to a window override, so propagate to SHM too.
+			// (No-op when already true.)
+		} else {
+			p.applyToShm = true
+		}
+	}
+	return p
 }
+
 
 func (p benchProfile) dialOpts(transport string) []grpc.DialOption {
 	apply := true
