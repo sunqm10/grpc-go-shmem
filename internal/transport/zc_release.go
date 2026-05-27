@@ -59,3 +59,36 @@ func (p *zcChainReleasePool) Put(_ *[]byte) {
 	}
 	p.ring.ReleaseChainZcBuffer()
 }
+
+// zcAnchorReleasePool is the consumer-side release pool for the
+// multi-anchor ZC receive path (ring_zc_multi.go). Each ring-backed
+// mem.Buffer issued via BeginAnchor carries its anchor pointer
+// through the pool; Put(buf) marks the anchor released and lets the
+// ring advance header.ReadIdx through the ordered prefix of released
+// anchors.
+//
+// Why a separate pool type from zcChainReleasePool: zcChainReleasePool
+// uses the single-anchor zcInFlight refcount to gate EndZcReservation.
+// zcAnchorReleasePool plumbs the anchor pointer to ReleaseAnchor so
+// the multi-anchor FIFO knows which anchor to mark released. Both
+// types coexist for backwards compatibility; the production h2 codec
+// uses zcAnchorReleasePool.
+type zcAnchorReleasePool struct {
+	ring   *ShmRing
+	anchor *zcAnchorMulti
+}
+
+func (p *zcAnchorReleasePool) Get(n int) *[]byte {
+	buf := make([]byte, n)
+	return &buf
+}
+
+func (p *zcAnchorReleasePool) Put(_ *[]byte) {
+	if p.ring == nil || p.anchor == nil {
+		return
+	}
+	if isRingClosed(p.ring) {
+		return
+	}
+	p.ring.ReleaseAnchor(p.anchor)
+}

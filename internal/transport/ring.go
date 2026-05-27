@@ -28,6 +28,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -176,6 +177,21 @@ type ShmRing struct {
 	// and will copy all remaining chunks. Cleared on the message's
 	// final (!MORE) chunk so the next message starts fresh.
 	chainCopyMode uint32
+
+	// Multi-anchor ZC state (ring_zc_multi.go). Replaces the
+	// at-most-one-ZC constraint with a bounded FIFO of in-flight
+	// anchors so concurrent streams sharing one ring direction can
+	// all benefit from the ring-backed receive path.
+	//
+	// zcAnchors is the FIFO (oldest first). Append on BeginAnchor;
+	// pop from head as the ordered prefix releases.
+	// zcAnchorsBytes is the total bytes held by anchors in flight,
+	// used for the per-ring byte budget (zcMaxBytesBudget).
+	// zcAnchorsMu serialises Begin/Release; reader-thread Commit
+	// remains lock-free against zcActive/zcDeferredTarget.
+	zcAnchorsMu    sync.Mutex
+	zcAnchors      []*zcAnchorMulti
+	zcAnchorsBytes uint64
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -404,18 +420,7 @@ func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
 // (excluding wire headers). contiguous is true iff the payload reservation
 // is contiguous (no ring wrap).
 //
-// The whole point of SHM is to avoid the per-byte memcpy that UDS / TCP
-// pay on every RPC. ZC is the mechanism that delivers on that promise,
-// so we want ZC to fire for as many payload sizes as physically safe.
-// The eligibility rules below were chosen accordingly:
-//
-//   - At-most-one-ZC in flight per ring (zcActive). The deferred-
-//     publish protocol assumes a single producer of bumps to
-//     zcDeferredTarget; multiple concurrent ZC frames would require
-//     multi-producer ordering not yet implemented. For pipelined
-//     streaming this means the second message of a back-to-back burst
-//     falls back to the single-mem.Copy fast path, which is correct
-//     and inexpensive.
+// Eligibility rules:
 //
 //   - Payload must be contiguous (no ring wrap). The H2 codec's
 //     copy-fallback handles wrap-aware reassembly.
@@ -426,17 +431,23 @@ func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
 //
 //   - Minimum payload of 4 KiB. Below that the ZC bookkeeping cost
 //     (atomic bumps + Buffer wrap + EndZcReservation publish) reliably
-//     loses to a direct mem.Copy. 4 KiB is one page; copying a single
-//     page is sub-µs on modern HW.
+//     loses to a direct mem.Copy.
+//
+//   - Single payload must fit inside the multi-anchor byte budget
+//     (zcMaxBytesBudget = capacity/2). Larger frames can never be ZC
+//     under the bounded-in-flight invariant.
 //
 //   - Back-pressure self-disable: when the ring is already > 75 % full
 //     (used*4 > cap*3), holding any extra bytes via ZC risks stalling
 //     the writer; let the copy path drain into heap instead.
 //
-// Compared to the previous heuristic (64 KiB minimum), the 4 KiB floor
-// lets ZC fire on the medium-message sizes (4 KiB – 16 KiB) where the
-// SHM advantage over UDS / TCP is most visible: those sizes still cost
-// the kernel two per-byte copies on UDS but zero on SHM with ZC.
+// Note on multi-anchor: prior versions of this check rejected ANY
+// candidate when a single ZC anchor was already in flight (zcActive==1).
+// Multi-anchor (see ring_zc_multi.go::BeginAnchor) admits up to
+// zcAnchorBudgetCount simultaneous anchors per ring, gated atomically
+// under zcAnchorsMu. IsSpeculativeZCEligible is now a fast pre-check
+// only; BeginAnchor is the authoritative gate that returns nil when the
+// budget is exceeded, letting the caller fall back to the copy path.
 func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bool {
 	if !contiguous {
 		return false
@@ -450,7 +461,9 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 	if payloadLength < 4*1024 {
 		return false
 	}
-	if atomic.LoadUint32(&r.zcActive) != 0 {
+	// Single-frame larger than half the ring can never fit alongside
+	// any other anchor under the bounded-in-flight invariant.
+	if uint64(payloadLength) > r.zcMaxBytesBudget() {
 		return false
 	}
 	// Back-pressure auto-degrade.

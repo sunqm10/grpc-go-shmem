@@ -1532,43 +1532,47 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//   - body contiguous (no ring wrap)
 				//   - body fully contains exactly one LPM
 				//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
-				//     at-most-one-ZC, not under back-pressure)
+				//     not under back-pressure)
+				//   - rx.BeginAnchor returns non-nil (multi-anchor budget
+				//     available; otherwise fall to single-frame copy path)
 				//
 				// The body bytes returned to the caller include the gRPC LPM
 				// 5-byte prefix.
 				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
 					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
-						atomic.AddUint64(&shmZCReadFire, 1)
-						// Arm the ZC anchor with the post-frame target, then
-						// don't call commitPayload.Commit — the deferred
-						// target already accounts for these bytes.
 						baseIdx := commitPayload.commitReadIdx
-						rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
-						rx.AddChainZcInFlight()
+						if anchor := rx.BeginAnchor(baseIdx, payloadLen); anchor != nil {
+							atomic.AddUint64(&shmZCReadFire, 1)
+							// Don't call commitPayload.Commit — BeginAnchor
+							// already bumped zcDeferredTarget by payloadLen.
 
-						// Set MORE flag based on END_STREAM. MORE=0
-						// signals client half-close to the server
-						// transport (ShmServerTransport.handleMessage
-						// uses MORE=0 to write io.EOF). Required for
-						// cross-impl interop with grpc-go HTTP/2,
-						// grpc-java, grpc-c++ which set END_STREAM on
-						// the last DATA frame carrying body bytes.
-						msgFlags := MessageFlagMORE
-						if h2fh.Flags&H2FlagEndStream != 0 {
-							msgFlags = 0
-							holder.removeLpmAccumulator(h2fh.StreamID)
+							// Set MORE flag based on END_STREAM. MORE=0
+							// signals client half-close to the server
+							// transport (ShmServerTransport.handleMessage
+							// uses MORE=0 to write io.EOF). Required for
+							// cross-impl interop with grpc-go HTTP/2,
+							// grpc-java, grpc-c++ which set END_STREAM on
+							// the last DATA frame carrying body bytes.
+							msgFlags := MessageFlagMORE
+							if h2fh.Flags&H2FlagEndStream != 0 {
+								msgFlags = 0
+								holder.removeLpmAccumulator(h2fh.StreamID)
+							}
+
+							ringSlice := pFirst[:payloadLen:payloadLen]
+							pool := &zcAnchorReleasePool{ring: rx, anchor: anchor}
+							buf := mem.NewBuffer(&ringSlice, pool)
+							return FrameHeader{
+								Type:     FrameTypeMESSAGE,
+								StreamID: h2fh.StreamID,
+								Length:   uint32(payloadLen),
+								Flags:    msgFlags,
+							}, buf, nil
 						}
-
-						ringSlice := pFirst[:payloadLen:payloadLen]
-						pool := &zcChainReleasePool{ring: rx}
-						buf := mem.NewBuffer(&ringSlice, pool)
-						return FrameHeader{
-							Type:     FrameTypeMESSAGE,
-							StreamID: h2fh.StreamID,
-							Length:   uint32(payloadLen),
-							Flags:    msgFlags,
-						}, buf, nil
+						// BeginAnchor returned nil — multi-anchor budget
+						// exceeded (counted in shmZCAnchorBudgetExceeded).
+						// Fall through to single-frame copy path below.
 					}
 				}
 

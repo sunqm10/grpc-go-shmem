@@ -91,6 +91,7 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-read/op", delta.ZCReadFire)
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
+		report("zc-anchor-budget-exceeded/op", delta.ZCAnchorBudgetExceeded)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)
