@@ -1214,7 +1214,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 		}
 	}
 
-	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
+	data, err := encode(s.getCodec(stream.ContentSubtype()), msg, s.opts.bufferPool)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err

@@ -1865,7 +1865,7 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 								binlog.Log(ss.ctx, sh)
 							}
 						}
-						binData, encErr := encode(ss.codec, m)
+						binData, encErr := encode(ss.codec, m, ss.p.bufferPool)
 						if encErr == nil {
 							sm := &binarylog.ServerMessage{Message: binData.Materialize()}
 							binData.Free()
@@ -2027,13 +2027,21 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // compression was made and therefore whether the payload needs to be freed in
 // addition to the returned data. Freeing the payload if the returned boolean is
 // false can lead to undefined behavior.
+//
+// pool is the channel-scoped mem.BufferPool from dial / server options.
+// It is forwarded to encode so that pool-aware codecs (proto codec
+// implements bufferPoolMarshaler) marshal directly into the channel
+// pool instead of falling back to mem.DefaultBufferPool. The shared
+// memory transport uses this hook to install a tightly sized pool that
+// eliminates the per-Get overshoot the default tiered pool incurs on
+// payloads just above a tier boundary (e.g. 4 KiB → 16 KiB).
 func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor, pool mem.BufferPool) (hdr []byte, data, payload mem.BufferSlice, pf payloadFormat, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.encodedData, preparedMsg.payload, preparedMsg.pf, nil
 	}
 	// The input interface is not a prepared msg.
 	// Marshal and Compress the data at this point
-	data, err = encode(codec, m)
+	data, err = encode(codec, m, pool)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}

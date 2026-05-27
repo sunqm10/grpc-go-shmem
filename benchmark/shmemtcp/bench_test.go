@@ -443,6 +443,13 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	srvOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(benchMaxMsg),
 		grpc.MaxSendMsgSize(benchMaxMsg),
+		// Channel-scoped exact-size buffer pool. Eliminates the per-Get
+		// overshoot the default tiered pool incurs when codec.Marshal
+		// asks for a buffer that lands just above a tier boundary (a
+		// 4 KiB payload snapping to the 16 KiB tier accounted for ~64 %
+		// of allocation bytes in the master baseline). Per-bench
+		// instance so cross-test pool state never leaks.
+		experimental.BufferPool(experimental.TightBufferPool()),
 	}
 	srvOpts = append(srvOpts, profile.serverOpts("shm")...)
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
@@ -454,6 +461,11 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),
 			grpc.MaxCallSendMsgSize(benchMaxMsg),
 		),
+		// See server-side rationale above. Per-channel pool instance
+		// matches the production wiring: a server pool serves all of
+		// its inbound streams' marshal calls; a client pool serves all
+		// of its outbound streams' marshal calls. The two never share.
+		experimental.WithBufferPool(experimental.TightBufferPool()),
 	}
 	dialOpts = append(dialOpts, profile.dialOpts("shm")...)
 	conn, err := grpc.NewClient("shm://"+name, dialOpts...)

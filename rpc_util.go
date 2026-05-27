@@ -798,11 +798,29 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (payloadFormat, mem.BufferSl
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c baseCodec, msg any) (mem.BufferSlice, error) {
+//
+// If pool is non-nil and the codec implements the bufferPoolMarshaler
+// extension, the marshal destination buffer is sourced from pool. This
+// lets the SHM transport supply a tighter per-channel pool that avoids
+// the default tiered pool's per-Get overshoot (4 KiB → 16 KiB jump on
+// a 4 KiB message is the worst case the default pays).
+func encode(c baseCodec, msg any, pool mem.BufferPool) (mem.BufferSlice, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
-	b, err := c.Marshal(msg)
+	var (
+		b   mem.BufferSlice
+		err error
+	)
+	if pool != nil {
+		if pc, ok := c.(bufferPoolMarshaler); ok {
+			b, err = pc.MarshalWithPool(msg, pool)
+		} else {
+			b, err = c.Marshal(msg)
+		}
+	} else {
+		b, err = c.Marshal(msg)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err.Error())
 	}
@@ -811,6 +829,15 @@ func encode(c baseCodec, msg any) (mem.BufferSlice, error) {
 		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", bufSize)
 	}
 	return b, nil
+}
+
+// bufferPoolMarshaler is an optional extension implemented by codecs that
+// can marshal into a caller-supplied mem.BufferPool. The proto codec (and
+// any codec wrapped via newCodecV1Bridge) implements this. Encode
+// type-asserts to this interface and dispatches when the caller has
+// configured a channel-level pool.
+type bufferPoolMarshaler interface {
+	MarshalWithPool(v any, pool mem.BufferPool) (mem.BufferSlice, error)
 }
 
 // compress returns the input bytes compressed by compressor or cp.
