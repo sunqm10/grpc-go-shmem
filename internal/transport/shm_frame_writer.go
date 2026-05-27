@@ -703,6 +703,28 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 		if connQ < grant {
 			grant = connQ
 		}
+		// LPM-header atomicity. The 5-byte gRPC LPM header MUST be
+		// delivered to the receiver in a contiguous DATA-frame body
+		// because the receive-side lpmAccumulator can only set its
+		// expectedTotal (which gates the onMessageStart stream-FC
+		// pre-credit hook) AFTER the full 5-byte header is parsed
+		// in a single feed() call. If the sender emits a chunk
+		// shorter than the remaining LPM-header bytes, the receiver
+		// sees a partial header, expectedTotal stays 0, the
+		// onMessageStart hook does not fire, no stream-level
+		// pre-credit is emitted, and the receiver's onData check on
+		// the NEXT chunk trips because pendingData crosses the
+		// per-stream limit while delta is still 0. This produces
+		// the 1 MiB-jumbo `Send: EOF` bench failure (rounds 0-31
+		// depending on concurrency) — confirmed by GRPC_SHM_DEBUG=1
+		// reproducer showing `delta=0` at the violation site.
+		//
+		// Defer until conn / stream credit can cover at least the
+		// remaining header bytes.
+		if hdrRemaining := int64(len(d.cur.lpmHdr)); hdrRemaining > 0 && grant < hdrRemaining {
+			w.deferred[streamID] = d
+			return
+		}
 		if !d.streamPtr.sendQuota.CompareAndSwap(streamQ, streamQ-grant) {
 			continue // CAS lost — retry
 		}
