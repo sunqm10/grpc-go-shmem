@@ -2610,13 +2610,83 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 // inline path bails instead so the sender goroutine doesn't hold
 // inlineMu while waiting).
 //
+// Handles the ring-wrap case CORRECTLY: when the reservation
+// straddles the wrap boundary (len(res.First) < total), the proto
+// is marshalled into a pooled scratch buffer and split-copied across
+// res.First + res.Second. The inline path's contiguous-only path
+// (writeProtoToRingH2Core) would silently corrupt the body region
+// in this case because proto.MarshalAppend reallocates internally
+// when cap(dst) < pSize, leaving the ring bytes uninitialised.
+//
 // Size bounds (Capacity/3, h2MaxFramePayload, shmMaxFrameSize) MUST
 // be pre-validated by the caller — they cannot be soft-rejected
 // from the writeLoop context (the entry is already in flight and
 // the sender is blocked on doneCh).
 func writeProtoToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize int, flags uint8) error {
 	total := h2FrameHeaderSize + 5 + pSize
-	return writeProtoToRingH2Core(ctx, tx, streamID, msg, pSize, total, flags)
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	// Build the 14-byte preamble (H2 frame header + gRPC LPM header)
+	// on the stack so neither path allocates here.
+	var hdr14 [h2FrameHeaderSize + 5]byte
+	var h2flags byte
+	if flags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var h2hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&h2hdr, H2FrameHeader{
+		Length:   uint32(5 + pSize),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	copy(hdr14[0:h2FrameHeaderSize], h2hdr[:])
+	hdr14[h2FrameHeaderSize] = 0 // gRPC LPM compressed flag = 0
+	binary.BigEndian.PutUint32(hdr14[h2FrameHeaderSize+1:h2FrameHeaderSize+5], uint32(pSize))
+
+	if len(res.Second) == 0 {
+		// Contiguous fast path: marshal directly into ring memory.
+		// res.First has cap == total here; dst's cap == pSize so
+		// proto.MarshalAppend can write in-place without realloc.
+		copy(res.First[0:h2FrameHeaderSize+5], hdr14[:])
+		dst := res.First[h2FrameHeaderSize+5 : h2FrameHeaderSize+5]
+		out, err := protoMarshalAppend(dst, msg)
+		if err != nil {
+			return err
+		}
+		if len(out) != pSize {
+			return fmt.Errorf("writeProtoToRingH2Blocking: size mismatch: %d vs %d", pSize, len(out))
+		}
+	} else {
+		// Wrap path: marshal into pooled scratch sized to total, then
+		// split-copy across res.First + res.Second. Heap allocation is
+		// amortised via sync.Pool — fires only when reservation
+		// straddles the ring wrap boundary (< 0.1 % of writes on a
+		// 64 MiB ring with ≤ 64 KiB messages).
+		scratch := getZcMarshalScratch(total)
+		copy(scratch[0:h2FrameHeaderSize+5], hdr14[:])
+		// proto.MarshalAppend(scratch[:14], msg) writes at index 14
+		// onward; cap(scratch) == total guarantees no realloc.
+		out, err := protoMarshalAppend(scratch[:h2FrameHeaderSize+5], msg)
+		if err != nil {
+			putZcMarshalScratch(scratch)
+			return err
+		}
+		if len(out) != total {
+			putZcMarshalScratch(scratch)
+			return fmt.Errorf("writeProtoToRingH2Blocking: total mismatch: %d vs %d", total, len(out))
+		}
+		firstLen := len(res.First)
+		copy(res.First, out[:firstLen])
+		copy(res.Second, out[firstLen:])
+		putZcMarshalScratch(scratch)
+	}
+
+	atomic.AddUint64(&shmZCWriteFire, 1)
+	return res.Commit(total)
 }
 
 // writeProtoToRingH2Core is the shared body of writeProtoToRingH2 and
