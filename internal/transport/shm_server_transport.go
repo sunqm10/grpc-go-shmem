@@ -1749,17 +1749,23 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		t.frameWriter.closeMu.RUnlock()
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 		// Writer goroutine is busy — push the proto.Message to writeLoop
-		// so it ZC-marshals there (instead of the bail-to-codec.Marshal
-		// path which allocates 8 GB/5s through tightBufferPool under
-		// N=1000/4K bench, dominating GC time per cpu pprof 2026-05-28).
-		// Quota stays consumed; refund on error.
+		// for asynchronous ZC marshal-into-ring. Mirrors http2Server's
+		// loopyWriter contract (server.write → controlBuf.put: returns
+		// after queue accept, errors surface asynchronously via the
+		// transport-level error path). Server-side has no opts.Last
+		// semantic on DATA frames — TRAILERS carries END_STREAM, sent
+		// via writeStatus on a separate code path — so no stream-state
+		// CAS is needed here.
 		fh := FrameHeader{
 			Type:     FrameTypeMESSAGE,
 			StreamID: s.id,
 			Flags:    0, // server-side: never END_STREAM on DATA (TRAILERS carries it)
 		}
-		err := t.frameWriter.enqueueProtoAndWait(s.ctx, &s.Stream, fh, pm, pSize)
+		err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize)
 		if err != nil {
+			// Queue full or writer closed BEFORE accepting the entry.
+			// Refund the pre-acquired quota; processProtoEntry never
+			// saw this entry, so it cannot refund.
 			t.connSendQuota.Add(int64(quotaSize))
 			s.sendQuota.Add(int64(quotaSize))
 			select {

@@ -634,17 +634,54 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 // only (streamDone signals the sender stopped caring). ctx error is
 // surfaced through ReserveWrite (which select's on ctx.Done()).
 func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
-	if w.closed.Load() {
-		entry.doneCh <- ErrConnClosing
+	var err error
+	switch {
+	case w.closed.Load():
+		err = ErrConnClosing
+	case entry.streamPtr != nil && entry.streamPtr.getState() == streamDone:
+		err = errStreamDone
+	default:
+		err = writeProtoToRingH2Blocking(entry.ctx, w.tx, entry.fh.StreamID,
+			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	}
+	if entry.doneCh != nil {
+		// Synchronous path (caller blocks on doneCh).
+		entry.doneCh <- err
 		return
 	}
-	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
-		entry.doneCh <- errStreamDone
+	// Async path (caller already returned from SendMsg with success).
+	// Per gRPC's standard async transport contract (mirrors
+	// http2Client.write → controlBuf.put: returns after queue accept,
+	// loopyWriter writes to wire later), errors from a previously-
+	// accepted Send surface on the next stream operation. We:
+	//   1. Refund the pre-acquired flow-control quota so subsequent
+	//      writes / deferred whole-message senders can use it.
+	//   2. Wake wuRetryWake so deferred entries revisit.
+	//   3. Escalate transport-fatal errors via onAsyncError (which the
+	//      transport plumbs to a stream-cancelling close); ctx /
+	//      stream-local errors propagate naturally via the stream's
+	//      existing error path when the caller next touches the stream.
+	if err == nil {
 		return
 	}
-	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, entry.fh.StreamID,
-		entry.protoMsg, entry.protoSize, entry.fh.Flags)
-	entry.doneCh <- err
+	if w.connQuota != nil {
+		w.connQuota.Add(int64(5 + entry.protoSize))
+	}
+	if entry.streamPtr != nil {
+		entry.streamPtr.sendQuota.Add(int64(5 + entry.protoSize))
+	}
+	select {
+	case w.wuRetryWake <- struct{}{}:
+	default:
+	}
+	// Transport-fatal: tear down so blocked stream goroutines wake
+	// via context cancellation (recvBuffer chan closes, RecvMsg
+	// returns ErrConnClosing). At-most-once via errReported CAS.
+	if err == ErrConnClosing || err == ErrRingClosed {
+		if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+			w.onAsyncError(err)
+		}
+	}
 }
 
 // enqueueProtoAndWait pushes a ZC marshal request onto the writer
@@ -710,6 +747,53 @@ func (w *shmFrameWriter) enqueueProtoAndWait(ctx context.Context, streamPtr *Str
 	err := <-doneCh
 	putDoneCh(doneCh)
 	return err
+}
+
+// enqueueProtoAsync is the gRPC-standard-aligned variant of
+// enqueueProtoAndWait: returns immediately after the writer chan
+// accepts the entry; writeLoop processes it later (mirrors
+// http2Client.write → controlBuf.put semantics, where the sender
+// returns before loopyWriter writes to the wire).
+//
+// Eliminates the sender's gopark-on-doneCh + writeLoop's goready
+// wake cycle that the sync path pays for ~27 % of writes at
+// N=1000/4 K bench (the inlineMu.TryLock bail fraction). Each
+// elimination saves ~1-3 µs of scheduler choreography per write
+// (one gopark + one goready + one schedule re-entry), restoring
+// goroutine P-affinity that the doneCh wake otherwise breaks.
+//
+// Pre-conditions (caller MUST satisfy, same as sync variant):
+//   - Single-frame size bounds pre-validated.
+//   - Send quota for (5 + protoSize) bytes pre-acquired by the
+//     sender. processProtoEntry refunds it on async error.
+//   - For opts.Last writes: caller has already CAS'd stream state
+//     to streamWriteDone BEFORE calling this (mirroring
+//     http2Client.write which CAS's before controlBuf.put). On
+//     CAS-fail caller refunds quota and does NOT enqueue.
+//
+// Errors:
+//   - ErrConnClosing if the queue is full (frameWriterQueueSize=2048
+//     should make this rare; treat as transport overload — caller
+//     refunds quota and returns the error).
+//   - All other errors (ring write failure, ctx cancel mid-write,
+//     etc.) surface asynchronously: processProtoEntry refunds quota,
+//     and transport-fatal errors trigger onAsyncError → transport
+//     close, which cancels all stream contexts and wakes blocked
+//     RecvMsg callers with ErrConnClosing.
+func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+	entry := frameEntry{
+		ctx:       ctx,
+		fh:        fh,
+		streamPtr: streamPtr,
+		protoMsg:  msg,
+		protoSize: pSize,
+		// doneCh == nil signals processProtoEntry to refund quota +
+		// escalate via onAsyncError instead of signalling a waiter.
+	}
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
+	return nil
 }
 
 // processWholeMessage handles a whole-message entry. The caller
