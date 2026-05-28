@@ -1369,7 +1369,6 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 		// These bytes already lived in heap-allocated form (pendingFrame
 		// is a copy, not a ring slice), so ZC isn't applicable here.
 		if len(holder.pendingFrame) > 0 {
-			atomic.AddUint64(&shmZCFailPendingFrame, 1)
 			sid := holder.pendingStreamID
 			data := holder.pendingFrame
 			endStream := holder.pendingFrameEndStream
