@@ -19,6 +19,8 @@
 package transport
 
 import (
+	"fmt"
+	"os"
 	"sync/atomic"
 )
 
@@ -142,6 +144,17 @@ var (
 	shmZCFailAccInProgress   uint64 // per-stream LPM accumulator non-empty
 	shmZCFailLpmMismatch     uint64 // 5+bodyLen != payloadLen (multi-LPM in one DATA)
 	shmZCFailIneligible      uint64 // IsMultiAnchorZCEligible returned false
+)
+
+// Sub-counters for IsMultiAnchorZCEligible rejection. Sum across these
+// = shmZCFailIneligible. shmZCElig_BPLogged is a one-shot guard for
+// the stderr trace.
+var (
+	shmZCElig_NotContig    uint64
+	shmZCElig_RingTooSmall uint64
+	shmZCElig_PayloadSmall uint64
+	shmZCElig_BackPressure uint64
+	shmZCElig_BPLogged     int64
 )
 
 // BeginMultiAnchor claims a single-frame ZC slot in the FIFO. Returns
@@ -381,16 +394,30 @@ func (r *ShmRing) drainReleasedAnchorPrefix() {
 //     held bytes do not stall the writer
 func (r *ShmRing) IsMultiAnchorZCEligible(payloadLength int, contiguous bool) bool {
 	if !contiguous {
+		atomic.AddUint64(&shmZCElig_NotContig, 1)
 		return false
 	}
 	const minRingForZC = uint64(1) << 20 // 1 MiB
 	if r.capacity < minRingForZC {
+		atomic.AddUint64(&shmZCElig_RingTooSmall, 1)
 		return false
 	}
 	if payloadLength < 4*1024 {
+		atomic.AddUint64(&shmZCElig_PayloadSmall, 1)
 		return false
 	}
 	hdr := r.header()
 	used := hdr.WriteIndex() - hdr.ReadIndex()
-	return used*4 <= r.capacity*3
+	if used*4 > r.capacity*3 {
+		atomic.AddUint64(&shmZCElig_BackPressure, 1)
+		// One-shot diag: print the first few rejections so we can
+		// see actual `used` / `capacity` values.
+		if n := atomic.AddInt64(&shmZCElig_BPLogged, 1); n <= 5 {
+			fmt.Fprintf(os.Stderr,
+				"[ZCDIAG] back-pressure reject: used=%d cap=%d ratio=%.2f%% threshold=75%% pl=%d\n",
+				used, r.capacity, float64(used)/float64(r.capacity)*100, payloadLength)
+		}
+		return false
+	}
+	return true
 }

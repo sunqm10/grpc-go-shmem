@@ -209,6 +209,10 @@ type ShmPathCounters struct {
 	ZCFailAccInProgress    uint64
 	ZCFailLpmMismatch      uint64
 	ZCFailIneligible       uint64
+	ZCEligNotContig        uint64
+	ZCEligRingTooSmall     uint64
+	ZCEligPayloadSmall     uint64
+	ZCEligBackPressure     uint64
 
 	InlineWriteFire              uint64
 	InlineWriteBailLocked        uint64
@@ -243,6 +247,10 @@ func LoadShmPathCounters() ShmPathCounters {
 		ZCFailAccInProgress:    atomic.LoadUint64(&shmZCFailAccInProgress),
 		ZCFailLpmMismatch:      atomic.LoadUint64(&shmZCFailLpmMismatch),
 		ZCFailIneligible:       atomic.LoadUint64(&shmZCFailIneligible),
+		ZCEligNotContig:        atomic.LoadUint64(&shmZCElig_NotContig),
+		ZCEligRingTooSmall:     atomic.LoadUint64(&shmZCElig_RingTooSmall),
+		ZCEligPayloadSmall:     atomic.LoadUint64(&shmZCElig_PayloadSmall),
+		ZCEligBackPressure:     atomic.LoadUint64(&shmZCElig_BackPressure),
 
 		InlineWriteFire:              atomic.LoadUint64(&shmInlineWriteFire),
 		InlineWriteBailLocked:        atomic.LoadUint64(&shmInlineWriteBailLocked),
@@ -278,6 +286,10 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		ZCFailAccInProgress:    a.ZCFailAccInProgress - before.ZCFailAccInProgress,
 		ZCFailLpmMismatch:      a.ZCFailLpmMismatch - before.ZCFailLpmMismatch,
 		ZCFailIneligible:       a.ZCFailIneligible - before.ZCFailIneligible,
+		ZCEligNotContig:        a.ZCEligNotContig - before.ZCEligNotContig,
+		ZCEligRingTooSmall:     a.ZCEligRingTooSmall - before.ZCEligRingTooSmall,
+		ZCEligPayloadSmall:     a.ZCEligPayloadSmall - before.ZCEligPayloadSmall,
+		ZCEligBackPressure:     a.ZCEligBackPressure - before.ZCEligBackPressure,
 
 		InlineWriteFire:              a.InlineWriteFire - before.InlineWriteFire,
 		InlineWriteBailLocked:        a.InlineWriteBailLocked - before.InlineWriteBailLocked,
