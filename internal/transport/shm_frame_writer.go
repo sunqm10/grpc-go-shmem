@@ -966,6 +966,206 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	return <-entry.doneCh
 }
 
+// tryInlineWrite attempts to emit the whole message as a single H2
+// DATA frame directly from the sender goroutine, bypassing the
+// channel + writer-goroutine handoff that enqueueMessageAndWait
+// normally takes.
+//
+// Motivation. At low stream concurrency (~10s-100s of streams) the
+// existing channel path's per-message wall time is dominated by
+// goroutine scheduling: sender sends to channel (~100 ns), runtime
+// schedules the writer goroutine (~1 µs), writer processes one
+// entry, futex_wakes the reader (~1 µs syscall), reader scheduler
+// fires (~1 µs). The actual ring memcpy is a small fraction. At
+// high concurrency the existing path amortises beautifully — one
+// writer wake drains many entries, one futex_wake covers many
+// frames — and convincingly beats UDS by 15+% (see
+// grpc-go-shm-beat-uds-roadmap-2026-05-28.md). The hybrid added
+// here keeps the high-concurrency win intact while reclaiming the
+// low-concurrency latency.
+//
+// Return contract. Returns (true, err) once the inline path has
+// taken responsibility for the message — the caller MUST NOT fall
+// back to the channel path even if err is non-nil. Returns
+// (false, nil) for all eligibility bails; the caller continues to
+// the existing channel + writer-goroutine path with no state change.
+//
+// Eligibility checks, ordered cheapest-first so each bail returns
+// fast:
+//
+//  1. payloadLen ∈ (0, shmMaxFrameSize]. Zero-length messages
+//     (client half-close, etc.) go through the channel path's
+//     specialised handler. Oversized messages need the writer
+//     goroutine's chunking + FC-defer machinery.
+//
+//  2. inlineMu.TryLock(). The writer goroutine holds inlineMu for
+//     its entire drain pass. A successful TryLock proves no
+//     writer-goroutine batch is in flight; the inline path will
+//     run alone until it Unlocks.
+//
+//  3. !closed, stream not done, ctx live. Each is checked AFTER
+//     the lock so a concurrent close racing with the TryLock loses
+//     to the close path's lock acquisition.
+//
+//  4. len(w.ch) == 0 AND len(w.deferred) == 0. This is the
+//     batching-preservation gate. Whenever ANY work is queued the
+//     channel path's batched drain is strictly better (one wake
+//     covers many frames). Bailing here means the high-concurrency
+//     workload (N=1000 streams ping-ponging) virtually never
+//     fires the inline path — its batched throughput stays unchanged.
+//
+//  5. stream and conn outbound FC quotas each cover payloadLen.
+//     Insufficient quota means we'd need the writer goroutine's
+//     deferred-retry machinery; bailing back to the channel path
+//     keeps that one canonical path.
+//
+//  6. CAS-deduct both quotas atomically. A CAS race here can only
+//     come from the reader's addSendQuota (incoming WINDOW_UPDATE
+//     applied on conn quota); we bail rather than retry-spin
+//     because the channel path can pick up the larger window cleanly.
+//
+// Why this is NOT a D-lite-class concurrency bug. D-lite raced
+// across multiple concurrent ZC reader anchors, each computing its
+// publish offset from a STALE `commitReadIdx` because
+// header.ReadIdx was frozen during the ZC hold. Anchors got
+// overlapping ranges, the prefix-walk publish jammed, and the
+// ring permanently back-pressured. Here, inlineMu serialises EVERY
+// ring write — both this inline path and the writer goroutine —
+// so at most one goroutine touches the ring at a time. Publish
+// order equals lock acquisition order. There is no anchor list, no
+// CAS-reserve race, no commit-vs-publish split. Even when CAS on
+// connQuota loses to a reader's addSendQuota, our rollback +
+// fall-through preserves the lock-acquisition publish order.
+func (w *shmFrameWriter) tryInlineWrite(
+	ctx context.Context,
+	streamPtr *Stream,
+	hdr []byte,
+	data mem.BufferSlice,
+	isLast bool,
+) (handled bool, err error) {
+	payloadLen := len(hdr) + data.Len()
+	if payloadLen == 0 {
+		atomic.AddUint64(&shmInlineWriteBailZeroLen, 1)
+		return false, nil
+	}
+	if payloadLen > shmMaxFrameSize {
+		atomic.AddUint64(&shmInlineWriteBailFrameSize, 1)
+		return false, nil
+	}
+	// Pre-lock fast-fail: if the writer-goroutine channel already has
+	// entries queued, the batched drain is strictly cheaper than the
+	// inline path (one writer wake covers many frames vs. one reader
+	// wake per inline emit). Reading len() on a chan is documented
+	// lock-free and racy-but-consistent (snapshot at some recent
+	// instant) — perfectly fine for an optimisation gate.
+	//
+	// Skipping the TryLock here is essential at high concurrency:
+	// without this gate, every sender at N=1000 streams pays a
+	// TryLock + 5-field check + Unlock just to bail on the same
+	// len(w.ch) > 0 condition. On a 16-core box the contended
+	// inlineMu cache line ping-pongs and net-regresses throughput
+	// even though all calls bail. Local Windows bench reproduced:
+	// N=1000/4K dropped 4 % and N=1000/64K dropped 9 % vs the
+	// pre-inline-write baseline. With this pre-lock gate the
+	// high-concurrency path returns to the original cost.
+	if len(w.ch) > 0 {
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	if !w.inlineMu.TryLock() {
+		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		return false, nil
+	}
+
+	// All paths from here must Unlock.
+
+	if w.closed.Load() {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		return false, nil
+	}
+	if streamPtr.getState() == streamDone {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		return false, nil
+	}
+	if ctx.Err() != nil {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		return false, nil
+	}
+	// Re-check len(w.ch) under the lock — between the pre-lock check
+	// and TryLock, another goroutine may have enqueued. Bail
+	// preserves the batched-drain invariant.
+	if len(w.ch) > 0 || len(w.deferred) > 0 {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	if w.connQuota == nil {
+		// setConnQuotaPtr has not been called yet (transport in the
+		// middle of construction). Fall back to channel path which
+		// also depends on connQuota and will bail more cleanly via
+		// processWholeMessage's misuse check.
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	streamQ := streamPtr.sendQuota.Load()
+	if streamQ < int64(payloadLen) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	connQ := w.connQuota.Load()
+	if connQ < int64(payloadLen) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	if !streamPtr.sendQuota.CompareAndSwap(streamQ, streamQ-int64(payloadLen)) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	if !w.connQuota.CompareAndSwap(connQ, connQ-int64(payloadLen)) {
+		streamPtr.sendQuota.Add(int64(payloadLen))
+		shmCASRollback.Add(1)
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+
+	// All eligibility gates passed. Emit the single H2 DATA frame
+	// carrying the whole MESSAGE. emitH2DataFromCursor handles its
+	// own ring reservation, segment-spanning copy, and reader signal
+	// (no BeginBatch wrapper needed for a single-chunk emit — the
+	// final Commit fires the wake).
+	fh := FrameHeader{StreamID: streamPtr.id, Type: FrameTypeMESSAGE}
+	if isLast {
+		fh.Flags = MessageFlagEndStream
+	} else {
+		fh.Flags = MessageFlagMORE
+	}
+	_, h2f := translateCustomToH2(fh)
+	cur := &vecCursor{lpmHdr: hdr, data: data}
+	if emitErr := emitH2DataFromCursor(ctx, w.tx, streamPtr.id, cur, payloadLen, h2f); emitErr != nil {
+		// Refund quota — bytes did not reach the ring.
+		streamPtr.sendQuota.Add(int64(payloadLen))
+		w.connQuota.Add(int64(payloadLen))
+		w.inlineMu.Unlock()
+		// Return handled=true so the caller does NOT fall back to
+		// the channel path (the message has terminally failed).
+		return true, emitErr
+	}
+	if w.piggybackWUFn != nil {
+		w.piggybackWUFn(streamPtr.id)
+	}
+	w.inlineMu.Unlock()
+	atomic.AddUint64(&shmInlineWriteFire, 1)
+	return true, nil
+}
+
 // enqueueMessageAndWait submits a whole MESSAGE (header + payload)
 // for chunked emission by the writer goroutine and blocks until
 // the LAST chunk has been written to the ring.
@@ -1003,6 +1203,21 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	if streamPtr == nil {
 		return errStreamDone
 	}
+	// Inline-write fast path: when the writer goroutine is idle and
+	// no other work is queued, emit the message directly from this
+	// goroutine. Bypasses the channel send + writer-goroutine wake
+	// + writer-side futex_wake-to-reader handoffs (~3 µs of
+	// scheduler latency per message). See tryInlineWrite's doc for
+	// the full eligibility set and the GPT-5.5-style adversarial
+	// review.
+	//
+	// data is consumed synchronously inside the inline path; no Ref
+	// bump is required because the caller's existing reference
+	// keeps the BufferSlice alive for the duration of this function.
+	if handled, ierr := w.tryInlineWrite(ctx, streamPtr, hdr, data, isLast); handled {
+		return ierr
+	}
+
 	fh := FrameHeader{StreamID: streamPtr.id, Type: FrameTypeMESSAGE}
 	doneCh := make(chan error, 1)
 	entry := frameEntry{

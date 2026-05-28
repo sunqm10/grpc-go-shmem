@@ -109,6 +109,46 @@ var (
 	// per chunk). Used when the LPM spans multiple DATA frames or
 	// when the candidate frame failed the ZC / single-copy guards.
 	shmAccReadFire uint64
+
+	// Inline-write fast-path counters (anchored at
+	// (*shmFrameWriter).tryInlineWrite). The inline path emits a
+	// single-frame whole-message DATA frame directly from the sender
+	// goroutine, bypassing the channel + writer-goroutine handoff.
+	// Targets low-concurrency latency: when the writer goroutine
+	// can't amortise its wake cost across a batch, the channel
+	// handoff dominates the per-message wall time. At high
+	// concurrency the existing channel path's batched drain is
+	// strictly better, so the inline path bails immediately when
+	// any pending work is observable.
+
+	// shmInlineWriteFire: tryInlineWrite emitted the whole message
+	// directly into the ring without going through the writer
+	// goroutine. The sender returned immediately (no doneCh wait).
+	shmInlineWriteFire uint64
+
+	// shmInlineWriteBailLocked: TryLock(inlineMu) failed — the writer
+	// goroutine is currently draining a batch. Forces channel path.
+	shmInlineWriteBailLocked uint64
+
+	// shmInlineWriteBailQueued: w.ch had pending entries OR
+	// w.deferred had blocked messages. Forces channel path so the
+	// writer goroutine can preserve batch + FC-retry ordering.
+	shmInlineWriteBailQueued uint64
+
+	// shmInlineWriteBailQuota: stream / conn outbound flow-control
+	// quota was insufficient for the whole message in one frame.
+	// Forces channel path so the writer goroutine's chunking +
+	// deferred-retry machinery can handle the partial credit.
+	shmInlineWriteBailQuota uint64
+
+	// shmInlineWriteBailFrameSize: payloadLen exceeded the negotiated
+	// H2 max frame size — must chunk via the channel path.
+	shmInlineWriteBailFrameSize uint64
+
+	// shmInlineWriteBailZeroLen: zero-length payload (e.g. client
+	// half-close). The channel path's specialised zero-length
+	// MESSAGE handling stays canonical for this rare case.
+	shmInlineWriteBailZeroLen uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -130,6 +170,13 @@ type ShmPathCounters struct {
 	ZCReadFire            uint64
 	CopyReadFire          uint64
 	AccReadFire           uint64
+
+	InlineWriteFire          uint64
+	InlineWriteBailLocked    uint64
+	InlineWriteBailQueued    uint64
+	InlineWriteBailQuota     uint64
+	InlineWriteBailFrameSize uint64
+	InlineWriteBailZeroLen   uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -148,6 +195,13 @@ func LoadShmPathCounters() ShmPathCounters {
 		ZCReadFire:            atomic.LoadUint64(&shmZCReadFire),
 		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
 		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
+
+		InlineWriteFire:          atomic.LoadUint64(&shmInlineWriteFire),
+		InlineWriteBailLocked:    atomic.LoadUint64(&shmInlineWriteBailLocked),
+		InlineWriteBailQueued:    atomic.LoadUint64(&shmInlineWriteBailQueued),
+		InlineWriteBailQuota:     atomic.LoadUint64(&shmInlineWriteBailQuota),
+		InlineWriteBailFrameSize: atomic.LoadUint64(&shmInlineWriteBailFrameSize),
+		InlineWriteBailZeroLen:   atomic.LoadUint64(&shmInlineWriteBailZeroLen),
 	}
 }
 
@@ -167,5 +221,12 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		ZCReadFire:            a.ZCReadFire - before.ZCReadFire,
 		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
 		AccReadFire:           a.AccReadFire - before.AccReadFire,
+
+		InlineWriteFire:          a.InlineWriteFire - before.InlineWriteFire,
+		InlineWriteBailLocked:    a.InlineWriteBailLocked - before.InlineWriteBailLocked,
+		InlineWriteBailQueued:    a.InlineWriteBailQueued - before.InlineWriteBailQueued,
+		InlineWriteBailQuota:     a.InlineWriteBailQuota - before.InlineWriteBailQuota,
+		InlineWriteBailFrameSize: a.InlineWriteBailFrameSize - before.InlineWriteBailFrameSize,
+		InlineWriteBailZeroLen:   a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
 	}
 }

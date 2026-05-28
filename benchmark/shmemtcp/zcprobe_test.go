@@ -91,6 +91,18 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-read/op", delta.ZCReadFire)
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
+		// Inline-write fast-path counters: emit single-frame whole-
+		// message DATA directly from the sender goroutine, bypassing
+		// the channel + writer-goroutine handoff. Bails dominate at
+		// high concurrency (preserves existing batching win); fires
+		// dominate at low concurrency (closes the goroutine-handoff
+		// latency gap to UDS).
+		report("inline-write-fire/op", delta.InlineWriteFire)
+		report("inline-write-bail-locked/op", delta.InlineWriteBailLocked)
+		report("inline-write-bail-queued/op", delta.InlineWriteBailQueued)
+		report("inline-write-bail-quota/op", delta.InlineWriteBailQuota)
+		report("inline-write-bail-frame/op", delta.InlineWriteBailFrameSize)
+		report("inline-write-bail-zero/op", delta.InlineWriteBailZeroLen)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)
