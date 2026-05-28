@@ -2218,50 +2218,17 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		t.frameWriter.closeMu.RUnlock()
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 		// Writer goroutine is busy — push the proto.Message to writeLoop
-		// for asynchronous ZC marshal-into-ring. This mirrors the gRPC
-		// standard async transport semantics established by
-		// http2Client.write → controlBuf.put: the sender CAS's stream
-		// state (Last → WriteDone) BEFORE enqueue, transfers ownership
-		// to the writer goroutine, and returns immediately. Errors
-		// from the eventual ring write surface asynchronously via
-		// onAsyncError → transport close → stream-context cancellation,
-		// which is the same error-propagation contract loopyWriter
-		// uses.
-		//
-		// At N=1000/4 K bench this path fires for ~27 % of writes
-		// (skip-inline counter). The previous sync path
-		// (enqueueProtoAndWait) made the sender gopark on doneCh,
-		// writeLoop goready'd the sender, and the sender then
-		// immediately re-parked on gRPC's recvBuffer chan — a wasted
-		// extra park-wake cycle (~2-5 µs) costing 0.5-1 ms/op at high
-		// concurrency. Async eliminates it.
+		// so it ZC-marshals there (instead of the bail-to-codec.Marshal
+		// path which allocates 8 GB/5s through tightBufferPool under
+		// N=1000/4K bench, dominating GC time per cpu pprof 2026-05-28).
+		// Quota stays consumed; refund on error.
 		fh := FrameHeader{
 			Type:     FrameTypeMESSAGE,
 			StreamID: s.id,
 			Flags:    frameFlags,
 		}
-		// CAS stream state for opts.Last BEFORE enqueue, matching
-		// http2Client.write's ordering. On CAS-fail (stream concurrently
-		// closed), refund and bail without enqueue.
-		if opts != nil && opts.Last {
-			if !s.compareAndSwapState(streamActive, streamWriteDone) {
-				t.connSendQuota.Add(int64(quotaSize))
-				s.sendQuota.Add(int64(quotaSize))
-				select {
-				case t.frameWriter.wuRetryWake <- struct{}{}:
-				default:
-				}
-				t.sendQuotaMu.Lock()
-				t.notifyQuotaChangeLocked(0)
-				t.sendQuotaMu.Unlock()
-				return true, errStreamDone
-			}
-		}
-		err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize)
+		err := t.frameWriter.enqueueProtoAndWait(s.ctx, &s.Stream, fh, pm, pSize)
 		if err != nil {
-			// Queue full or writer closed BEFORE accepting the entry.
-			// Refund the pre-acquired quota; processProtoEntry never
-			// saw this entry, so it cannot refund.
 			t.connSendQuota.Add(int64(quotaSize))
 			s.sendQuota.Add(int64(quotaSize))
 			select {
@@ -2273,9 +2240,12 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 			t.sendQuotaMu.Unlock()
 			return true, err
 		}
-		// Async enqueue accepted; return optimistic success. Any
-		// post-accept failure (ring closed, ctx cancel) is reported
-		// asynchronously via processProtoEntry → onAsyncError.
+		// ZC succeeded via writeLoop — transition stream state if last.
+		if opts != nil && opts.Last {
+			if !s.compareAndSwapState(streamActive, streamWriteDone) {
+				return true, errStreamDone
+			}
+		}
 		return true, nil
 	}
 	ok2, err := writeProtoToRing(s.ctx, t.clientToServer, s.id, pm, pSize, frameFlags)
