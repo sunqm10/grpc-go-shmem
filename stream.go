@@ -931,7 +931,12 @@ func (cs *clientStream) bufferForRetryLocked(sz int, op func(a *csAttempt) error
 	cs.replayBufferSize += sz
 	if cs.replayBufferSize > cs.callInfo.maxRetryRPCBufferSize {
 		cs.commitAttemptLocked()
-		cleanup()
+		// cleanup may be nil for callers (e.g. the ZC fast path in
+		// SendMsg) that own buffer lifetime themselves and have
+		// nothing to free here.
+		if cleanup != nil {
+			cleanup()
+		}
 		return
 	}
 	cs.replayBuffer = append(cs.replayBuffer, replayOp{op: op, cleanup: cleanup})
