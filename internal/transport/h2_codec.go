@@ -1369,6 +1369,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 		// These bytes already lived in heap-allocated form (pendingFrame
 		// is a copy, not a ring slice), so ZC isn't applicable here.
 		if len(holder.pendingFrame) > 0 {
+			atomic.AddUint64(&shmZCFailPendingFrame, 1)
 			sid := holder.pendingStreamID
 			data := holder.pendingFrame
 			endStream := holder.pendingFrameEndStream
@@ -1569,12 +1570,16 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					}
 				}
 				if zcEligible {
-					// commitPayload.commitReadIdx is the ring offset
-					// of the body's first byte (post H2 header), captured
-					// by the earlier ReadSlices and fresh for this frame.
-					// Passing it as the anchor's start avoids the
-					// stale-ReadIdx race the previous D-lite attempt hit.
-					if anchor := rx.BeginMultiAnchor(commitPayload.commitReadIdx, payloadLen); anchor != nil {
+					// Body's actual ring offset is bodyEndIdx-payloadLen.
+					// We cannot use commitReadIdx (= shared header.ReadIdx
+					// captured by ReadSlices) — that value is FROZEN
+					// while zcActive=1, so consecutive anchors would
+					// claim overlapping ranges and drainPrefix would
+					// publish header.ReadIdx past header.WriteIndex
+					// (uint64 underflow in the writer's back-pressure
+					// calculation, observed as zc-elig-bp 99.9% reject).
+					bodyStartIdx := commitPayload.bodyEndIdx - uint64(payloadLen)
+					if anchor := rx.BeginMultiAnchor(bodyStartIdx, payloadLen); anchor != nil {
 						atomic.AddUint64(&shmZCReadFire, 1)
 
 						// Set MORE flag based on END_STREAM. MORE=0

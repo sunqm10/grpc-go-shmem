@@ -202,7 +202,19 @@ type ShmRing struct {
 type ReadCommit struct {
 	ring          *ShmRing
 	commitReadIdx uint64
-	maxBytes      int
+	// bodyEndIdx is the monotonic ring offset of the byte just past
+	// the last byte returned by the latest ReadSlices call (i.e.,
+	// pendingReadIdx after the call advanced it). Independent of
+	// sharedReadIdx, which the deferred-ZC path freezes.
+	//
+	// Multi-anchor ZC uses (bodyEndIdx - payloadLen, bodyEndIdx) as
+	// the held byte range for its anchor — sharedReadIdx-based
+	// commitReadIdx is STALE while zcActive=1 and would cause
+	// consecutive anchors to claim overlapping ranges, eventually
+	// driving header.ReadIdx past header.WriteIndex (uint64
+	// underflow in the writer's used-bytes calculation).
+	bodyEndIdx uint64
+	maxBytes   int
 }
 
 // Commit advances the shared read index to free space for the writer.
@@ -2042,10 +2054,12 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 
 			// Advance pendingReadIdx now - this allows us to read ahead
 			// while the application holds the buffer
-			atomic.StoreUint64(&r.pendingReadIdx, pendingIdx+uint64(n))
+			newPendingIdx := pendingIdx + uint64(n)
+			atomic.StoreUint64(&r.pendingReadIdx, newPendingIdx)
 
 			// Set up pre-allocated commit context (no closure allocation)
 			r.readCommit.commitReadIdx = sharedReadIdx
+			r.readCommit.bodyEndIdx = newPendingIdx
 			r.readCommit.maxBytes = n
 
 			return firstSlice, secondSlice, &r.readCommit, nil
