@@ -1234,6 +1234,32 @@ func (t *ShmClientTransport) Close(err error) {
 
 		t.readerWG.Wait()
 
+		// Drain any unconsumed inbound messages queued on the closed
+		// streams. The reader goroutine has now exited (readerWG.Wait
+		// above), so the per-stream recvBuffers no longer have
+		// producers; the app side may not have RecvMsg'd these yet,
+		// in which case the recvMsg.buffer slices may reference
+		// ring-mapped memory via the multi-anchor ZC path. Free them
+		// HERE — before t.segment.Close() unmaps the backing memory —
+		// to eliminate the use-after-free window where a late RecvMsg
+		// would deref dangling slices.
+		//
+		// drainAndFree preserves the recvBuffer's b.err set by
+		// closeStream's s.write(recvMsg{err: err}) above, so any
+		// subsequent RecvMsg still returns the close error correctly
+		// — only the queued data messages are released.
+		//
+		// Mirrors the server-side teardown loop in
+		// ShmServerTransport.Close which already does this for the
+		// same reason. Without this loop, a benchmark or test that
+		// finishes mid-RPC + immediately Close()s could panic with
+		// "fatal error: ..." pointing into unmapped memory.
+		for _, stream := range streams {
+			if stream != nil {
+				stream.drainRecvBuffer()
+			}
+		}
+
 		// Close the named events (Windows)
 		if t.readEvents != nil {
 			t.readEvents.Close()
