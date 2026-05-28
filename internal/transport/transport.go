@@ -352,24 +352,42 @@ type Stream struct {
 	// pending stream-WU state inside inFlow.pendingUpdate.
 	pendingWU atomic.Uint32
 
-	// connWaiterElem is the stream's entry in the SHM transport's
-	// connection-level quota waiter FIFO (transport.connWaiters), or
-	// nil if the stream is not currently parked waiting for conn
-	// send-quota. Protected by transport.sendQuotaMu — the same
-	// mutex that guards the connWaiters list itself.
-	//
-	// This enables the SC-Aware Quota Dispatch path: when an inbound
-	// connection-level WINDOW_UPDATE arrives, the (single) reader
-	// goroutine walks the waiter FIFO and signals only those streams
-	// whose `wanted` byte count can be satisfied by the just-credited
-	// conn quota — eliminating the thundering-herd wake of all
-	// parked stream goroutines that the previous broadcast-on-
-	// connQuotaSignal path caused. The doubly-linked container/list
-	// gives O(1) park/unlink without scanning the list per cycle.
-	//
-	// Unused (remains nil) on the TCP/UDS HTTP/2 transports, which
-	// use the controlBuf / loopyWriter scheduling model instead.
+	// connWaiterElem is retained for binary-compat with stream.go's
+	// general Stream layout (used by other transports if they ever
+	// add similar machinery). The SHM transport's legacy connWaiters
+	// FIFO + sendQuotaMu slow path has been removed in favour of the
+	// async-on-CAS-fail design where the writer goroutine owns FC
+	// reservation + defer + retry; nothing references this field on
+	// the SHM path now, but removing it would touch stream.go and
+	// risk merge churn for no benefit. Reserved for future use.
 	connWaiterElem *list.Element
+
+	// protoInFlight counts the number of ZC proto entries (writeProto's
+	// async fire-and-forget path) currently pending for this stream —
+	// either queued on the writer chan or sitting in
+	// shmFrameWriter.deferredProto. Incremented by the sender BEFORE
+	// enqueueProtoAsync; decremented by the writer goroutine after
+	// processProtoEntry / retryDeferredProto fully resolves an entry
+	// (successful write / refund / silent drop on close).
+	//
+	// Used by writeProto's inline TryLock path to enforce per-stream
+	// message order: if `protoInFlight.Load() > 0` while the sender
+	// holds inlineMu, an async entry for this stream is already in
+	// the pipeline AHEAD of the current write; the sender MUST also
+	// enqueue async (instead of doing an inline CAS + emit) so the
+	// new entry queues behind the existing one. Without this check
+	// the inline path could overtake a chan-pending or deferred
+	// entry on the same stream, violating gRPC's per-stream message
+	// order invariant.
+	//
+	// Reads outside inlineMu (the sender's pre-TryLock advisory
+	// check) are best-effort: a false negative just means we do one
+	// extra inline attempt that might race; a false positive
+	// triggers a redundant async hop. Both are correctness-neutral.
+	// The authoritative check happens under inlineMu after TryLock.
+	//
+	// Unused (remains 0) on the TCP/UDS HTTP/2 transports.
+	protoInFlight atomic.Int32
 
 	// sendQuota is the per-stream outbound flow-control window (in
 	// bytes) on the SHM transport, replacing the legacy

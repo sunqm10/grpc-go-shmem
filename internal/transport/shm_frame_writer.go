@@ -158,12 +158,26 @@ type shmFrameWriter struct {
 	// CAS fails; on incoming WU credit (signalled via wuRetryWake)
 	// WL walks the map and retries each deferred entry.
 	//
-	// Both fields are accessed only from the writer goroutine; no
-	// mutex is needed. setConnQuotaPtr publishes the connQuota
-	// pointer via happens-before-channel-send before any sender
-	// enqueueMessageAndWait can race here.
-	connQuota *atomic.Int64
-	deferred  map[uint32]*deferredMessage
+	// deferredProto maps streamID -> FIFO slice of ZC proto entries
+	// (writeProto's async fire-and-forget path) whose CAS attempt
+	// at processProtoEntry time failed for lack of outbound send
+	// quota. Each slice preserves the original chan-arrival order so
+	// retryDeferred drains in FIFO. The sender's inline TryLock path
+	// inspects `len(deferredProto[streamID]) > 0` under inlineMu and
+	// re-routes to async if non-empty, guaranteeing that no inline
+	// write for stream X overtakes an already-deferred async entry
+	// for stream X. Empty / absent slices have zero overhead in the
+	// map (a single hash lookup) — the common case under non-stalled
+	// FC.
+	//
+	// All three fields are accessed only from the writer goroutine
+	// (plus the sender under inlineMu for the deferredProto peek);
+	// no extra mutex is needed. setConnQuotaPtr publishes the
+	// connQuota pointer via happens-before-channel-send before any
+	// sender enqueueMessageAndWait can race here.
+	connQuota     *atomic.Int64
+	deferred      map[uint32]*deferredMessage
+	deferredProto map[uint32][]frameEntry
 }
 
 // deferredMessage holds the partial state of a whole-message entry
@@ -249,10 +263,11 @@ const (
 // newShmFrameWriter creates and starts a frame writer for the given ring.
 func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 	w := &shmFrameWriter{
-		tx:          tx,
-		ch:          make(chan frameEntry, frameWriterQueueSize),
-		wuRetryWake: make(chan struct{}, 1),
-		deferred:    make(map[uint32]*deferredMessage),
+		tx:            tx,
+		ch:            make(chan frameEntry, frameWriterQueueSize),
+		wuRetryWake:   make(chan struct{}, 1),
+		deferred:      make(map[uint32]*deferredMessage),
+		deferredProto: make(map[uint32][]frameEntry),
 	}
 	w.wg.Add(1)
 	go w.writeLoop()
@@ -613,103 +628,141 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 // processProtoEntry handles a ZC marshal request: the sender supplied
 // an unmarshalled proto.Message; we marshal it directly into a ring
 // reservation here under writeLoop's inlineMu. This is the queued
-// fallback for senders whose writeProto.TryLock failed — instead of
-// returning to the upper layer and triggering codec.Marshal +
-// tightBufferPool.Get (which is the dominant alloc source under
-// high-concurrency 4 KiB ping-pong per CPU profile 2026-05-28), the
-// sender enqueues the message and writeLoop ZC-marshals it from its
-// drain pass.
+// fallback for senders whose writeProto fast path could not commit
+// inline — either inlineMu.TryLock failed OR the inline lock-free
+// CAS for outbound send-quota failed (window depleted / lost a race
+// with a concurrent reservation). Instead of parking the sender on a
+// per-stream signal under sendQuotaMu (the legacy slow path) the
+// sender enqueues a fire-and-forget ZC entry and writeLoop owns FC
+// reservation + defer + retry symmetrically with the chunked whole-
+// message path.
 //
 // Caller MUST have:
 //   - Pre-validated single-frame size bounds (Capacity/3,
 //     h2MaxFramePayload, shmMaxFrameSize) — writeProto does this
 //     before TryLock, so by the time the bail enqueue happens, the
 //     entry is guaranteed to fit a single H2 DATA frame.
-//   - Acquired send quota for (5 + protoSize) bytes. writeLoop does
-//     NOT touch flow control here; the quota is consumed end-to-end
-//     by the sender's pre-acquisition. On error, caller is responsible
-//     for refunding the quota after observing the doneCh result.
 //
-// Liveness check: streamPtr is consulted for stream-level cancellation
-// only (streamDone signals the sender stopped caring). ctx error is
-// surfaced through ReserveWrite (which select's on ctx.Done()).
+// Flow control: the writer goroutine owns the CAS reservation. On
+// CAS failure the entry is appended to w.deferredProto[streamID]
+// (per-stream FIFO slice — see field comment for ordering rationale)
+// and retried on the next wuRetryWake via retryDeferred. On stream-
+// local close (closeStream flips state to streamDone and fires
+// wuRetryWake) the deferred entry is discarded silently — the upper
+// layer already observed write success at enqueue time, so there is
+// no caller to notify; downstream Send/Recv calls will observe
+// errStreamDone via the stream state machine.
+//
+// Fire-and-forget semantics: entries arrive with doneCh == nil. Ring
+// write errors surface through onAsyncError exactly as for other
+// fire-and-forget control frame paths (HEADERS / GOAWAY senders).
+// The transport tears down on a single failure; subsequent senders
+// observe ErrConnClosing via t.closed.Load().
 func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 	if w.closed.Load() {
-		entry.doneCh <- ErrConnClosing
+		// Drop silently; sender already returned success. The
+		// protoInFlight counter still needs to drain so future
+		// transport.Close-time test assertions hold; on close all
+		// streams go to streamDone anyway, so the counter value
+		// becomes irrelevant.
+		if entry.streamPtr != nil {
+			entry.streamPtr.protoInFlight.Add(-1)
+		}
 		return
 	}
-	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
-		entry.doneCh <- errStreamDone
+	s := entry.streamPtr
+	if s == nil || w.connQuota == nil {
+		// Misuse: ZC entry pushed without the required stream
+		// pointer or before setConnQuotaPtr was wired up. Surface
+		// via onAsyncError so the transport tears down.
+		if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+			w.onAsyncError(ErrConnClosing)
+		}
 		return
 	}
-	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, entry.fh.StreamID,
+	if s.getState() == streamDone {
+		s.protoInFlight.Add(-1)
+		return
+	}
+	sid := entry.fh.StreamID
+	// FIFO order preservation: if this stream already has deferred
+	// proto entries, append rather than attempt CAS. The sender's
+	// inline path also checks s.protoInFlight under inlineMu before
+	// doing its inline CAS — between the sender's check and now no
+	// new entry for this stream can have raced past us via the
+	// inline path (inlineMu serialises both). Within the writer
+	// goroutine the chan-arrival order is FIFO and matches the
+	// sender's call order; appending preserves the gRPC per-stream
+	// message order invariant.
+	if existing := w.deferredProto[sid]; len(existing) > 0 {
+		w.deferredProto[sid] = append(existing, entry)
+		// protoInFlight stays at its incremented value — entry
+		// remains in flight until retryDeferredProto drains it.
+		return
+	}
+	n := int64(5 + entry.protoSize)
+	if !tryReserveSendQuota(w.connQuota, &s.sendQuota, n) {
+		// Stalled on FC — defer for retry. Single-slot allocation
+		// optimised for the common case (only one pending per
+		// stream); slice growth covers back-to-back streaming sends.
+		w.deferredProto[sid] = []frameEntry{entry}
+		return
+	}
+	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
 		entry.protoMsg, entry.protoSize, entry.fh.Flags)
-	entry.doneCh <- err
+	if err != nil {
+		// Refund the quota we just reserved — these bytes did not
+		// land on the wire. ReserveWrite returns BEFORE Commit on
+		// error, so the receiver never sees / charges them.
+		w.connQuota.Add(n)
+		s.sendQuota.Add(n)
+		if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+			w.onAsyncError(err)
+		}
+	}
+	s.protoInFlight.Add(-1)
 }
 
-// enqueueProtoAndWait pushes a ZC marshal request onto the writer
-// channel and blocks until writeLoop processes it.
+// enqueueProtoAsync pushes a ZC marshal request onto the writer
+// channel fire-and-forget. The sender does NOT block on completion.
 //
 // Used by (*ShmClientTransport|ShmServerTransport).writeProto when
-// inlineMu.TryLock fails: instead of bailing back to the upper layer
-// (which would re-encode via codec.Marshal + tightBufferPool), we
-// push the unmarshalled proto.Message through to writeLoop so the
-// ZC-marshal-into-ring path runs there. This is the .NET-equivalent
-// of writer.WriteInlineDirect deferring to WriterLoop.
+// either the inline TryLock fails OR the inline lock-free CAS for
+// outbound send-quota fails. Replaces the legacy slow path
+// (acquireSendQuota park on per-stream signal under sendQuotaMu +
+// connWaiters FIFO + register/unregister/notifyQuotaChangeLocked
+// dispatch) with a single chan-hop: the writer goroutine owns FC
+// reservation + defer + retry symmetrically with the chunked whole-
+// message path, eliminating the parallel slow-path machinery that
+// previously parked ~10% of senders at fair-default 1000/4K.
 //
 // Pre-conditions (caller MUST satisfy):
 //   - Single-frame size bounds pre-validated.
-//   - Send quota for (5 + protoSize) bytes pre-acquired by the
-//     sender. On returned error the caller refunds it.
+//   - opts.Last → stream state already CAS'd to streamWriteDone
+//     (semantic transition happens-before the upper-layer return).
+//   - NO send-quota pre-reserved. The writer's processProtoEntry
+//     does the CAS reservation under its own context.
 //
-// Errors:
-//   - ErrConnClosing if the queue is full (frameWriterQueueSize=2048
-//     should make this rare; treat as transport overload).
-//   - The error from writeProtoToRingH2Blocking otherwise.
-// doneChPool reuses buffered-1 error channels across enqueueProtoAndWait
-// calls. The chan itself can't live on the caller's stack (Go channels
-// are heap), so pooling is the only no-alloc option. Steady-state under
-// the N=1000/4 K bench: 800 K make(chan error, 1) calls per 5 s
-// eliminated.
-//
-// Safety: after each sender's recv(<-doneCh), the chan is empty (it
-// was buffered=1 and contained exactly one value the writer sent).
-// We assert empty via a non-blocking recv before returning to the
-// pool to defend against future misuse (e.g., a writer sending twice).
-var doneChPool = sync.Pool{
-	New: func() any { return make(chan error, 1) },
-}
-
-func getDoneCh() chan error {
-	return doneChPool.Get().(chan error)
-}
-
-func putDoneCh(ch chan error) {
-	// Defensive drain — under correct use this is always empty already.
-	select {
-	case <-ch:
-	default:
-	}
-	doneChPool.Put(ch)
-}
-
-func (w *shmFrameWriter) enqueueProtoAndWait(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
-	doneCh := getDoneCh()
+// Errors: returns ErrConnClosing if the chan is full or the writer
+// is closed. The frameWriterQueueSize=2048 buffer makes "full"
+// extremely rare under realistic 1000-stream workloads; if it does
+// occur the transport is so backed up that returning an error to
+// the caller is the correct semantics. On success the entry is
+// guaranteed to be processed (or silently dropped on stream/
+// transport close, both of which the upper layer observes via the
+// stream state machine).
+func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
 	entry := frameEntry{
 		ctx:       ctx,
 		fh:        fh,
 		streamPtr: streamPtr,
 		protoMsg:  msg,
 		protoSize: pSize,
-		doneCh:    doneCh,
 	}
 	if !w.trySend(entry) {
-		putDoneCh(doneCh)
 		return ErrConnClosing
 	}
-	err := <-doneCh
-	putDoneCh(doneCh)
-	return err
+	return nil
 }
 
 // processWholeMessage handles a whole-message entry. The caller
@@ -905,23 +958,111 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 }
 
 // retryDeferred is called by the writeLoop on every wuRetryWake.
-// It walks the deferred map and attempts to make progress on each
-// stalled message. Runs under inlineMu.
+// It walks the deferred maps and attempts to make progress on each
+// stalled entry. Runs under inlineMu.
 //
-// Iteration order is map-random — for fairness under high
-// concurrency we don't try to preserve FIFO. A starving stream will
-// eventually be reached as WU credits accumulate; in practice the
-// receiver-side WU emitter drives wuRetryWake at sub-millisecond
-// cadence so the latency cost of map-random is negligible.
+// Two maps are walked:
+//
+//   - w.deferred (whole-message chunked path): iteration is map-
+//     random; advanceDeferred may delete sid during the loop, which
+//     Go's spec permits during range.
+//   - w.deferredProto (ZC proto fire-and-forget path): for each
+//     stream's FIFO slice, pop entries from the head as long as CAS
+//     succeeds. On first CAS failure for a stream, stop and leave
+//     the rest of the slice for the next wuRetryWake — preserving
+//     per-stream message order. If a stream's slice empties, delete
+//     the map entry.
+//
+// Iteration across streams is map-random for fairness under high
+// concurrency. A starving stream will eventually be reached as WU
+// credits accumulate; in practice the receiver-side WU emitter
+// drives wuRetryWake at sub-millisecond cadence so the latency
+// cost of map-random is negligible.
 func (w *shmFrameWriter) retryDeferred() {
-	if len(w.deferred) == 0 {
+	if len(w.deferred) > 0 {
+		for sid, d := range w.deferred {
+			// advanceDeferred may delete sid from the map; Go's
+			// spec guarantees this is safe during a range loop
+			// (the iterator observes the new state going forward).
+			w.advanceDeferred(sid, d)
+		}
+	}
+	if len(w.deferredProto) > 0 {
+		for sid, queue := range w.deferredProto {
+			w.retryDeferredProto(sid, queue)
+		}
+	}
+}
+
+// retryDeferredProto drains as many head entries of queue as the
+// current outbound FC window permits, preserving per-stream FIFO.
+// Stops at the first head whose CAS fails (insufficient credit) or
+// whose stream has closed in the interim. Updates / deletes the
+// map entry as needed. Runs under inlineMu (caller's invariant).
+//
+// Each "resolved" entry (written, errored, dropped on close, dropped
+// on ctx cancel) decrements its stream's protoInFlight counter so
+// that subsequent senders can resume the inline fast path once the
+// async pipeline drains.
+func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
+	emitted := 0
+	for emitted < len(queue) {
+		entry := queue[emitted]
+		s := entry.streamPtr
+		// Stream-local close → drop remaining entries silently;
+		// upper layer sees errStreamDone via stream state machine
+		// the next time it touches the stream.
+		if s == nil || s.getState() == streamDone {
+			// Decrement protoInFlight for every drained entry —
+			// the count must drain to zero so the stream's resource
+			// teardown can complete without a leaked debit.
+			for j := emitted; j < len(queue); j++ {
+				if queue[j].streamPtr != nil {
+					queue[j].streamPtr.protoInFlight.Add(-1)
+				}
+			}
+			emitted = len(queue)
+			break
+		}
+		if entry.ctx.Err() != nil {
+			// Context cancellation: same as stream close — drop and
+			// move to the next head. Upper layer's deadline already
+			// fired and surfaced via ctx.Err() on the recv side.
+			s.protoInFlight.Add(-1)
+			emitted++
+			continue
+		}
+		n := int64(5 + entry.protoSize)
+		if !tryReserveSendQuota(w.connQuota, &s.sendQuota, n) {
+			// Still stalled at this head; leave the queue alone and
+			// revisit on the next wuRetryWake.
+			break
+		}
+		err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		if err != nil {
+			// Refund and tear down; subsequent senders see
+			// ErrConnClosing via t.closed.Load().
+			w.connQuota.Add(n)
+			s.sendQuota.Add(n)
+			if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+				w.onAsyncError(err)
+			}
+		}
+		s.protoInFlight.Add(-1)
+		emitted++
+	}
+	if emitted >= len(queue) {
+		delete(w.deferredProto, sid)
 		return
 	}
-	for sid, d := range w.deferred {
-		// advanceDeferred may delete sid from the map; Go's spec
-		// guarantees this is safe during a range loop (the iterator
-		// observes the new state going forward).
-		w.advanceDeferred(sid, d)
+	if emitted > 0 {
+		// Compact: drop the drained prefix. Re-slice keeps the
+		// backing array; under steady-state the queue rarely grows
+		// beyond 1-2 entries so the wasted prefix capacity is
+		// negligible. A fresh allocation here would be measurable
+		// at high CAS-fail rates.
+		w.deferredProto[sid] = append(queue[:0], queue[emitted:]...)
 	}
 }
 
@@ -1400,6 +1541,23 @@ func (w *shmFrameWriter) close() {
 		delete(w.deferred, sid)
 		// Balance the Ref taken in enqueueMessageAndWait.
 		d.cur.data.Free()
+	}
+	// Drain any ZC proto entries still pending in the deferredProto
+	// map. Senders for these returned success at enqueue time (the
+	// fire-and-forget contract), so there is no doneCh to signal.
+	// The transport's close path (which called us) has already set
+	// t.closed.Load() == true, so any subsequent upper-layer Send /
+	// Recv on the affected streams will surface ErrConnClosing via
+	// the stream state machine. We still need to decrement each
+	// entry's protoInFlight counter so that test-side assertions on
+	// stream resource teardown (counter must reach zero) hold.
+	for sid, queue := range w.deferredProto {
+		for _, entry := range queue {
+			if entry.streamPtr != nil {
+				entry.streamPtr.protoInFlight.Add(-1)
+			}
+		}
+		delete(w.deferredProto, sid)
 	}
 }
 

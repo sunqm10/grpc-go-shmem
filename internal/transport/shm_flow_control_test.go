@@ -29,7 +29,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
@@ -88,12 +87,8 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	}
 
 	// Exhaust both connection and stream send windows to force a block.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(0)
 	cs.sendQuota.Store(0)
-	cliTransport.notifyQuotaChangeLocked(0)
-	cliTransport.sendQuotaMu.Unlock()
-
 	msg := mem.BufferSlice{mem.Copy([]byte("hello"), mem.DefaultBufferPool())}
 	writeErr := make(chan error, 1)
 	go func() {
@@ -293,11 +288,8 @@ func TestShmFlowControl_SlowConsumer_SenderBlocks(t *testing.T) {
 	// Force conn + stream quotas down to one window so the test does not
 	// inadvertently start with a 32 MiB SHM-tuned quota that would let
 	// the sender finish many messages before noticing the back-pressure.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(window)
 	cs.sendQuota.Store(window)
-	cliTransport.sendQuotaMu.Unlock()
-
 	// Wait for the server's handler to enter so the stream is fully set
 	// up on both sides before we begin observing back-pressure timing.
 	select {
@@ -408,12 +400,8 @@ func TestShmFlowControl_SlowConsumer_UnblocksOnAppRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(window)
 	cs.sendQuota.Store(window)
-	cliTransport.sendQuotaMu.Unlock()
-
 	bodyLen := window - 5
 	payload := make([]byte, bodyLen)
 	hdr := make([]byte, 5)
@@ -512,13 +500,10 @@ func TestShmFlowControl_MemoryBoundedByWindow(t *testing.T) {
 
 	// Clamp quotas to a single window each on the sender so each stream
 	// can push at most W bytes before back-pressure kicks in.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(numStreams * int64(window)) // ample conn budget
 	for _, cs := range clientStreams {
 		cs.sendQuota.Store(window)
 	}
-	cliTransport.sendQuotaMu.Unlock()
-
 	bodyLen := window - 5
 	payload := make([]byte, bodyLen)
 	hdr := make([]byte, 5)
@@ -661,10 +646,8 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	// Simulate the dialer applying grpc.WithInitialWindowSize(64 KiB).
 	// This is exactly what shm_dialer.go does at the
 	// `opts.InitialWindowSize > 0` branch.
-	cli.sendQuotaMu.Lock()
 	cli.initialStreamWindow = int64(userWindow)
 	cli.initialWindowSize = int32(userWindow)
-	cli.sendQuotaMu.Unlock()
 	cli.wuThreshold.Store(computeWUThreshold(int32(userWindow)))
 
 	gotThreshold := cli.wuThreshold.Load()
@@ -684,9 +667,7 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-	cli.sendQuotaMu.Lock()
 	gotQuota := cs.sendQuota.Load()
-	cli.sendQuotaMu.Unlock()
 	if gotQuota != int64(userWindow) {
 		t.Errorf("Bug 1 regression: NewStream stream send quota=%d, want %d (pre-fix would fall back to maxWindowSize=%d, silently violating HTTP/2 stream-window semantics)",
 			gotQuota, userWindow, maxWindowSize)
@@ -725,9 +706,7 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
-	cli2.sendQuotaMu.Lock()
 	gotFallback := cs2.sendQuota.Load()
-	cli2.sendQuotaMu.Unlock()
 	wantFallback := int64(cli2.initialWindowSize)
 	if gotFallback != wantFallback {
 		t.Errorf("Bug 1 fallback: NewStream stream send quota=%d, want %d (= t.initialWindowSize). maxWindowSize fallback regressed.",
@@ -772,9 +751,7 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 	defer srv.Close(nil)
 
 	// Capture pre-Apply state: defaults from shmInitialWindowSize.
-	srv.sendQuotaMu.Lock()
 	preWindow := srv.initialWindowSize
-	srv.sendQuotaMu.Unlock()
 	preThreshold := srv.wuThreshold.Load()
 	if preWindow != int32(shmInitialWindowSize) {
 		t.Fatalf("pre-Apply initialWindowSize=%d, want shm-tuned default %d", preWindow, shmInitialWindowSize)
@@ -790,11 +767,8 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 		MaxStreams:            userMaxStreams,
 	}
 	srv.ApplyServerConfig(cfg)
-
-	srv.sendQuotaMu.Lock()
 	postWindow := srv.initialWindowSize
 	postConnLimit := srv.connInFlow.limit
-	srv.sendQuotaMu.Unlock()
 	postThreshold := srv.wuThreshold.Load()
 	postMaxStreams := srv.maxStreams
 
@@ -823,9 +797,7 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 	srv2.ApplyServerConfig(&ServerConfig{
 		InitialWindowSize: defaultWindowSize - 1, // below gate
 	})
-	srv2.sendQuotaMu.Lock()
 	gateWindow := srv2.initialWindowSize
-	srv2.sendQuotaMu.Unlock()
 	if gateWindow != int32(shmInitialWindowSize) {
 		t.Errorf("sub-default InitialWindowSize=%d incorrectly applied (should be ignored, expected default %d)",
 			gateWindow, shmInitialWindowSize)
@@ -1435,122 +1407,4 @@ func TestTryReserveSendQuota_CASRollbackUnderContention(t *testing.T) {
 		delta, totalAttempt, totalSuccess)
 }
 
-// TestConnWaiterElem_CloseStreamUnblocksParkedAcquire is a regression
-// test for a deadlock in acquireSendQuota's slow path on the SHM
-// client transport. The scenario:
-//
-//  1. Goroutine G1 calls acquireSendQuota; both quotas insufficient,
-//     parks on stream-signal channel after registerConnWaiterLocked.
-//  2. closeStream runs (e.g., RST_STREAM from peer): unregisters G1
-//     from connWaiters FIFO, signals + DELETES the stream's entry
-//     from t.streamQuotaSignals.
-//  3. G1 wakes from <-streamCh, falls back to the for{} loop top.
-//  4. Quotas still insufficient. G1 takes sendQuotaMu and re-runs
-//     registerConnWaiterLocked. The new connWaiter captures
-//     t.streamQuotaSignals[streamID] which is now nil (map miss).
-//  5. G1 selects on a nil channel; only ctx.Done() or t.ctx.Done()
-//     can fire. If the caller's ctx is alive and the transport is
-//     still up, G1 deadlocks forever.
-//
-// The fix is to check s.getState() == streamDone at the top of the
-// for loop (after the wake) and return errStreamDone promptly.
-//
-// Without the fix this test hangs and is reaped by the test
-// timeout / -timeout flag. With the fix it returns within
-// milliseconds.
-func TestConnWaiterElem_CloseStreamUnblocksParkedAcquire(t *testing.T) {
-	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer testCancel()
-
-	segName := fmt.Sprintf("test-connwaiter-close-%d", time.Now().UnixNano())
-	defer RemoveSegment(segName)
-
-	serverSeg, _ := CreateSegment(segName, 65536, 65536)
-	serverSeg.H.SetServerReady(true)
-	defer serverSeg.Close()
-	clientSeg, _ := OpenSegment(segName)
-	clientSeg.H.SetClientReady(true)
-	defer clientSeg.Close()
-
-	srvTransport, _ := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
-	defer srvTransport.Close(nil)
-	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
-	defer cliTransport.Close(nil)
-
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
-		<-testCtx.Done()
-	})
-
-	// Caller ctx must stay alive — it's the only way the deadlock
-	// would manifest in production (caller hasn't cancelled).
-	callerCtx, callerCancel := context.WithCancel(context.Background())
-	defer callerCancel()
-
-	cs, err := cliTransport.NewStream(callerCtx, &CallHdr{Method: "/test/ConnWaiterClose"}, nil)
-	if err != nil {
-		t.Fatalf("NewStream: %v", err)
-	}
-
-	// Drive both quotas to zero so the next acquireSendQuota parks.
-	cliTransport.connSendQuota.Store(0)
-	cs.sendQuota.Store(0)
-
-	// Park a goroutine in acquireSendQuota. It will register on
-	// connWaiters and block on the stream's signal channel.
-	acquireErr := make(chan error, 1)
-	go func() {
-		acquireErr <- cliTransport.acquireSendQuota(cs.ctx, cs.id, 1024)
-	}()
-
-	// Wait until the goroutine is parked (visible via connWaiterElem).
-	parked := false
-	for i := 0; i < 100; i++ {
-		cliTransport.sendQuotaMu.Lock()
-		registered := cs.connWaiterElem != nil
-		cliTransport.sendQuotaMu.Unlock()
-		if registered {
-			parked = true
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !parked {
-		t.Fatal("goroutine did not register on connWaiters within 2s")
-	}
-
-	// Close the stream — this triggers the deadlock-prone path:
-	// closeStream signals + deletes streamQuotaSignals[id], unregister
-	// + nils connWaiterElem. The parked goroutine wakes, falls back
-	// to the for{} loop. Without the fix, it re-parks on a nil
-	// channel.
-	cliTransport.closeStream(cs, errStreamDone, false, http2.ErrCodeNo,
-		status.New(codes.Canceled, "test close"), nil, false)
-
-	// With the fix, the goroutine returns promptly (errStreamDone
-	// or ErrConnClosing). Without the fix, the goroutine deadlocks
-	// and this select times out.
-	select {
-	case err := <-acquireErr:
-		t.Logf("acquireSendQuota returned: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("acquireSendQuota deadlocked after closeStream — " +
-			"parked goroutine did not return within 2s. " +
-			"This indicates the connWaiterElem lifecycle hole: " +
-			"after wake, re-parking on nil signal channel.")
-	}
-
-	// Verify lifecycle invariant: connWaiterElem must be nil and
-	// connWaiters FIFO must not retain a stale entry for the
-	// closed stream.
-	cliTransport.sendQuotaMu.Lock()
-	leftover := cs.connWaiterElem
-	fifoLen := cliTransport.connWaiters.Len()
-	cliTransport.sendQuotaMu.Unlock()
-	if leftover != nil {
-		t.Errorf("cs.connWaiterElem should be nil after close + acquire return, got %v", leftover)
-	}
-	if fifoLen != 0 {
-		t.Errorf("connWaiters FIFO should be empty after close + acquire return, got len=%d", fifoLen)
-	}
-}
 
