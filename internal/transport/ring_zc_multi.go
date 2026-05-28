@@ -19,8 +19,6 @@
 package transport
 
 import (
-	"fmt"
-	"os"
 	"sync/atomic"
 )
 
@@ -147,14 +145,22 @@ var (
 )
 
 // Sub-counters for IsMultiAnchorZCEligible rejection. Sum across these
-// = shmZCFailIneligible. shmZCElig_BPLogged is a one-shot guard for
-// the stderr trace.
+// = shmZCFailIneligible. Reported via the zcprobe bench harness as
+// zc-elig-* metrics. Back-pressure rejection at high concurrency is
+// expected (ring fills past 75% used) — surfaces as a tunable, not a
+// bug.
 var (
 	shmZCElig_NotContig    uint64
 	shmZCElig_RingTooSmall uint64
 	shmZCElig_PayloadSmall uint64
 	shmZCElig_BackPressure uint64
-	shmZCElig_BPLogged     int64
+
+	// shmZCFailPendingFrame: readFrameViewH2 returned via the
+	// pendingFrame replay path at the TOP of its loop (frame's bytes
+	// were already heap-copied in a prior iteration). This bypasses
+	// the ZC fast path entirely. Population indicates a prior DATA
+	// frame produced leftover bytes (slow-path multi-LPM-in-frame).
+	shmZCFailPendingFrame uint64
 )
 
 // BeginMultiAnchor claims a single-frame ZC slot in the FIFO. Returns
@@ -410,13 +416,6 @@ func (r *ShmRing) IsMultiAnchorZCEligible(payloadLength int, contiguous bool) bo
 	used := hdr.WriteIndex() - hdr.ReadIndex()
 	if used*4 > r.capacity*3 {
 		atomic.AddUint64(&shmZCElig_BackPressure, 1)
-		// One-shot diag: print the first few rejections so we can
-		// see actual `used` / `capacity` values.
-		if n := atomic.AddInt64(&shmZCElig_BPLogged, 1); n <= 5 {
-			fmt.Fprintf(os.Stderr,
-				"[ZCDIAG] back-pressure reject: used=%d cap=%d ratio=%.2f%% threshold=75%% pl=%d\n",
-				used, r.capacity, float64(used)/float64(r.capacity)*100, payloadLength)
-		}
 		return false
 	}
 	return true
