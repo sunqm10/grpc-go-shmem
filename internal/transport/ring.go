@@ -1560,8 +1560,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			if bytesRead > 0 && hdr.SpaceWaiters() > 0 {
 				hdr.IncrementSpaceSequence()
 				newSeq := hdr.SpaceSequence()
-				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
-					bytesRead, newSeq)
+				if shmDebugEnabled {
+					shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
+						bytesRead, newSeq)
+				}
 				r.signalSpace(&hdr.spaceSeq)
 			}
 
@@ -1576,8 +1578,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Need to wait for data
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
-		shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
-			hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		if shmDebugEnabled {
+			shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
+				hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		}
 
 		// Re-check data availability before sleeping
 		writeIdx = hdr.WriteIndex()
@@ -1696,10 +1700,22 @@ func (wr *WriteReservation) Commit(written int) error {
 		hdr.IncrementDataSequence()
 		newSeq := hdr.DataSequence()
 		waiters := hdr.DataWaiters()
-		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		// Guard the vararg call site: Go evaluates the ...any slice
+		// at the caller BEFORE entering shmDebugf, boxing each
+		// int/uint into interface{} (one 16-byte heap alloc each).
+		// shmDebugf's own early-return only skips the log.Printf,
+		// not the per-call boxing. At N=1000/4 K bench Commit fires
+		// 3.6 M times in 5 s; without this guard the bench profile
+		// attributes 55 MB / 3.6 M obj to this site. Pattern repeated
+		// for every shmDebugf in a hot path below.
+		if shmDebugEnabled {
+			shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		}
 		// Only wake if there are waiters - avoids unnecessary syscalls
 		if waiters > 0 {
-			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			if shmDebugEnabled {
+				shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			}
 			wr.ring.signalData(&hdr.dataSeq)
 		}
 	}
@@ -1854,10 +1870,12 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		}
 		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReserveWrite: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
+			} else {
+				shmDebugf("ReserveWrite: waiting WITHOUT timeout")
+			}
 		}
 
 		// Spin failed - fall back to futex, choosing wait type based on fullness
@@ -1893,8 +1911,10 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
-			shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
-				hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			if shmDebugEnabled {
+				shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
+					hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			}
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1909,9 +1929,13 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 					hdr.DecSpaceWaiters()
 					return WriteReservation{}, context.DeadlineExceeded
 				}
-				shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				if shmDebugEnabled {
+					shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				}
 				err = r.waitForSpace(&hdr.spaceSeq, exp, rem)
-				shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				if shmDebugEnabled {
+					shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				}
 			} else {
 				err = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 			}
@@ -2118,10 +2142,12 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		default:
 		}
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReadSlices: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
+			} else {
+				shmDebugf("ReadSlices: waiting WITHOUT timeout")
+			}
 		}
 
 		// Check local closed flag before accessing header
@@ -2174,7 +2200,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			return nil, nil, nil, io.EOF
 		}
 
-		shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		}
 
 		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
 		var err error
@@ -2187,10 +2215,14 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 				}
 				return nil, nil, nil, context.DeadlineExceeded
 			}
-			shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, rem)
 		} else {
-			shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, 0)
 		}
 		// Check if ring is still valid before decrementing - the segment may have
@@ -2198,7 +2230,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		if atomic.LoadUint32(&r.closed) == 0 {
 			hdr.DecDataWaiters()
 		}
-		shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
+		}
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.
