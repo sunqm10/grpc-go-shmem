@@ -997,28 +997,22 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 			}
 			opts := &transport.WriteOptions{Last: !cs.desc.ClientStreams}
 
-			// Lazy-encode state. Populated only on WriteProto bail,
-			// retry-buffer capture, or binlog materialise.
-			var (
-				encHdr     []byte
-				encData    mem.BufferSlice
-				encPayload mem.BufferSlice
-				encPf      payloadFormat
-			)
-			ensureEncoded := func() error {
-				if encHdr != nil {
-					return nil
-				}
-				hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
-				if err != nil {
-					return err
-				}
-				encHdr = hdr
-				encData = data
-				encPayload = payload
-				encPf = pf
-				return nil
-			}
+			// Lazy-encode state. Populated only on WriteProto bail or
+			// binlog materialise. NOT populated for onSuccess: replay
+			// closures re-execute op on a new attempt which re-runs
+			// the WriteProto/encode decision. bufferForRetryLocked
+			// uses the upfront 5+pSize size hint for replay-budget
+			// tracking; no payload to capture and free.
+			//
+			// ensureEncoded is inlined at both call sites (op +
+			// binlog) to avoid a third closure escape — the closure
+			// alone added ~3 M small heap allocs/5s under
+			// N=1000/4 K pprof, which fully erased the marshal
+			// savings at high concurrency.
+			var encHdr []byte
+			var encData mem.BufferSlice
+			var encPayload mem.BufferSlice
+			var encPf payloadFormat
 
 			op := func(a *csAttempt) error {
 				if a.trInfo != nil {
@@ -1028,7 +1022,6 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 					}
 					a.mu.Unlock()
 				}
-				// Try ZC write.
 				if handled, err := a.transportStream.WriteProto(m, opts); handled {
 					if err != nil {
 						if !cs.desc.ClientStreams {
@@ -1041,41 +1034,57 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 					}
 					return nil
 				}
-				// ZC not handled (non-SHM transport on retry, or SHM
-				// declined). Encode now and use the standard path.
-				if err := ensureEncoded(); err != nil {
-					return err
+				// ZC bailed — encode now (inline; only happens for
+				// non-SHM transport or SHM-decline). Idempotent across
+				// replay attempts: each retry re-executes op and
+				// re-checks encHdr; if a prior attempt already
+				// encoded, we reuse.
+				if encHdr == nil {
+					hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
+					if err != nil {
+						return err
+					}
+					encHdr = hdr
+					encData = data
+					encPayload = payload
+					encPf = pf
 				}
 				return a.sendMsg(m, encHdr, encPayload, encData.Len(), encPayload.Len())
 			}
 
-			onSuccessCalled := false
 			err = cs.withRetry(op, func() {
-				// Retry buffer captures the encoded bytes for replay on
-				// a new attempt. Encode if not yet done; if encoding
-				// fails here we skip retry buffering — the next retry
-				// will re-attempt via op which will re-encode.
-				if err := ensureEncoded(); err != nil {
-					return
-				}
-				encPayload.Ref()
-				cs.bufferForRetryLocked(len(encHdr)+encPayload.Len(), op, encPayload.Free)
-				onSuccessCalled = true
+				// Replay is rebuilt by re-running op on each retry
+				// attempt; nothing to capture upfront. Size hint uses
+				// 5+pSize (LPM header + body) so replay-budget
+				// tracking is accurate.
+				cs.bufferForRetryLocked(5+pSize, op, nil)
 			})
 
-			// Cleanup. Mirrors the original prepareMsg cleanup, but
-			// only if encoding actually happened.
+			// Cleanup. encData/encPayload populated only when op took
+			// the bail path on some attempt.
 			if encData != nil {
 				encData.Free()
 			}
-			if encPf.isCompressed() && encPayload != nil && !onSuccessCalled {
+			if encPf.isCompressed() && encPayload != nil {
 				encPayload.Free()
 			}
 
 			if len(cs.binlogs) != 0 && err == nil {
-				// Binlogs need the materialised bytes; force encode if
-				// ZC took the success path and never materialised.
-				if encErr := ensureEncoded(); encErr == nil {
+				// Binlogs need the materialised proto bytes. If ZC
+				// took the success path encData is nil; encode now
+				// for the log only.
+				if encData == nil {
+					hdr, data, payload, pf, encErr := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
+					if encErr == nil {
+						_ = hdr
+						defer data.Free()
+						if pf.isCompressed() {
+							defer payload.Free()
+						}
+						encData = data
+					}
+				}
+				if encData != nil {
 					cm := &binarylog.ClientMessage{
 						OnClientSide: true,
 						Message:      encData.Materialize(),
