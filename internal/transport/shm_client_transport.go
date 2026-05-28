@@ -2184,6 +2184,13 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	t.frameWriter.closeMu.RLock()
 	if t.frameWriter.closed.Load() {
 		t.frameWriter.closeMu.RUnlock()
+		// Refund the quota reserved by acquireSendQuota above. Even
+		// though the transport is shutting down, the quota lifecycle
+		// invariant ("every successful acquireSendQuota is balanced
+		// by either an emit or a refund") must hold so the FC
+		// bookkeeping in shutdown-time tests stays clean.
+		t.connSendQuota.Add(int64(quotaSize))
+		s.sendQuota.Add(int64(quotaSize))
 		return true, ErrConnClosing
 	}
 	if !t.frameWriter.inlineMu.TryLock() {

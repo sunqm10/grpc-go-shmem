@@ -1737,6 +1737,12 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	t.frameWriter.closeMu.RLock()
 	if t.frameWriter.closed.Load() {
 		t.frameWriter.closeMu.RUnlock()
+		// Refund the quota reserved by acquireSendQuota above so
+		// the quota lifecycle invariant ("every successful
+		// acquireSendQuota is balanced by either an emit or a
+		// refund") holds even on the shutdown race path.
+		t.connSendQuota.Add(int64(quotaSize))
+		s.sendQuota.Add(int64(quotaSize))
 		return true, ErrConnClosing
 	}
 	if !t.frameWriter.inlineMu.TryLock() {

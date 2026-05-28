@@ -43,9 +43,10 @@ import (
 //
 // Shutdown safety:
 //   - close() marks the writer as closed and closes the channel.
-//   - Channel-send paths (trySend, enqueueOrInline, enqueueAndWait)
-//     hold closeMu.RLock around the closed check + chan send so the
-//     channel is never sent to after close.
+//   - Channel-send paths (trySend, enqueueOrInlineNonBlocking,
+//     enqueueAndWait, enqueueMessageAndWait) hold closeMu.RLock
+//     around the closed check + chan send so the channel is never
+//     sent to after close.
 //   - The inline-write path (tryInlineWrite) does NOT hold closeMu;
 //     it relies on inlineMu + the post-lock closed.Load() check.
 //     close() drains inlineMu (drainInline barrier) after wg.Wait,
@@ -806,45 +807,6 @@ func (w *shmFrameWriter) trySend(entry frameEntry) bool {
 	return true
 }
 
-// enqueueOrInline writes the frame inline if the writer goroutine is idle
-// (inlineMu available), otherwise enqueues to the channel for asynchronous
-// processing. The caller does not block waiting for completion either way.
-//
-// Used for fire-and-forget control frames (WINDOW_UPDATE in particular) that
-// callers do not need to acknowledge but where avoiding the writer-goroutine
-// wakeup matters for latency. Under fair-default flow control (65535 B
-// HTTP/2 window) the receiver emits a WINDOW_UPDATE roughly every DATA frame,
-// and the round-trip cost of "enqueue -> wake writer goroutine -> write
-// frame -> futexWake peer" is the dominant stall in the producer's send
-// loop. Writing the WU inline collapses that to "write frame -> futexWake".
-//
-// Returns nil on success (inline or queued); ErrConnClosing if closed.
-func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
-	w.closeMu.RLock()
-	if w.closed.Load() {
-		w.closeMu.RUnlock()
-		return ErrConnClosing
-	}
-	if w.inlineMu.TryLock() {
-		var err error
-		if entry.data != nil {
-			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
-		} else {
-			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
-		}
-		w.inlineMu.Unlock()
-		w.closeMu.RUnlock()
-		return err
-	}
-	w.closeMu.RUnlock()
-	// Writer goroutine is busy; fall back to async enqueue. The caller
-	// does not need synchronous completion, so doneCh stays nil.
-	if !w.trySend(entry) {
-		return ErrConnClosing
-	}
-	return nil
-}
-
 // errFrameWriterFull signals that an enqueue attempted via
 // enqueueOrInlineNonBlocking could not complete because the writer was
 // neither idle nor able to accept an entry on its async channel without
@@ -853,17 +815,17 @@ func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
 // catch up and a future enqueue attempt will succeed.
 var errFrameWriterFull = errors.New("shm frame writer: channel full, would block")
 
-// enqueueOrInlineNonBlocking is the strictly non-blocking variant of
-// enqueueOrInline. It is the ONLY safe enqueue path for callers that
-// MUST NOT block — most importantly the SHM reader goroutine, which
-// is responsible for committing inbound ring bytes and waking peers.
+// enqueueOrInlineNonBlocking is a strictly non-blocking inline-or-async
+// enqueue. It is the ONLY safe enqueue path for callers that MUST NOT
+// block — most importantly the SHM reader goroutine, which is
+// responsible for committing inbound ring bytes and waking peers.
 //
-// If the reader were to block on the outbound writer (which is what
-// the blocking trySend in enqueueOrInline can cause), it would create
-// a transport-level deadlock: the outbound ring fills because the
-// peer reader is blocked the same way; the writer can't drain its
-// channel because its ring writes block; the reader can't enqueue
-// the WINDOW_UPDATE that would unblock the peer.
+// If the reader were to block on the outbound writer (which is what a
+// blocking trySend can cause), it would create a transport-level
+// deadlock: the outbound ring fills because the peer reader is
+// blocked the same way; the writer can't drain its channel because
+// its ring writes block; the reader can't enqueue the WINDOW_UPDATE
+// that would unblock the peer.
 //
 // Behavior:
 //   - inlineMu available → write inline, return nil on success.
@@ -876,9 +838,8 @@ var errFrameWriterFull = errors.New("shm frame writer: channel full, would block
 //     writer loop drains the restored value on its next tick.
 //
 // Use this from sendWindowUpdate when called via reader callbacks
-// (onDataFrameReceived, onMessageStart). Use the blocking
-// enqueueOrInline only from app goroutines that can tolerate
-// blocking (e.g., sender Write paths).
+// (onDataFrameReceived, onMessageStart). App goroutines on the
+// sender Write path use trySend / enqueueMessageAndWait instead.
 func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 	w.closeMu.RLock()
 	if w.closed.Load() {
@@ -1031,18 +992,16 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 //     applied on conn quota); we bail rather than retry-spin
 //     because the channel path can pick up the larger window cleanly.
 //
-// Why this is NOT a D-lite-class concurrency bug. D-lite raced
-// across multiple concurrent ZC reader anchors, each computing its
-// publish offset from a STALE `commitReadIdx` because
-// header.ReadIdx was frozen during the ZC hold. Anchors got
-// overlapping ranges, the prefix-walk publish jammed, and the
-// ring permanently back-pressured. Here, inlineMu serialises EVERY
-// ring write — both this inline path and the writer goroutine —
-// so at most one goroutine touches the ring at a time. Publish
-// order equals lock acquisition order. There is no anchor list, no
-// CAS-reserve race, no commit-vs-publish split. Even when CAS on
-// connQuota loses to a reader's addSendQuota, our rollback +
-// fall-through preserves the lock-acquisition publish order.
+// Concurrency invariant. inlineMu serialises EVERY ring write —
+// both this inline path and the writer goroutine — so at most one
+// goroutine touches the ring at a time. Publish order equals lock
+// acquisition order. There is no reservation list, no CAS-reserve
+// race, no commit-vs-publish split (in contrast to any multi-anchor
+// ZC publish scheme, where concurrent reserve-but-not-yet-published
+// anchors can race the prefix-walk publisher into back-pressure
+// jams). Even when our CAS on connQuota loses to a reader's
+// addSendQuota, the explicit rollback + fall-through to the
+// channel path preserves the lock-acquisition publish order.
 func (w *shmFrameWriter) tryInlineWrite(
 	ctx context.Context,
 	streamPtr *Stream,

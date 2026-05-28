@@ -831,11 +831,11 @@ func encode(c baseCodec, msg any, pool mem.BufferPool) (mem.BufferSlice, error) 
 	return b, nil
 }
 
-// bufferPoolMarshaler is an optional extension implemented by codecs that
-// can marshal into a caller-supplied mem.BufferPool. The proto codec (and
-// any codec wrapped via newCodecV1Bridge) implements this. Encode
-// type-asserts to this interface and dispatches when the caller has
-// configured a channel-level pool.
+// bufferPoolMarshaler is an optional extension implemented by codecs
+// that can marshal into a caller-supplied mem.BufferPool. The built-in
+// proto codec (encoding/proto.codecV2) implements this; other codecs
+// (including the V1 bridge) fall back to plain c.Marshal() inside
+// encode(). The fallback is transparent to callers.
 type bufferPoolMarshaler interface {
 	MarshalWithPool(v any, pool mem.BufferPool) (mem.BufferSlice, error)
 }
