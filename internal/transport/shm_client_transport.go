@@ -1926,6 +1926,27 @@ func (t *ShmClientTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}
+	// Conn-level pre-credit. The drip-on-receive path in
+	// onDataFrameReceived emits conn WU at the wuThreshold AFTER
+	// bytes are received, which fails to admit an LPM that exceeds
+	// the current effective conn window: the sender stalls (no more
+	// conn quota to send the remainder) and the receiver cannot drip
+	// (no more bytes arriving). This is the 1 MiB-jumbo `Send: EOF`
+	// failure mode that arises whenever SHM_MAX_FRAME_SIZE >= LPM
+	// size (the writer would otherwise chunk the LPM into per-frame
+	// pieces that individually fit in the conn window).
+	//
+	// Emit a one-shot conn WU equal to the deficit between lpmSize
+	// and the current effective conn window. The peer's
+	// connSendQuota grows by that amount and admits this LPM to
+	// complete. Multiple concurrent streams firing this path can
+	// over-emit (we do not track promised conn-level pre-credit), but
+	// per-stream FC enforces the per-stream limit on receive so
+	// over-emission only loosens the conn cap — it does not produce
+	// wire-protocol errors.
+	if connEff := t.connInFlow.getSize(); lpmSize > connEff {
+		t.sendConnWindowUpdate(lpmSize-connEff, true)
+	}
 }
 
 // onDataFrameReceived runs at parse-time for each H2 DATA frame

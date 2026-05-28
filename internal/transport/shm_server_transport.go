@@ -1993,6 +1993,14 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}
+	// Conn-level pre-credit. See ShmClientTransport.onMessageStart
+	// for the full rationale; the symmetric fix is required on the
+	// server side because a CLIENT sending a 1 MiB+ request to the
+	// server under jumbo (SHM_MAX_FRAME_SIZE >= LPM) deadlocks on
+	// the server's conn window in exactly the same way.
+	if connEff := t.connInFlow.getSize(); lpmSize > connEff {
+		t.sendConnWindowUpdate(lpmSize-connEff, true)
+	}
 }
 
 // onDataFrameReceived runs at parse-time for each H2 DATA frame
