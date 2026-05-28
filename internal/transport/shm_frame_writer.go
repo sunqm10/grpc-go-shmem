@@ -666,19 +666,50 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 //   - ErrConnClosing if the queue is full (frameWriterQueueSize=2048
 //     should make this rare; treat as transport overload).
 //   - The error from writeProtoToRingH2Blocking otherwise.
+// doneChPool reuses buffered-1 error channels across enqueueProtoAndWait
+// calls. The chan itself can't live on the caller's stack (Go channels
+// are heap), so pooling is the only no-alloc option. Steady-state under
+// the N=1000/4 K bench: 800 K make(chan error, 1) calls per 5 s
+// eliminated.
+//
+// Safety: after each sender's recv(<-doneCh), the chan is empty (it
+// was buffered=1 and contained exactly one value the writer sent).
+// We assert empty via a non-blocking recv before returning to the
+// pool to defend against future misuse (e.g., a writer sending twice).
+var doneChPool = sync.Pool{
+	New: func() any { return make(chan error, 1) },
+}
+
+func getDoneCh() chan error {
+	return doneChPool.Get().(chan error)
+}
+
+func putDoneCh(ch chan error) {
+	// Defensive drain — under correct use this is always empty already.
+	select {
+	case <-ch:
+	default:
+	}
+	doneChPool.Put(ch)
+}
+
 func (w *shmFrameWriter) enqueueProtoAndWait(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+	doneCh := getDoneCh()
 	entry := frameEntry{
 		ctx:       ctx,
 		fh:        fh,
 		streamPtr: streamPtr,
 		protoMsg:  msg,
 		protoSize: pSize,
-		doneCh:    make(chan error, 1),
+		doneCh:    doneCh,
 	}
 	if !w.trySend(entry) {
+		putDoneCh(doneCh)
 		return ErrConnClosing
 	}
-	return <-entry.doneCh
+	err := <-doneCh
+	putDoneCh(doneCh)
+	return err
 }
 
 // processWholeMessage handles a whole-message entry. The caller

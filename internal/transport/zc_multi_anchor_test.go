@@ -119,25 +119,25 @@ func TestMultiAnchorZC_BudgetExceeded(t *testing.T) {
 	// Fill the FIFO by directly calling Begin (bypasses framing).
 	// Use bookkeeping-only ranges that won't interfere with real reads.
 	const payloadLen = 64 * 1024
-	anchors := make([]*MultiAnchor, 0, zcAnchorBudgetCount)
+	seqs := make([]uint64, 0, zcAnchorBudgetCount)
 	startBefore := atomic.LoadUint64(&shmZCAnchorBudgetExceeded)
 	for i := 0; i < zcAnchorBudgetCount; i++ {
-		a := rx.BeginMultiAnchor(uint64(i)*payloadLen, payloadLen)
-		if a == nil {
-			t.Fatalf("Begin %d returned nil (FIFO should not be full)", i)
+		seq, ok := rx.BeginMultiAnchor(uint64(i)*payloadLen, payloadLen)
+		if !ok {
+			t.Fatalf("Begin %d returned !ok (FIFO should not be full)", i)
 		}
-		anchors = append(anchors, a)
+		seqs = append(seqs, seq)
 	}
 	// One more must be rejected.
-	if a := rx.BeginMultiAnchor(uint64(zcAnchorBudgetCount)*payloadLen, payloadLen); a != nil {
-		t.Errorf("Begin %d: expected nil (budget exceeded), got %p", zcAnchorBudgetCount, a)
+	if _, ok := rx.BeginMultiAnchor(uint64(zcAnchorBudgetCount)*payloadLen, payloadLen); ok {
+		t.Errorf("Begin %d: expected !ok (budget exceeded), got ok", zcAnchorBudgetCount)
 	}
 	if got := atomic.LoadUint64(&shmZCAnchorBudgetExceeded) - startBefore; got != 1 {
 		t.Errorf("budget-exceeded counter delta: got %d want 1", got)
 	}
 	// Release all to leave the ring in a clean state.
-	for _, a := range anchors {
-		a.Release()
+	for _, s := range seqs {
+		rx.ReleaseMultiAnchor(s)
 	}
 }
 
@@ -157,13 +157,13 @@ func TestMultiAnchorZC_ConcurrentReleases(t *testing.T) {
 
 	const n = 64
 	const payloadLen = 8 * 1024
-	anchors := make([]*MultiAnchor, n)
+	seqs := make([]uint64, n)
 	for i := 0; i < n; i++ {
-		a := rx.BeginMultiAnchor(uint64(i)*payloadLen, payloadLen)
-		if a == nil {
-			t.Fatalf("Begin %d returned nil", i)
+		seq, ok := rx.BeginMultiAnchor(uint64(i)*payloadLen, payloadLen)
+		if !ok {
+			t.Fatalf("Begin %d returned !ok", i)
 		}
-		anchors[i] = a
+		seqs[i] = seq
 	}
 
 	// Release all anchors concurrently. The prefix walk must converge
@@ -173,7 +173,7 @@ func TestMultiAnchorZC_ConcurrentReleases(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			anchors[idx].Release()
+			rx.ReleaseMultiAnchor(seqs[idx])
 		}(i)
 	}
 	wg.Wait()

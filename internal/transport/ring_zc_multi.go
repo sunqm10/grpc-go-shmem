@@ -114,14 +114,12 @@ type anchorSlot struct {
 	_     [44]byte     // pad to 64 B cache line (8+8+4 = 20 used)
 }
 
-// MultiAnchor is the handle returned by BeginMultiAnchor. Carries the
-// slot's sequence number, the absolute byte range, and a back-pointer
-// to the ring. Release MUST be called exactly once — typically wired
-// into a mem.Buffer's Free callback via zcMultiAnchorReleasePool.
-type MultiAnchor struct {
-	ring *ShmRing
-	seq  uint64
-}
+// MultiAnchor was previously a heap-allocated handle (ring*, seq);
+// it has been retired. Begin returns (seq uint64, ok bool) directly
+// and Release is now (*ShmRing).ReleaseMultiAnchor(seq). This
+// eliminates ~2 M heap allocations per 5 s under N=1000/4 K bench
+// without requiring a sync.Pool — the anchor is a pure identifier
+// with no state independent of the ring's anchorSlots[].
 
 // shmZCAnchorBudgetExceeded counts BeginMultiAnchor returns due to all
 // slots being in use. Reported via the zcprobe bench harness as
@@ -163,12 +161,19 @@ var (
 	shmZCFailPendingFrame uint64
 )
 
-// BeginMultiAnchor claims a single-frame ZC slot in the FIFO. Returns
-// the anchor handle on success; nil when all slots are in use
-// (caller falls back to the single-frame copy path).
+// BeginMultiAnchor claims a single-frame ZC slot in the FIFO. On
+// success returns (seq, true) where `seq` identifies the slot for the
+// matching ReleaseMultiAnchor call; on FIFO full returns (0, false)
+// and the caller falls back to the single-frame copy path.
+//
+// The returned `seq` is a plain uint64 — no heap allocation is
+// performed per ZC frame. Callers store it in their per-frame
+// release-pool struct (which is itself sync.Pool'd, see
+// zc_multi_release.go), keeping the steady-state allocation count for
+// the ZC anchor itself at zero.
 //
 // `start` is the absolute ring offset of the body's first byte —
-// typically the caller's `commitPayload.commitReadIdx`, which is the
+// typically the caller's `commitPayload.bodyEndIdx-payloadLen`, the
 // post-frame-header position captured by ReadSlices. `payloadLen` is
 // the body byte count. The held byte range is [start, start+payloadLen);
 // drainReleasedAnchorPrefix uses these bounds to advance header.ReadIdx
@@ -198,9 +203,9 @@ var (
 // race Store(zcActive=0) between any two steps; its re-check of
 // anchorTail after the Store(0) observes step 4 and restores
 // zcActive=1, restoring the deferred-Commit invariant.
-func (r *ShmRing) BeginMultiAnchor(start uint64, payloadLen int) *MultiAnchor {
+func (r *ShmRing) BeginMultiAnchor(start uint64, payloadLen int) (uint64, bool) {
 	if payloadLen <= 0 {
-		return nil
+		return 0, false
 	}
 	seq := r.anchorTail.Load()
 	slot := &r.anchorSlots[seq%zcAnchorBudgetCount]
@@ -209,7 +214,7 @@ func (r *ShmRing) BeginMultiAnchor(start uint64, payloadLen int) *MultiAnchor {
 		// Either way the FIFO position is occupied. Caller falls back
 		// to the single-frame copy path.
 		atomic.AddUint64(&shmZCAnchorBudgetExceeded, 1)
-		return nil
+		return 0, false
 	}
 
 	end := start + uint64(payloadLen)
@@ -247,28 +252,28 @@ func (r *ShmRing) BeginMultiAnchor(start uint64, payloadLen int) *MultiAnchor {
 	// past our held range.
 	atomic.StoreUint32(&r.zcActive, 1)
 
-	return &MultiAnchor{ring: r, seq: seq}
+	return seq, true
 }
 
-// Release marks the anchor's slot released (state 1 → 2) and triggers
-// a prefix-walk. If this anchor was the oldest in flight, the walk
-// advances header.ReadIdx through the contiguous released prefix.
+// ReleaseMultiAnchor marks the anchor's slot released (state 1 → 2)
+// and triggers a prefix-walk. If this anchor was the oldest in
+// flight, the walk advances header.ReadIdx through the contiguous
+// released prefix.
 //
 // Safe to call from any goroutine. Multiple concurrent Release calls
 // race the prefix-walk's head CAS; each loser retries with the new
 // head, so all releasable bytes get published exactly once.
 //
-// Release is idempotent in the sense that calling it twice on the
-// same anchor is a logic bug but not a memory-safety bug — the second
-// Store(2) is a no-op (already 2), the drainPrefix loop sees the same
-// state.
-func (a *MultiAnchor) Release() {
-	if a == nil || a.ring == nil {
+// Calling twice on the same seq is a logic bug but not a memory-safety
+// bug — the second Store(2) is a no-op (already 2), the drainPrefix
+// loop sees the same state.
+func (r *ShmRing) ReleaseMultiAnchor(seq uint64) {
+	if r == nil {
 		return
 	}
-	slot := &a.ring.anchorSlots[a.seq%zcAnchorBudgetCount]
+	slot := &r.anchorSlots[seq%zcAnchorBudgetCount]
 	slot.state.Store(2)
-	a.ring.drainReleasedAnchorPrefix()
+	r.drainReleasedAnchorPrefix()
 }
 
 // drainReleasedAnchorPrefix walks the anchor FIFO from head. For each

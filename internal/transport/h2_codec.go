@@ -1578,7 +1578,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					// (uint64 underflow in the writer's back-pressure
 					// calculation, observed as zc-elig-bp 99.9% reject).
 					bodyStartIdx := commitPayload.bodyEndIdx - uint64(payloadLen)
-					if anchor := rx.BeginMultiAnchor(bodyStartIdx, payloadLen); anchor != nil {
+					if seq, ok := rx.BeginMultiAnchor(bodyStartIdx, payloadLen); ok {
 						atomic.AddUint64(&shmZCReadFire, 1)
 
 						// Set MORE flag based on END_STREAM. MORE=0
@@ -1594,9 +1594,13 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 							holder.removeLpmAccumulator(h2fh.StreamID)
 						}
 
-						ringSlice := pFirst[:payloadLen:payloadLen]
-						pool := newZcMultiAnchorReleasePool(rx, anchor)
-						buf := mem.NewBuffer(&ringSlice, pool)
+						// Inline ringSlice into the pool struct so
+						// mem.NewBuffer's &slice does not force a
+						// per-frame slice-header heap alloc (the
+						// pool is sync.Pool'd; the slice header
+						// lives inside the recycled struct).
+						pool := newZcMultiAnchorReleasePool(rx, seq, pFirst[:payloadLen:payloadLen])
+						buf := mem.NewBuffer(&pool.ringSlice, pool)
 						return FrameHeader{
 							Type:     FrameTypeMESSAGE,
 							StreamID: h2fh.StreamID,
