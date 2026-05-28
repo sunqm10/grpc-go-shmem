@@ -92,6 +92,11 @@ func startZCProbe(b *testing.B) func() {
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
 		report("zc-anchor-budget/op", delta.ZCAnchorBudgetExceeded)
+		report("zc-fail-wrap/op", delta.ZCFailPSecondNonzero)
+		report("zc-fail-shorthdr/op", delta.ZCFailPFirstShort)
+		report("zc-fail-accinprogress/op", delta.ZCFailAccInProgress)
+		report("zc-fail-lpmmismatch/op", delta.ZCFailLpmMismatch)
+		report("zc-fail-ineligible/op", delta.ZCFailIneligible)
 		// Inline-write fast-path counters: emit single-frame whole-
 		// message DATA directly from the sender goroutine, bypassing
 		// the channel + writer-goroutine handoff. Bails dominate at

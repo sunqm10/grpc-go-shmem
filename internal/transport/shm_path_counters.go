@@ -204,6 +204,11 @@ type ShmPathCounters struct {
 	CopyReadFire           uint64
 	AccReadFire            uint64
 	ZCAnchorBudgetExceeded uint64
+	ZCFailPSecondNonzero   uint64
+	ZCFailPFirstShort      uint64
+	ZCFailAccInProgress    uint64
+	ZCFailLpmMismatch      uint64
+	ZCFailIneligible       uint64
 
 	InlineWriteFire              uint64
 	InlineWriteBailLocked        uint64
@@ -233,6 +238,11 @@ func LoadShmPathCounters() ShmPathCounters {
 		CopyReadFire:           atomic.LoadUint64(&shmCopyReadFire),
 		AccReadFire:            atomic.LoadUint64(&shmAccReadFire),
 		ZCAnchorBudgetExceeded: atomic.LoadUint64(&shmZCAnchorBudgetExceeded),
+		ZCFailPSecondNonzero:   atomic.LoadUint64(&shmZCFailPSecondNonzero),
+		ZCFailPFirstShort:      atomic.LoadUint64(&shmZCFailPFirstShort),
+		ZCFailAccInProgress:    atomic.LoadUint64(&shmZCFailAccInProgress),
+		ZCFailLpmMismatch:      atomic.LoadUint64(&shmZCFailLpmMismatch),
+		ZCFailIneligible:       atomic.LoadUint64(&shmZCFailIneligible),
 
 		InlineWriteFire:              atomic.LoadUint64(&shmInlineWriteFire),
 		InlineWriteBailLocked:        atomic.LoadUint64(&shmInlineWriteBailLocked),
@@ -263,6 +273,11 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		CopyReadFire:           a.CopyReadFire - before.CopyReadFire,
 		AccReadFire:            a.AccReadFire - before.AccReadFire,
 		ZCAnchorBudgetExceeded: a.ZCAnchorBudgetExceeded - before.ZCAnchorBudgetExceeded,
+		ZCFailPSecondNonzero:   a.ZCFailPSecondNonzero - before.ZCFailPSecondNonzero,
+		ZCFailPFirstShort:      a.ZCFailPFirstShort - before.ZCFailPFirstShort,
+		ZCFailAccInProgress:    a.ZCFailAccInProgress - before.ZCFailAccInProgress,
+		ZCFailLpmMismatch:      a.ZCFailLpmMismatch - before.ZCFailLpmMismatch,
+		ZCFailIneligible:       a.ZCFailIneligible - before.ZCFailIneligible,
 
 		InlineWriteFire:              a.InlineWriteFire - before.InlineWriteFire,
 		InlineWriteBailLocked:        a.InlineWriteBailLocked - before.InlineWriteBailLocked,

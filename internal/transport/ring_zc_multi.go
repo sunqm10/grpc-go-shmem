@@ -129,6 +129,21 @@ type MultiAnchor struct {
 // budget needs tuning for the workload.
 var shmZCAnchorBudgetExceeded uint64
 
+// ===== Diagnostic counters for ZC fast-path rejection =====
+//
+// Temporary instrumentation to localize why zc-read/op is ≈ 0 on the
+// Linux concurrent bench despite zc-write/op > 50%. Each counter is
+// incremented at the exact rejection point in the H2 codec ZC fast
+// path. Sum of these (per op) + ZCReadFire (per op) should equal the
+// per-op DATA frame count for the workload. Remove after diagnosis.
+var (
+	shmZCFailPSecondNonzero  uint64 // body wrapped across ring boundary
+	shmZCFailPFirstShort     uint64 // first slice < 5 B (LPM header doesn't fit)
+	shmZCFailAccInProgress   uint64 // per-stream LPM accumulator non-empty
+	shmZCFailLpmMismatch     uint64 // 5+bodyLen != payloadLen (multi-LPM in one DATA)
+	shmZCFailIneligible      uint64 // IsMultiAnchorZCEligible returned false
+)
+
 // BeginMultiAnchor claims a single-frame ZC slot in the FIFO. Returns
 // the anchor handle on success; nil when all slots are in use
 // (caller falls back to the single-frame copy path).
