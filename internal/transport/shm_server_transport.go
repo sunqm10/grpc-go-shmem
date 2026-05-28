@@ -1708,6 +1708,17 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		return false, nil
 	}
 
+	// Skip ZC when the LPM body exceeds shmMaxFrameSize. See the
+	// matching client-side comment in shm_client_transport.go.writeProto:
+	// both ZC paths emit the LPM as a single H2 DATA frame regardless
+	// of the chunking knob, so a fair-mode 64 KiB response would emit
+	// a 65549 B frame that triggers the receiver's stream-level
+	// fc.onData violation before onMessageStart's pre-credit can fire.
+	if quotaSize > shmMaxFrameSize {
+		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
+		return false, nil
+	}
+
 	// Skip ZC when the message exceeds the current send window —
 	// acquireSendQuota is atomic on quotaSize and deadlocks when the
 	// stream window is smaller. The fallback write() path hands the

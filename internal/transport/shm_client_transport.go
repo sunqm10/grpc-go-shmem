@@ -2156,6 +2156,26 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, nil
 	}
 
+	// Skip ZC when the LPM body exceeds shmMaxFrameSize. Both ZC paths
+	// (inline writeProtoToRingH2 + queued writeProtoToRingH2Blocking)
+	// emit the entire LPM as a single H2 DATA frame regardless of
+	// the chunking knob; under a fair-comparison bench profile that
+	// constrains maxFrameSize to 16384, a 64 KiB LPM emits ~65549 B
+	// in one frame, which the receiver's stream-level fc.onData rejects
+	// with "received N-bytes data exceeding the limit M bytes" BEFORE
+	// onMessageStart's pre-credit fires (single-frame paths skip the
+	// codec lpmAccumulator feed hook that drives onMessageStart).
+	// The fallback write() path uses enqueueMessageAndWait →
+	// emitH2DataFromCursor which honours shmMaxFrameSize chunking;
+	// each emitted H2 DATA frame is < shmMaxFrameSize so the receiver's
+	// codec runs the accumulator path that fires onMessageStart on
+	// the first chunk and pre-credits the full LPM via
+	// sendWindowUpdateForce.
+	if quotaSize > shmMaxFrameSize {
+		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
+		return false, nil
+	}
+
 	// Skip ZC when the message wouldn't fit in the current per-stream
 	// send window. acquireSendQuota is atomic on `quotaSize` bytes —
 	// when quotaSize exceeds the stream window it would deadlock
