@@ -126,11 +126,6 @@ type ShmServerTransport struct {
 	// connWaiters; see that field's comment for the SC-Aware Quota
 	// Dispatch design. Protected by sendQuotaMu.
 	connWaiters *list.List
-	// connWaitersCount mirrors connWaiters.Len() as an atomic so
-	// addSendQuota's conn-WU drip path can short-circuit the
-	// sendQuotaMu Lock when the FIFO is empty. See the matching
-	// ShmClientTransport.connWaitersCount doc + lost-wake proof.
-	connWaitersCount atomic.Int64
 
 	connInFlow   trInFlow
 	streamInFlow map[uint32]*inFlow
@@ -290,7 +285,6 @@ func (t *ShmServerTransport) notifyQuotaChangeLocked(streamID uint32) {
 			if !sok {
 				next := e.Next()
 				t.connWaiters.Remove(e)
-				t.connWaitersCount.Add(-1)
 				e = next
 				continue
 			}
@@ -298,7 +292,6 @@ func (t *ShmServerTransport) notifyQuotaChangeLocked(streamID uint32) {
 			if connQ >= w.wanted && streamQ >= w.wanted {
 				next := e.Next()
 				t.connWaiters.Remove(e)
-				t.connWaitersCount.Add(-1)
 				if s.connWaiterElem == e {
 					s.connWaiterElem = nil
 				}
@@ -329,7 +322,6 @@ func (t *ShmServerTransport) unregisterConnWaiterLocked(s *ServerStream) {
 	}
 	t.connWaiters.Remove(s.connWaiterElem)
 	s.connWaiterElem = nil
-	t.connWaitersCount.Add(-1)
 }
 
 // registerConnWaiterLocked adds (or updates wanted on) the given
@@ -346,7 +338,6 @@ func (t *ShmServerTransport) registerConnWaiterLocked(s *ServerStream, wanted in
 		signal:   t.streamQuotaSignals[s.id],
 	}
 	s.connWaiterElem = t.connWaiters.PushBack(w)
-	t.connWaitersCount.Add(1)
 }
 
 // addSendQuota credits outbound send-quota and wakes parked senders.
@@ -379,14 +370,6 @@ func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 	// acquireSendQuota whose slow path parks on
 	// streamQuotaSignals, so this dispatch is required whenever a
 	// sender is parked there. Near-noop when the FIFO is empty.
-	//
-	// Empty-walk short-circuit — see ShmClientTransport.addSendQuota
-	// for the lost-wake proof. Cuts conn-WU per-call cost from ~50 ns
-	// to ~3 ns under fair-default 1000-stream bench where the FIFO is
-	// empty 99 % of the time.
-	if streamID == 0 && t.connWaitersCount.Load() == 0 {
-		return
-	}
 	t.sendQuotaMu.Lock()
 	t.notifyQuotaChangeLocked(streamID)
 	t.sendQuotaMu.Unlock()
@@ -1819,6 +1802,20 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		t.notifyQuotaChangeLocked(0)
 		t.sendQuotaMu.Unlock()
 		return false, err
+	}
+	if err != nil {
+		// ZC attempted (ok2==true) but failed AFTER reservation —
+		// see the matching client-side comment in writeProto.
+		// The ring write did not commit, so refund quota.
+		t.connSendQuota.Add(int64(quotaSize))
+		s.sendQuota.Add(int64(quotaSize))
+		select {
+		case t.frameWriter.wuRetryWake <- struct{}{}:
+		default:
+		}
+		t.sendQuotaMu.Lock()
+		t.notifyQuotaChangeLocked(0)
+		t.sendQuotaMu.Unlock()
 	}
 	return true, err
 }
