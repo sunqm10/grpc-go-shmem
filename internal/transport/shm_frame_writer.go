@@ -949,11 +949,21 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			fh.Flags = MessageFlagMORE
 		}
 		_, h2f := translateCustomToH2(fh)
-		if err := emitH2DataFromCursor(d.ctx, w.tx, streamID, d.cur, int(grant), h2f); err != nil {
-			// Refund the reserved quota — these bytes were not
-			// delivered and the stream is about to error out.
-			d.streamPtr.sendQuota.Add(grant)
-			w.connQuota.Add(grant)
+		committed, err := emitH2DataFromCursor(d.ctx, w.tx, streamID, d.cur, int(grant), h2f)
+		if err != nil {
+			// Partial-commit-aware refund. emitH2DataFromCursor may
+			// have committed `committed` bytes to the ring BEFORE
+			// failing (the peer has those bytes and will charge them
+			// against its inbound window). Refund only the uncommitted
+			// remainder; refunding the full grant would inflate the
+			// conn-level send quota by `committed` bytes and let a
+			// later send on a different stream overshoot the receiver's
+			// actual window. Track stream send quota the same way.
+			refund := grant - int64(committed)
+			if refund > 0 {
+				d.streamPtr.sendQuota.Add(refund)
+				w.connQuota.Add(refund)
+			}
 			d.doneCh <- err
 			delete(w.deferred, streamID)
 			// Balance the Ref taken in enqueueMessageAndWait.
@@ -1149,17 +1159,52 @@ func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 		return ErrConnClosing
 	}
 	if w.inlineMu.TryLock() {
-		var err error
+		// Available-precheck: ensure the ring has space for this
+		// frame BEFORE entering writeFrame (which would block in
+		// ReserveWrite). The current callers of this function are
+		// reader-side WU emitters (sendWindowUpdate from both client
+		// and server transports, fired by notifyDataFrameConsumed
+		// during the inbound DATA reservation window). If the outbound
+		// ring is full AND inline TryLock succeeds, writeFrame's
+		// ReserveWrite parks the reader goroutine WHILE the reader is
+		// still holding an uncommitted inbound DATA reservation —
+		// symmetrically the peer's reader can be in the same state
+		// and neither side frees ring space for the other. The
+		// Available-check breaks this deadlock window: when the
+		// outbound is full we bail to the (non-blocking) chan path,
+		// which lets the caller continue + restore credit via
+		// errFrameWriterFull and ping wuRetryWake; the reader then
+		// commits its inbound DATA, peer's writer unblocks, and the
+		// queued WU eventually drains via writeLoop.
+		//
+		// The Available() Load is racy vs concurrent producers, but
+		// (a) the per-WU frame size is small (~13 B) so a false
+		// positive is essentially impossible in practice, and (b) a
+		// false negative just means we take the chan path that one
+		// time — correctness-neutral.
+		var size int
 		if entry.data != nil {
-			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
+			size = h2FrameHeaderSize + len(entry.hdr) + entry.data.Len()
 		} else {
-			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+			size = h2FrameHeaderSize + len(entry.payload)
 		}
+		if w.tx.Available() >= uint64(size) {
+			var err error
+			if entry.data != nil {
+				err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
+			} else {
+				err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+			}
+			w.inlineMu.Unlock()
+			w.closeMu.RUnlock()
+			return err
+		}
+		// Ring lacks space — release inlineMu and fall through to
+		// the non-blocking chan send. Writer goroutine will pick up
+		// the entry when ring space frees.
 		w.inlineMu.Unlock()
-		w.closeMu.RUnlock()
-		return err
 	}
-	// inlineMu busy; try non-blocking channel send.
+	// inlineMu busy or ring full; try non-blocking channel send.
 	select {
 	case w.ch <- entry:
 		w.closeMu.RUnlock()
@@ -1321,15 +1366,13 @@ func (w *shmFrameWriter) tryInlineWrite(
 	// payloadLen path runs first, fully recovered by moving the
 	// channel-length gate to position zero.
 	//
-	// Also gate on the writer-owned deferredProto map (any stream).
-	// When a ZC proto entry sits deferred behind FC stall and a
-	// later whole-message arrives for ANY stream, emitting it inline
-	// before the chan and retryDeferred have drained the proto entry
-	// breaks per-stream FIFO if the deferred and the new entry share
-	// a stream. Conservatively bail whenever any stream has a deferred
-	// proto pending — the chan path's retryDeferred ordering will
-	// resolve them correctly in turn.
-	if len(w.ch) > 0 || len(w.deferredProto) > 0 {
+	// We deliberately do NOT include `len(w.deferredProto)` here:
+	// that map is mutated by the writer goroutine under inlineMu,
+	// and a `len(map)` read off-lock is a data race (go vet -race
+	// flags it; production can panic on concurrent map read/write).
+	// The post-lock check below covers the same ordering invariant
+	// safely. The pre-lock gate stays as a chan-only fast bail.
+	if len(w.ch) > 0 {
 		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
 		return false, nil
 	}
@@ -1421,10 +1464,19 @@ func (w *shmFrameWriter) tryInlineWrite(
 	}
 	_, h2f := translateCustomToH2(fh)
 	cur := &vecCursor{lpmHdr: hdr, data: data}
-	if emitErr := emitH2DataFromCursor(ctx, w.tx, streamPtr.id, cur, payloadLen, h2f); emitErr != nil {
-		// Refund quota — bytes did not reach the ring.
-		streamPtr.sendQuota.Add(int64(payloadLen))
-		w.connQuota.Add(int64(payloadLen))
+	if committed, emitErr := emitH2DataFromCursor(ctx, w.tx, streamPtr.id, cur, payloadLen, h2f); emitErr != nil {
+		// Partial-commit-aware refund. When shmMaxFrameSize exceeds
+		// h2MaxFramePayload (e.g. shm-tuned mode), emitH2DataFromCursor
+		// may chunk a single whole-message into several H2 DATA frames
+		// and may commit some prefix before failing on a later chunk.
+		// Refund only the uncommitted remainder; refunding the full
+		// payloadLen would inflate conn-level send quota by `committed`
+		// bytes the peer has already received and charged.
+		refund := int64(payloadLen - committed)
+		if refund > 0 {
+			streamPtr.sendQuota.Add(refund)
+			w.connQuota.Add(refund)
+		}
 		w.inlineMu.Unlock()
 		// Return handled=true so the caller does NOT fall back to
 		// the channel path (the message has terminally failed).

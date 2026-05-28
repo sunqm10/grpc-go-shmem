@@ -2225,7 +2225,8 @@ func writeFrameH2DataChunkedVec(
 	// chunk consumes from the current segment, advancing across
 	// segment boundaries automatically.
 	cur := vecCursor{lpmHdr: lpmHdr, data: data}
-	return emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+	_, err := emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+	return err
 }
 
 // emitH2DataFromCursor emits `length` bytes from cur into the ring as
@@ -2261,6 +2262,30 @@ func writeFrameH2DataChunkedVec(
 // BenchmarkGRPCShmLargeUnary/size=64MB on a 64-MiB ring went from
 // ~650 MB/s (16 MB message, fits in ring) to ~270 MB/s (64 MB message,
 // exactly fills ring) under that regime.
+// emitH2DataFromCursor emits `length` bytes from cur into the ring as
+// one or more H2 DATA frames (chunked per shmMaxFrameSize / ring
+// capacity). baseFlags is applied to the FINAL emitted DATA frame only
+// (typically used to carry END_STREAM on the last chunk of a logical
+// MESSAGE). The cursor is advanced by exactly `length` bytes on
+// success.
+//
+// Returns (committedBytes, err). On success committedBytes == length.
+// On error, committedBytes is the prefix that was successfully
+// committed to the ring (the peer has received those bytes and will
+// charge them against its inbound window); the caller MUST refund
+// only `length - committedBytes` worth of outbound send quota. Earlier
+// versions returned only `error` and the sole multi-chunk caller
+// (advanceDeferred) refunded the FULL `length` on any failure, which
+// over-credited stream / conn send quota by the prefix the peer had
+// already received. That manifests as receiver-side onData rejection
+// on a subsequent send from a different stream over the same conn
+// (the inflated conn quota lets the sender overshoot the receiver's
+// actual window), surfacing as an H2-protocol "received N-bytes data
+// exceeding the limit M bytes" error — flaky and load-dependent.
+//
+// All-or-nothing single-chunk callers (writeFrameH2DataChunkedVec,
+// tryInlineWrite) ignore committedBytes and just propagate err; the
+// committedBytes return is only consulted by advanceDeferred.
 func emitH2DataFromCursor(
 	ctx context.Context,
 	tx *ShmRing,
@@ -2268,7 +2293,7 @@ func emitH2DataFromCursor(
 	cur *vecCursor,
 	length int,
 	baseFlags byte,
-) error {
+) (int, error) {
 	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
 
 	maxChunk := shmMaxFrameSize
@@ -2279,7 +2304,7 @@ func emitH2DataFromCursor(
 		maxChunk = int(tx.Capacity() / 4)
 	}
 	if maxChunk == 0 {
-		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
+		return 0, fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
 
 	// Signal-batch threshold: how many bytes we let accumulate before
@@ -2305,7 +2330,8 @@ func emitH2DataFromCursor(
 		}
 	}
 
-	for written := 0; written < length; {
+	written := 0
+	for written < length {
 		chunk := length - written
 		if chunk > maxChunk {
 			chunk = maxChunk
@@ -2328,7 +2354,12 @@ func emitH2DataFromCursor(
 		}
 		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, cur); err != nil {
 			closeBatch()
-			return err
+			// `written` here is the prefix successfully committed
+			// BEFORE this chunk. writeH2DataFromCursor either fully
+			// commits its `chunk` bytes or fails before any Commit
+			// (ReserveWrite returns err before producing a slice),
+			// so partial-chunk commits are impossible.
+			return written, err
 		}
 		written += chunk
 		batchBytes += chunk
@@ -2341,7 +2372,7 @@ func emitH2DataFromCursor(
 			closeBatch()
 		}
 	}
-	return nil
+	return written, nil
 }
 
 // writeH2DataFromCursor reserves one H2 DATA frame's worth of ring
