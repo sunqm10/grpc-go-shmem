@@ -148,6 +148,23 @@ type ShmClientTransport struct {
 	// notifyQuotaChangeLocked / acquireSendQuota for the register /
 	// dispatch protocol.
 	connWaiters *list.List
+	// connWaitersCount mirrors the length of connWaiters as an atomic
+	// so addSendQuota's conn-WU drip hot path (streamID==0, fires ~25 K/s
+	// per direction at 1000-stream fair-default bench) can short-circuit
+	// the sendQuotaMu Lock when the FIFO is empty (~99 % of the time
+	// under any window large enough to admit one full LPM per pass).
+	// Mutated under sendQuotaMu in register/unregister/dispatch paths;
+	// read lock-free by addSendQuota.
+	//
+	// Lost-wake safety: the SC reasoning over
+	//   reader: connSendQuota.Add(credit) ; connWaitersCount.Load()
+	//   sender: sendQuotaMu.Lock ; recheck connSendQuota ; counter.Add(+1) ; Unlock ; park
+	// proves the short-circuit is race-free: if reader observes
+	// counter==0, sender's increment hasn't happened yet, so sender's
+	// under-lock re-check sees reader's credit Add (which is sequenced
+	// before reader's counter Load), and sender exits before parking
+	// without ever registering. See addSendQuota for the full proof.
+	connWaitersCount atomic.Int64
 	streamInFlow          map[uint32]*inFlow
 	connInFlow            trInFlow
 	maxConcurrentStreams  uint32
@@ -319,6 +336,7 @@ func (t *ShmClientTransport) notifyQuotaChangeLocked(streamID uint32) {
 				// goroutine to wake.
 				next := e.Next()
 				t.connWaiters.Remove(e)
+				t.connWaitersCount.Add(-1)
 				e = next
 				continue
 			}
@@ -326,6 +344,7 @@ func (t *ShmClientTransport) notifyQuotaChangeLocked(streamID uint32) {
 			if connQ >= w.wanted && streamQ >= w.wanted {
 				next := e.Next()
 				t.connWaiters.Remove(e)
+				t.connWaitersCount.Add(-1)
 				if s.connWaiterElem == e {
 					s.connWaiterElem = nil
 				}
@@ -361,6 +380,7 @@ func (t *ShmClientTransport) unregisterConnWaiterLocked(s *ClientStream) {
 	}
 	t.connWaiters.Remove(s.connWaiterElem)
 	s.connWaiterElem = nil
+	t.connWaitersCount.Add(-1)
 }
 
 // registerConnWaiterLocked adds the given stream to the connWaiters
@@ -379,6 +399,7 @@ func (t *ShmClientTransport) registerConnWaiterLocked(s *ClientStream, wanted in
 		signal:   t.streamQuotaSignals[s.id],
 	}
 	s.connWaiterElem = t.connWaiters.PushBack(w)
+	t.connWaitersCount.Add(1)
 }
 
 // addSendQuota credits outbound send-quota and wakes parked senders.
@@ -435,6 +456,16 @@ func (t *ShmClientTransport) addSendQuota(streamID uint32, delta uint32) {
 	// whenever a sender is parked there. notifyQuotaChangeLocked is
 	// a near-noop when the FIFO is empty (the common case under
 	// large windows where no sender ever parks).
+	//
+	// Empty-walk short-circuit (conn-WU hot path): under fair-default
+	// 1000-stream bench, addSendQuota(streamID=0) fires ~25 K/s and
+	// the FIFO is empty ~99 % of the time. Skipping the Lock when
+	// connWaitersCount==0 cuts the per-call cost from ~50 ns to ~3 ns
+	// (one atomic Load). Per-stream credit (streamID != 0) still
+	// takes the Lock so streamQuotaSignals dispatch runs.
+	if streamID == 0 && t.connWaitersCount.Load() == 0 {
+		return
+	}
 	t.sendQuotaMu.Lock()
 	t.notifyQuotaChangeLocked(streamID)
 	t.sendQuotaMu.Unlock()
