@@ -43,8 +43,15 @@ import (
 //
 // Shutdown safety:
 //   - close() marks the writer as closed and closes the channel.
-//   - enqueue/enqueueAndWait use closeMu.RLock to coordinate with close(),
-//     ensuring the channel is never sent to after being closed.
+//   - Channel-send paths (trySend, enqueueOrInline, enqueueAndWait)
+//     hold closeMu.RLock around the closed check + chan send so the
+//     channel is never sent to after close.
+//   - The inline-write path (tryInlineWrite) does NOT hold closeMu;
+//     it relies on inlineMu + the post-lock closed.Load() check.
+//     close() drains inlineMu (drainInline barrier) after wg.Wait,
+//     so any inline writer that already TryLocked inlineMu before
+//     close set the closed flag runs to completion against a still-
+//     mapped ring before close proceeds to teardown.
 type shmFrameWriter struct {
 	tx     *ShmRing
 	ch     chan frameEntry // data + control frames from app goroutines
@@ -1074,17 +1081,17 @@ func (w *shmFrameWriter) tryInlineWrite(
 
 	if w.closed.Load() {
 		w.inlineMu.Unlock()
-		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		atomic.AddUint64(&shmInlineWriteBailClosed, 1)
 		return false, nil
 	}
 	if streamPtr.getState() == streamDone {
 		w.inlineMu.Unlock()
-		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		atomic.AddUint64(&shmInlineWriteBailStreamDone, 1)
 		return false, nil
 	}
 	if ctx.Err() != nil {
 		w.inlineMu.Unlock()
-		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		atomic.AddUint64(&shmInlineWriteBailCtxDone, 1)
 		return false, nil
 	}
 	// Re-check len(w.ch) under the lock — between the pre-lock check

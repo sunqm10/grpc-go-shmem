@@ -99,6 +99,9 @@ func startZCProbe(b *testing.B) func() {
 		// latency gap to UDS).
 		report("inline-write-fire/op", delta.InlineWriteFire)
 		report("inline-write-bail-locked/op", delta.InlineWriteBailLocked)
+		report("inline-write-bail-closed/op", delta.InlineWriteBailClosed)
+		report("inline-write-bail-streamdone/op", delta.InlineWriteBailStreamDone)
+		report("inline-write-bail-ctxdone/op", delta.InlineWriteBailCtxDone)
 		report("inline-write-bail-queued/op", delta.InlineWriteBailQueued)
 		report("inline-write-bail-quota/op", delta.InlineWriteBailQuota)
 		report("inline-write-bail-frame/op", delta.InlineWriteBailFrameSize)

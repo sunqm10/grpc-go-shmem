@@ -128,7 +128,32 @@ var (
 
 	// shmInlineWriteBailLocked: TryLock(inlineMu) failed — the writer
 	// goroutine is currently draining a batch. Forces channel path.
+	// This is the only "Bail*" bucket that reflects real lock
+	// contention; the other post-lock bails (Closed / StreamDone /
+	// CtxDone) are bucketed separately so a dirty Locked count
+	// doesn't shadow contention diagnosis.
 	shmInlineWriteBailLocked uint64
+
+	// shmInlineWriteBailClosed: TryLock succeeded but w.closed was
+	// already set by close(). The inline path observes the closed
+	// flag after the lock and bails to the channel path which
+	// returns ErrConnClosing via trySend. Should be near-zero
+	// outside shutdown windows.
+	shmInlineWriteBailClosed uint64
+
+	// shmInlineWriteBailStreamDone: TryLock succeeded but
+	// streamPtr.getState() == streamDone — the stream was cancelled
+	// or completed (e.g. server-side WriteStatus already ran)
+	// between the caller's pre-checks and this point. Forces
+	// channel path so processWholeMessage produces the canonical
+	// errStreamDone result.
+	shmInlineWriteBailStreamDone uint64
+
+	// shmInlineWriteBailCtxDone: TryLock succeeded but ctx.Err()
+	// became non-nil after the lock. The channel path also returns
+	// ctx.Err() in this case; bucketing it separately keeps the
+	// Locked counter pure.
+	shmInlineWriteBailCtxDone uint64
 
 	// shmInlineWriteBailQueued: w.ch had pending entries OR
 	// w.deferred had blocked messages. Forces channel path so the
@@ -171,12 +196,15 @@ type ShmPathCounters struct {
 	CopyReadFire          uint64
 	AccReadFire           uint64
 
-	InlineWriteFire          uint64
-	InlineWriteBailLocked    uint64
-	InlineWriteBailQueued    uint64
-	InlineWriteBailQuota     uint64
-	InlineWriteBailFrameSize uint64
-	InlineWriteBailZeroLen   uint64
+	InlineWriteFire              uint64
+	InlineWriteBailLocked        uint64
+	InlineWriteBailClosed        uint64
+	InlineWriteBailStreamDone    uint64
+	InlineWriteBailCtxDone       uint64
+	InlineWriteBailQueued        uint64
+	InlineWriteBailQuota         uint64
+	InlineWriteBailFrameSize     uint64
+	InlineWriteBailZeroLen       uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -196,12 +224,15 @@ func LoadShmPathCounters() ShmPathCounters {
 		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
 		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
 
-		InlineWriteFire:          atomic.LoadUint64(&shmInlineWriteFire),
-		InlineWriteBailLocked:    atomic.LoadUint64(&shmInlineWriteBailLocked),
-		InlineWriteBailQueued:    atomic.LoadUint64(&shmInlineWriteBailQueued),
-		InlineWriteBailQuota:     atomic.LoadUint64(&shmInlineWriteBailQuota),
-		InlineWriteBailFrameSize: atomic.LoadUint64(&shmInlineWriteBailFrameSize),
-		InlineWriteBailZeroLen:   atomic.LoadUint64(&shmInlineWriteBailZeroLen),
+		InlineWriteFire:              atomic.LoadUint64(&shmInlineWriteFire),
+		InlineWriteBailLocked:        atomic.LoadUint64(&shmInlineWriteBailLocked),
+		InlineWriteBailClosed:        atomic.LoadUint64(&shmInlineWriteBailClosed),
+		InlineWriteBailStreamDone:    atomic.LoadUint64(&shmInlineWriteBailStreamDone),
+		InlineWriteBailCtxDone:       atomic.LoadUint64(&shmInlineWriteBailCtxDone),
+		InlineWriteBailQueued:        atomic.LoadUint64(&shmInlineWriteBailQueued),
+		InlineWriteBailQuota:         atomic.LoadUint64(&shmInlineWriteBailQuota),
+		InlineWriteBailFrameSize:     atomic.LoadUint64(&shmInlineWriteBailFrameSize),
+		InlineWriteBailZeroLen:       atomic.LoadUint64(&shmInlineWriteBailZeroLen),
 	}
 }
 
@@ -222,11 +253,14 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
 		AccReadFire:           a.AccReadFire - before.AccReadFire,
 
-		InlineWriteFire:          a.InlineWriteFire - before.InlineWriteFire,
-		InlineWriteBailLocked:    a.InlineWriteBailLocked - before.InlineWriteBailLocked,
-		InlineWriteBailQueued:    a.InlineWriteBailQueued - before.InlineWriteBailQueued,
-		InlineWriteBailQuota:     a.InlineWriteBailQuota - before.InlineWriteBailQuota,
-		InlineWriteBailFrameSize: a.InlineWriteBailFrameSize - before.InlineWriteBailFrameSize,
-		InlineWriteBailZeroLen:   a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
+		InlineWriteFire:              a.InlineWriteFire - before.InlineWriteFire,
+		InlineWriteBailLocked:        a.InlineWriteBailLocked - before.InlineWriteBailLocked,
+		InlineWriteBailClosed:        a.InlineWriteBailClosed - before.InlineWriteBailClosed,
+		InlineWriteBailStreamDone:    a.InlineWriteBailStreamDone - before.InlineWriteBailStreamDone,
+		InlineWriteBailCtxDone:       a.InlineWriteBailCtxDone - before.InlineWriteBailCtxDone,
+		InlineWriteBailQueued:        a.InlineWriteBailQueued - before.InlineWriteBailQueued,
+		InlineWriteBailQuota:         a.InlineWriteBailQuota - before.InlineWriteBailQuota,
+		InlineWriteBailFrameSize:     a.InlineWriteBailFrameSize - before.InlineWriteBailFrameSize,
+		InlineWriteBailZeroLen:       a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
 	}
 }
