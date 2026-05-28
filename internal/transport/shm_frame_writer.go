@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 
 	"google.golang.org/grpc/mem"
+	"google.golang.org/protobuf/proto"
 )
 
 // shmFrameWriter provides a dedicated writer goroutine with an MPSC queue for
@@ -216,6 +217,24 @@ type frameEntry struct {
 	wholeMsg  bool
 	streamPtr *Stream
 	isLast    bool
+
+	// ZC marshal in writeLoop.
+	//
+	// When `protoMsg != nil`, this entry carries an UNMARSHALLED
+	// proto.Message that writeLoop should marshal DIRECTLY into a
+	// ring reservation (via writeProtoToRingH2Blocking), bypassing
+	// the upper-layer codec.Marshal allocation. Used as the queued
+	// fallback when (*ShmClientTransport|ShmServerTransport).writeProto's
+	// inlineMu.TryLock fails — even bailed senders still get ZC
+	// marshal via the writer goroutine instead of the
+	// tightBufferPool + chunked-write-vec copy path.
+	//
+	// Caller MUST pre-validate single-frame size bounds AND must
+	// have already acquired send quota for (5 + protoSize) bytes
+	// before pushing — writeLoop cannot soft-reject these from its
+	// drain context. fh.Flags carries MessageFlagEndStream / MORE.
+	protoMsg  proto.Message
+	protoSize int
 }
 
 const (
@@ -566,6 +585,15 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 		w.processWholeMessage(entry)
 		return
 	}
+	// ZC marshal entries: marshal the proto.Message DIRECTLY into a
+	// ring reservation here (under inlineMu), bypassing the upper-
+	// layer codec.Marshal + tightBufferPool allocation that the
+	// sender would otherwise pay. See enqueueProtoAndWait for the
+	// caller-side contract.
+	if entry.protoMsg != nil {
+		w.processProtoEntry(entry)
+		return
+	}
 	var err error
 	switch {
 	case entry.data != nil:
@@ -580,6 +608,77 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	if err != nil && w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
 		w.onAsyncError(err)
 	}
+}
+
+// processProtoEntry handles a ZC marshal request: the sender supplied
+// an unmarshalled proto.Message; we marshal it directly into a ring
+// reservation here under writeLoop's inlineMu. This is the queued
+// fallback for senders whose writeProto.TryLock failed — instead of
+// returning to the upper layer and triggering codec.Marshal +
+// tightBufferPool.Get (which is the dominant alloc source under
+// high-concurrency 4 KiB ping-pong per CPU profile 2026-05-28), the
+// sender enqueues the message and writeLoop ZC-marshals it from its
+// drain pass.
+//
+// Caller MUST have:
+//   - Pre-validated single-frame size bounds (Capacity/3,
+//     h2MaxFramePayload, shmMaxFrameSize) — writeProto does this
+//     before TryLock, so by the time the bail enqueue happens, the
+//     entry is guaranteed to fit a single H2 DATA frame.
+//   - Acquired send quota for (5 + protoSize) bytes. writeLoop does
+//     NOT touch flow control here; the quota is consumed end-to-end
+//     by the sender's pre-acquisition. On error, caller is responsible
+//     for refunding the quota after observing the doneCh result.
+//
+// Liveness check: streamPtr is consulted for stream-level cancellation
+// only (streamDone signals the sender stopped caring). ctx error is
+// surfaced through ReserveWrite (which select's on ctx.Done()).
+func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
+	if w.closed.Load() {
+		entry.doneCh <- ErrConnClosing
+		return
+	}
+	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
+		entry.doneCh <- errStreamDone
+		return
+	}
+	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, entry.fh.StreamID,
+		entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	entry.doneCh <- err
+}
+
+// enqueueProtoAndWait pushes a ZC marshal request onto the writer
+// channel and blocks until writeLoop processes it.
+//
+// Used by (*ShmClientTransport|ShmServerTransport).writeProto when
+// inlineMu.TryLock fails: instead of bailing back to the upper layer
+// (which would re-encode via codec.Marshal + tightBufferPool), we
+// push the unmarshalled proto.Message through to writeLoop so the
+// ZC-marshal-into-ring path runs there. This is the .NET-equivalent
+// of writer.WriteInlineDirect deferring to WriterLoop.
+//
+// Pre-conditions (caller MUST satisfy):
+//   - Single-frame size bounds pre-validated.
+//   - Send quota for (5 + protoSize) bytes pre-acquired by the
+//     sender. On returned error the caller refunds it.
+//
+// Errors:
+//   - ErrConnClosing if the queue is full (frameWriterQueueSize=2048
+//     should make this rare; treat as transport overload).
+//   - The error from writeProtoToRingH2Blocking otherwise.
+func (w *shmFrameWriter) enqueueProtoAndWait(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+	entry := frameEntry{
+		ctx:       ctx,
+		fh:        fh,
+		streamPtr: streamPtr,
+		protoMsg:  msg,
+		protoSize: pSize,
+		doneCh:    make(chan error, 1),
+	}
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
+	return <-entry.doneCh
 }
 
 // processWholeMessage handles a whole-message entry. The caller

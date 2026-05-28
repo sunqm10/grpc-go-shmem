@@ -2598,9 +2598,35 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 		return false, nil
 	}
 
+	if err := writeProtoToRingH2Core(ctx, tx, streamID, msg, pSize, total, flags); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// writeProtoToRingH2Blocking is the writeLoop variant of
+// writeProtoToRingH2: it skips the non-blocking ContiguousWriteSpace
+// short-circuit so ReserveWrite blocks when the ring is tight (the
+// inline path bails instead so the sender goroutine doesn't hold
+// inlineMu while waiting).
+//
+// Size bounds (Capacity/3, h2MaxFramePayload, shmMaxFrameSize) MUST
+// be pre-validated by the caller — they cannot be soft-rejected
+// from the writeLoop context (the entry is already in flight and
+// the sender is blocked on doneCh).
+func writeProtoToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize int, flags uint8) error {
+	total := h2FrameHeaderSize + 5 + pSize
+	return writeProtoToRingH2Core(ctx, tx, streamID, msg, pSize, total, flags)
+}
+
+// writeProtoToRingH2Core is the shared body of writeProtoToRingH2 and
+// writeProtoToRingH2Blocking: reserve, lay out H2 header + gRPC LPM
+// header, marshal the proto body directly into the ring slice,
+// commit. The two outer functions differ only in their pre-checks.
+func writeProtoToRingH2Core(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize, total int, flags uint8) error {
 	res, err := tx.ReserveWrite(ctx, total)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// H2 DATA frame header (9 bytes).
@@ -2634,12 +2660,12 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	dst := res.First[h2FrameHeaderSize+5 : h2FrameHeaderSize+5]
 	out, err := protoMarshalAppend(dst, msg)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if len(out) != pSize {
-		return false, fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
+		return fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
 	}
 
 	atomic.AddUint64(&shmZCWriteFire, 1)
-	return true, res.Commit(total)
+	return res.Commit(total)
 }

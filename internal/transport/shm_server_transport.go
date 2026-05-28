@@ -1748,20 +1748,30 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	if !t.frameWriter.inlineMu.TryLock() {
 		t.frameWriter.closeMu.RUnlock()
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
-		// Atomic refund; always dispatch under the mutex to close
-		// the lost-wakeup race vs acquireSendQuota. Also wake WL
-		// to revisit deferred whole-message senders whose quota gap
-		// may now be satisfiable.
-		t.connSendQuota.Add(int64(quotaSize))
-		s.sendQuota.Add(int64(quotaSize))
-		select {
-		case t.frameWriter.wuRetryWake <- struct{}{}:
-		default:
+		// Writer goroutine is busy — push the proto.Message to writeLoop
+		// so it ZC-marshals there (instead of the bail-to-codec.Marshal
+		// path which allocates 8 GB/5s through tightBufferPool under
+		// N=1000/4K bench, dominating GC time per cpu pprof 2026-05-28).
+		// Quota stays consumed; refund on error.
+		fh := FrameHeader{
+			Type:     FrameTypeMESSAGE,
+			StreamID: s.id,
+			Flags:    0, // server-side: never END_STREAM on DATA (TRAILERS carries it)
 		}
-		t.sendQuotaMu.Lock()
-		t.notifyQuotaChangeLocked(0)
-		t.sendQuotaMu.Unlock()
-		return false, nil
+		err := t.frameWriter.enqueueProtoAndWait(s.ctx, &s.Stream, fh, pm, pSize)
+		if err != nil {
+			t.connSendQuota.Add(int64(quotaSize))
+			s.sendQuota.Add(int64(quotaSize))
+			select {
+			case t.frameWriter.wuRetryWake <- struct{}{}:
+			default:
+			}
+			t.sendQuotaMu.Lock()
+			t.notifyQuotaChangeLocked(0)
+			t.sendQuotaMu.Unlock()
+			return true, err
+		}
+		return true, nil
 	}
 	ok2, err := writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
 	t.frameWriter.inlineMu.Unlock()
