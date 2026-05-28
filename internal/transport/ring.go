@@ -759,19 +759,21 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 
 // signalData signals that new data is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// When the per-data-segment eventfd waker is active on this ring,
+// Segment.finalizeDataSegWaker guarantees the peer is also on the
+// eventfd primitive (asymmetric wake states converge to the futex
+// fallback during handshake; see shm_segment.go). We therefore skip
+// the additional futex_wake on this branch -- it would be pure
+// syscall overhead with no possible peer waiter. Under N=1000
+// concurrent streams this is ~200K skipped syscalls/s.
+//
+// Raw-ring tests that bypass the full handshake path and want to
+// exercise the futex wake primitive must disable the eventfd waker
+// via ConfigureShmEventfdWakerForBench(false).
 func (r *ShmRing) signalData(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// Also issue a futex_wake on the same address so peers using a
-		// different wake primitive (raw-ring tests that bypass
-		// RegisterRing; cross-process peers whose SCM_RIGHTS handoff
-		// failed and converged on futex via OpenerWakeReady=false)
-		// still observe the signal. Safe: futex_wake on an address
-		// with no waiters is a cheap kernel hash lookup (~150 ns) --
-		// negligible against the ~100 us per-RPC cost. Use the on-
-		// Linux primitive directly so the Windows events path is not
-		// double-fired.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
@@ -783,11 +785,12 @@ func (r *ShmRing) signalData(addr *uint32) {
 
 // signalSpace signals that space is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// See signalData for the rationale on skipping futex_wake when the
+// eventfd waker is active.
 func (r *ShmRing) signalSpace(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// See signalData for the futex_wake-after-dataSegWaker rationale.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
@@ -799,11 +802,12 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 
 // signalContig signals that contiguous space improved.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// See signalData for the rationale on skipping futex_wake when the
+// eventfd waker is active.
 func (r *ShmRing) signalContig(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// See signalData for the futex_wake-after-dataSegWaker rationale.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
