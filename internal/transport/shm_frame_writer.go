@@ -824,6 +824,21 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		isLast:    entry.isLast,
 		doneCh:    entry.doneCh,
 	}
+	// Per-stream FIFO vs the async ZC proto path. If this stream
+	// already has deferred proto entries waiting on FC, the chan
+	// arrival order put those entries BEFORE this whole-message
+	// (the sender's inline path bails when len(w.ch) > 0 OR when
+	// any stream has deferred proto pending — see tryInlineWrite).
+	// Emitting this whole-message before retryDeferredProto drains
+	// the proto queue would violate gRPC per-stream message order.
+	// Install in w.deferred[sid] (sender already holds doneCh; the
+	// at-most-one-whole-message-per-stream invariant guarantees no
+	// pre-existing entry is overwritten — write() callers block on
+	// doneCh until resolution).
+	if len(w.deferredProto[entry.fh.StreamID]) > 0 {
+		w.deferred[entry.fh.StreamID] = d
+		return
+	}
 	w.advanceDeferred(entry.fh.StreamID, d)
 }
 
@@ -978,18 +993,34 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 // credits accumulate; in practice the receiver-side WU emitter
 // drives wuRetryWake at sub-millisecond cadence so the latency
 // cost of map-random is negligible.
+//
+// Ordering invariant: process w.deferredProto FIRST. Any whole-
+// message entry sitting in w.deferred[sid] was queued AFTER the
+// proto entries that landed in deferredProto[sid] (processWholeMessage
+// installs the whole-message in w.deferred[sid] when it observes a
+// non-empty deferredProto[sid] head). Emitting the whole-message
+// before the proto queue drains would violate gRPC per-stream
+// message order.
 func (w *shmFrameWriter) retryDeferred() {
+	if len(w.deferredProto) > 0 {
+		for sid, queue := range w.deferredProto {
+			w.retryDeferredProto(sid, queue)
+		}
+	}
 	if len(w.deferred) > 0 {
 		for sid, d := range w.deferred {
+			// Skip if this stream still has pending async proto
+			// entries — they must drain first to preserve FIFO.
+			// retryDeferredProto above may have left some entries
+			// in deferredProto[sid] if FC was insufficient; revisit
+			// on the next wuRetryWake.
+			if len(w.deferredProto[sid]) > 0 {
+				continue
+			}
 			// advanceDeferred may delete sid from the map; Go's
 			// spec guarantees this is safe during a range loop
 			// (the iterator observes the new state going forward).
 			w.advanceDeferred(sid, d)
-		}
-	}
-	if len(w.deferredProto) > 0 {
-		for sid, queue := range w.deferredProto {
-			w.retryDeferredProto(sid, queue)
 		}
 	}
 }
@@ -1289,7 +1320,16 @@ func (w *shmFrameWriter) tryInlineWrite(
 	// Linux fair-default bench shows N=1000/4K drops 1-3 % when the
 	// payloadLen path runs first, fully recovered by moving the
 	// channel-length gate to position zero.
-	if len(w.ch) > 0 {
+	//
+	// Also gate on the writer-owned deferredProto map (any stream).
+	// When a ZC proto entry sits deferred behind FC stall and a
+	// later whole-message arrives for ANY stream, emitting it inline
+	// before the chan and retryDeferred have drained the proto entry
+	// breaks per-stream FIFO if the deferred and the new entry share
+	// a stream. Conservatively bail whenever any stream has a deferred
+	// proto pending — the chan path's retryDeferred ordering will
+	// resolve them correctly in turn.
+	if len(w.ch) > 0 || len(w.deferredProto) > 0 {
 		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
 		return false, nil
 	}
@@ -1324,10 +1364,12 @@ func (w *shmFrameWriter) tryInlineWrite(
 		atomic.AddUint64(&shmInlineWriteBailCtxDone, 1)
 		return false, nil
 	}
-	// Re-check len(w.ch) under the lock — between the pre-lock check
-	// and TryLock, another goroutine may have enqueued. Bail
-	// preserves the batched-drain invariant.
-	if len(w.ch) > 0 || len(w.deferred) > 0 {
+	// Re-check len(w.ch) / deferred / deferredProto under the lock —
+	// between the pre-lock check and TryLock, another goroutine may
+	// have enqueued. Bail preserves the batched-drain invariant AND
+	// the per-stream FIFO invariant (see pre-lock comment for the
+	// deferredProto-overtaking-by-inline ordering bug).
+	if len(w.ch) > 0 || len(w.deferred) > 0 || len(w.deferredProto) > 0 {
 		w.inlineMu.Unlock()
 		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
 		return false, nil

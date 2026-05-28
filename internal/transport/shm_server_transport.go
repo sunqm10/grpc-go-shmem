@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -550,6 +551,27 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 	// Start the dedicated frame writer goroutine for the server→client ring.
 	t.frameWriter = newShmFrameWriter(serverToClient)
+	// Surface async write failures (fire-and-forget control frames
+	// such as TRAILERS / GOAWAY) by tearing down the transport.
+	// Mirrors the client-side handler: without this hook the writer
+	// goroutine would silently drop a failure and the peer would
+	// wait forever for a frame that was never sent. The handler runs
+	// in a fresh goroutine so it can safely call Close (which waits
+	// for the writer goroutine that is currently invoking the
+	// callback). Close is guarded by closeOnce so concurrent
+	// invocations are idempotent.
+	t.frameWriter.setAsyncErrorHandler(func(err error) {
+		// Benign causes: per-stream ctx cancel (peer gave up on that
+		// stream, our bytes are no longer needed) or the transport
+		// already closing.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return
+		}
+		if t.closed.Load() {
+			return
+		}
+		go t.Close(fmt.Errorf("shm server: async write failed: %w", err))
+	})
 	// Register the lockless WU drain callback. See client-side
 	// drainPendingWUForWriter for the contract. Must be installed
 	// BEFORE any reader/sender goroutine can call sendWindowUpdate
@@ -1558,12 +1580,8 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	}
 
 	// Server-side MESSAGE frames never carry the HTTP/2 END_STREAM bit;
-	// end-of-stream is communicated via TRAILERS (writeStatus). Flags=0.
-	fh := FrameHeader{
-		Type:     FrameTypeMESSAGE,
-		StreamID: s.id,
-		Flags:    0,
-	}
+	// end-of-stream is communicated via TRAILERS (writeStatus). Flags=0
+	// on every DATA frame the inline writeProtoToRing emits below.
 
 	// Acquire the frame writer's inline mutex to serialize with writeLoop.
 	// writeProtoToRing writes directly to the ring, bypassing the frame
@@ -1609,23 +1627,32 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				}
 				return true, err
 			}
-			// CAS-fail → fall through to async.
+			// CAS-fail → fall through to sync chunked path (return
+			// false). DO NOT take the async fire-and-forget path on
+			// the server side: writeStatus follows immediately after
+			// a successful response and swaps stream state to
+			// streamDone, which the writer's processProtoEntry treats
+			// as a "drop" signal — silently losing the async DATA and
+			// producing a cardinality violation on the client. The
+			// existing blocking write() path uses enqueueMessageAndWait
+			// which sender-blocks on doneCh, guaranteeing DATA-before-
+			// TRAILERS ordering. Confirmed reproducible at
+			// BenchmarkGRPCShmUnary/size={64,256,1024,4096} 2026-05-28.
 			atomic.AddUint64(&shmZCWriteSkipQuota, 1)
 		}
 		t.frameWriter.inlineMu.Unlock()
 	} else {
+		// TryLock-fail: same async-vs-writeStatus race as the CAS-fail
+		// branch above. Bail to sync write() instead of going async.
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 	}
 	t.frameWriter.closeMu.RUnlock()
 
-	// Async path: writer goroutine owns CAS reservation + defer-and-
-	// retry. Fire-and-forget; see client writeProto for the design.
-	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
-		s.protoInFlight.Add(-1)
-		return true, err
-	}
-	return true, nil
+	// Server-side ALWAYS falls back to the sync chunked path on
+	// inline failure (no async fire-and-forget). The writeStatus
+	// race makes the async path unsafe on the server until a unified
+	// per-stream writer FIFO covers DATA + TRAILERS ordering.
+	return false, nil
 }
 
 // write writes header and data for a stream.
