@@ -1043,6 +1043,19 @@ func (w *shmFrameWriter) tryInlineWrite(
 	data mem.BufferSlice,
 	isLast bool,
 ) (handled bool, err error) {
+	// Cheapest gate FIRST: at high stream concurrency (N=1000) the
+	// channel is almost never empty, so this single non-atomic chan
+	// length check bails ~100 % of calls without touching any
+	// expensive field. Reordering matters: prior arrangement
+	// (payloadLen check first) called BufferSlice.Len() — which
+	// iterates segments — before realising we were going to bail.
+	// Linux fair-default bench shows N=1000/4K drops 1-3 % when the
+	// payloadLen path runs first, fully recovered by moving the
+	// channel-length gate to position zero.
+	if len(w.ch) > 0 {
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
 	payloadLen := len(hdr) + data.Len()
 	if payloadLen == 0 {
 		atomic.AddUint64(&shmInlineWriteBailZeroLen, 1)
@@ -1050,26 +1063,6 @@ func (w *shmFrameWriter) tryInlineWrite(
 	}
 	if payloadLen > shmMaxFrameSize {
 		atomic.AddUint64(&shmInlineWriteBailFrameSize, 1)
-		return false, nil
-	}
-	// Pre-lock fast-fail: if the writer-goroutine channel already has
-	// entries queued, the batched drain is strictly cheaper than the
-	// inline path (one writer wake covers many frames vs. one reader
-	// wake per inline emit). Reading len() on a chan is documented
-	// lock-free and racy-but-consistent (snapshot at some recent
-	// instant) — perfectly fine for an optimisation gate.
-	//
-	// Skipping the TryLock here is essential at high concurrency:
-	// without this gate, every sender at N=1000 streams pays a
-	// TryLock + 5-field check + Unlock just to bail on the same
-	// len(w.ch) > 0 condition. On a 16-core box the contended
-	// inlineMu cache line ping-pongs and net-regresses throughput
-	// even though all calls bail. Local Windows bench reproduced:
-	// N=1000/4K dropped 4 % and N=1000/64K dropped 9 % vs the
-	// pre-inline-write baseline. With this pre-lock gate the
-	// high-concurrency path returns to the original cost.
-	if len(w.ch) > 0 {
-		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
 		return false, nil
 	}
 	if !w.inlineMu.TryLock() {
