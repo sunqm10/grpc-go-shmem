@@ -176,6 +176,25 @@ type ShmRing struct {
 	// and will copy all remaining chunks. Cleared on the message's
 	// final (!MORE) chunk so the next message starts fresh.
 	chainCopyMode uint32
+
+	// ===== Multi-anchor single-frame ZC FIFO =====
+	//
+	// Lock-free bounded FIFO of in-flight single-frame ZC anchors.
+	// Replaces the at-most-one zcActive gate for the H2 codec ZC fast
+	// path (see ring_zc_multi.go for the protocol). Each slot records
+	// a held byte range [start, end); concurrent receivers can hold
+	// up to zcAnchorBudgetCount anchors simultaneously. head/tail are
+	// atomic.Uint64 monotonic counters; the slot at head%budget is the
+	// next candidate for prefix-walk publish.
+	//
+	// Inline ([256]anchorSlot, 16 KiB) rather than a separate
+	// allocation: keeps the cache layout predictable and avoids the
+	// double indirection on every Begin/Release. Cost is 32 KiB per
+	// connection (TX ring + RX ring) which is acceptable for the ZC
+	// throughput gain at concurrent receive.
+	anchorSlots [zcAnchorBudgetCount]anchorSlot
+	anchorHead  atomic.Uint64 // oldest in-flight anchor sequence
+	anchorTail  atomic.Uint64 // next anchor sequence to claim
 }
 
 // ReadCommit holds the state needed to commit a read operation.

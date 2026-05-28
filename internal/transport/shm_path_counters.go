@@ -110,6 +110,14 @@ var (
 	// when the candidate frame failed the ZC / single-copy guards.
 	shmAccReadFire uint64
 
+	// shmZCAnchorBudgetExceeded: BeginMultiAnchor returned nil because
+	// the FIFO slot for the next sequence was still in use. The caller
+	// falls back to the single-frame copy path. A high value vs
+	// ZCReadFire signals the budget needs tuning (zcAnchorBudgetCount
+	// in ring_zc_multi.go).
+	// Note: defined as a package-level var in ring_zc_multi.go; this
+	// field is the snapshot exported via ShmPathCounters.
+
 	// Inline-write fast-path counters (anchored at
 	// (*shmFrameWriter).tryInlineWrite). The inline path emits a
 	// single-frame whole-message DATA frame directly from the sender
@@ -192,9 +200,10 @@ type ShmPathCounters struct {
 	VectoredWriteFire     uint64
 	ChunkedWriteFire      uint64
 	ChunkedWriteVecFire   uint64
-	ZCReadFire            uint64
-	CopyReadFire          uint64
-	AccReadFire           uint64
+	ZCReadFire             uint64
+	CopyReadFire           uint64
+	AccReadFire            uint64
+	ZCAnchorBudgetExceeded uint64
 
 	InlineWriteFire              uint64
 	InlineWriteBailLocked        uint64
@@ -220,9 +229,10 @@ func LoadShmPathCounters() ShmPathCounters {
 		VectoredWriteFire:     atomic.LoadUint64(&shmVectoredWriteFire),
 		ChunkedWriteFire:      atomic.LoadUint64(&shmChunkedWriteFire),
 		ChunkedWriteVecFire:   atomic.LoadUint64(&shmChunkedWriteVecFire),
-		ZCReadFire:            atomic.LoadUint64(&shmZCReadFire),
-		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
-		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
+		ZCReadFire:             atomic.LoadUint64(&shmZCReadFire),
+		CopyReadFire:           atomic.LoadUint64(&shmCopyReadFire),
+		AccReadFire:            atomic.LoadUint64(&shmAccReadFire),
+		ZCAnchorBudgetExceeded: atomic.LoadUint64(&shmZCAnchorBudgetExceeded),
 
 		InlineWriteFire:              atomic.LoadUint64(&shmInlineWriteFire),
 		InlineWriteBailLocked:        atomic.LoadUint64(&shmInlineWriteBailLocked),
@@ -249,9 +259,10 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		VectoredWriteFire:     a.VectoredWriteFire - before.VectoredWriteFire,
 		ChunkedWriteFire:      a.ChunkedWriteFire - before.ChunkedWriteFire,
 		ChunkedWriteVecFire:   a.ChunkedWriteVecFire - before.ChunkedWriteVecFire,
-		ZCReadFire:            a.ZCReadFire - before.ZCReadFire,
-		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
-		AccReadFire:           a.AccReadFire - before.AccReadFire,
+		ZCReadFire:             a.ZCReadFire - before.ZCReadFire,
+		CopyReadFire:           a.CopyReadFire - before.CopyReadFire,
+		AccReadFire:            a.AccReadFire - before.AccReadFire,
+		ZCAnchorBudgetExceeded: a.ZCAnchorBudgetExceeded - before.ZCAnchorBudgetExceeded,
 
 		InlineWriteFire:              a.InlineWriteFire - before.InlineWriteFire,
 		InlineWriteBailLocked:        a.InlineWriteBailLocked - before.InlineWriteBailLocked,

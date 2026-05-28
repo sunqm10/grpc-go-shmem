@@ -1531,44 +1531,53 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//   - accumulator empty (no in-progress chain)
 				//   - body contiguous (no ring wrap)
 				//   - body fully contains exactly one LPM
-				//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
-				//     at-most-one-ZC, not under back-pressure)
+				//   - rx.IsMultiAnchorZCEligible (large enough ring/payload,
+				//     not under back-pressure)
+				//
+				// Multi-anchor protocol (see ring_zc_multi.go): up to
+				// zcAnchorBudgetCount in-flight ZC buffers per ring,
+				// released in arrival order via a lock-free FIFO. Replaces
+				// the legacy single-anchor zcActive gate that serialized
+				// concurrent receivers.
 				//
 				// The body bytes returned to the caller include the gRPC LPM
 				// 5-byte prefix.
 				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
-					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
-						atomic.AddUint64(&shmZCReadFire, 1)
-						// Arm the ZC anchor with the post-frame target, then
-						// don't call commitPayload.Commit — the deferred
-						// target already accounts for these bytes.
-						baseIdx := commitPayload.commitReadIdx
-						rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
-						rx.AddChainZcInFlight()
+					if 5+bodyLen == payloadLen && rx.IsMultiAnchorZCEligible(payloadLen, true) {
+						// commitPayload.commitReadIdx is the ring offset
+						// of the body's first byte (post H2 header), captured
+						// by the earlier ReadSlices and fresh for this frame.
+						// Passing it as the anchor's start avoids the
+						// stale-ReadIdx race the previous D-lite attempt hit.
+						if anchor := rx.BeginMultiAnchor(commitPayload.commitReadIdx, payloadLen); anchor != nil {
+							atomic.AddUint64(&shmZCReadFire, 1)
 
-						// Set MORE flag based on END_STREAM. MORE=0
-						// signals client half-close to the server
-						// transport (ShmServerTransport.handleMessage
-						// uses MORE=0 to write io.EOF). Required for
-						// cross-impl interop with grpc-go HTTP/2,
-						// grpc-java, grpc-c++ which set END_STREAM on
-						// the last DATA frame carrying body bytes.
-						msgFlags := MessageFlagMORE
-						if h2fh.Flags&H2FlagEndStream != 0 {
-							msgFlags = 0
-							holder.removeLpmAccumulator(h2fh.StreamID)
+							// Set MORE flag based on END_STREAM. MORE=0
+							// signals client half-close to the server
+							// transport (ShmServerTransport.handleMessage
+							// uses MORE=0 to write io.EOF). Required for
+							// cross-impl interop with grpc-go HTTP/2,
+							// grpc-java, grpc-c++ which set END_STREAM on
+							// the last DATA frame carrying body bytes.
+							msgFlags := MessageFlagMORE
+							if h2fh.Flags&H2FlagEndStream != 0 {
+								msgFlags = 0
+								holder.removeLpmAccumulator(h2fh.StreamID)
+							}
+
+							ringSlice := pFirst[:payloadLen:payloadLen]
+							pool := newZcMultiAnchorReleasePool(rx, anchor)
+							buf := mem.NewBuffer(&ringSlice, pool)
+							return FrameHeader{
+								Type:     FrameTypeMESSAGE,
+								StreamID: h2fh.StreamID,
+								Length:   uint32(payloadLen),
+								Flags:    msgFlags,
+							}, buf, nil
 						}
-
-						ringSlice := pFirst[:payloadLen:payloadLen]
-						pool := &zcChainReleasePool{ring: rx}
-						buf := mem.NewBuffer(&ringSlice, pool)
-						return FrameHeader{
-							Type:     FrameTypeMESSAGE,
-							StreamID: h2fh.StreamID,
-							Length:   uint32(payloadLen),
-							Flags:    msgFlags,
-						}, buf, nil
+						// Budget exhausted: counter incremented inside
+						// BeginMultiAnchor. Fall through to the copy path.
 					}
 				}
 
