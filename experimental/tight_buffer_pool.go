@@ -78,35 +78,13 @@ func TightBufferPool() mem.BufferPool {
 
 const (
 	defaultTightPoolMaxSizeClasses = 1024
-	// tightPoolMemBudgetPerSizeClass bounds the per-size-class strong-ref
-	// free list memory at ~16 MiB. cap_for_size(N) = budget / N, clamped
-	// to [64, 8192]. The intent: small sizes (e.g. 4 KiB protobuf
-	// payloads) get cap=4096 to cover SHM's ~3500-buffer in-flight
-	// working set at 1000-stream concurrent loads, while large sizes
-	// (e.g. 1 MiB) get cap=64. Total resident memory bound across all
-	// active size classes ≈ maxSizeClasses × budget but realistic
-	// workloads cluster on a handful of sizes.
-	tightPoolMemBudgetPerSizeClass = 16 * 1024 * 1024
-	tightFreeListMinCap            = 64
-	tightFreeListMaxCap            = 8192
+	// defaultTightFreeListCap bounds the per-size-class strong-ref free
+	// list. Sized to cover one outstanding buffer per concurrent stream
+	// at the published high-concurrency bench targets (N=1000) with
+	// modest headroom. See strong_ref_buffer_pool.go in internal/mem
+	// for the equivalent constant rationale.
+	defaultTightFreeListCap = 1024
 )
-
-// freeListCapForSize returns the bounded-strong-ref free-list cap for
-// a given exact buffer size. See tightPoolMemBudgetPerSizeClass for
-// the policy rationale.
-func freeListCapForSize(size int) int {
-	if size <= 0 {
-		return tightFreeListMinCap
-	}
-	cap := tightPoolMemBudgetPerSizeClass / size
-	if cap < tightFreeListMinCap {
-		return tightFreeListMinCap
-	}
-	if cap > tightFreeListMaxCap {
-		return tightFreeListMaxCap
-	}
-	return cap
-}
 
 // boundedFreeList is a per-size-class bounded strong-ref free list.
 // It replaces sync.Pool to decouple pool-hit-rate from GC frequency.
@@ -161,10 +139,7 @@ type tightBufferPool struct {
 func newTightBufferPool(maxSizeClasses int32) *tightBufferPool {
 	return &tightBufferPool{
 		maxSizeClasses: maxSizeClasses,
-		// Overflow list is shared across all over-cap sizes; size it
-		// using the smallest expected size (to be conservative on cap
-		// = larger). The overflow path is a fallback, not the hot path.
-		overflowList: newBoundedFreeList(tightFreeListMaxCap),
+		overflowList:   newBoundedFreeList(defaultTightFreeListCap),
 	}
 }
 
@@ -212,10 +187,6 @@ func (p *tightBufferPool) Put(b *[]byte) {
 // reached new sizes share p.overflowList (which loses the exact-size
 // guarantee but never blocks). The cap is a soft limit applied with a
 // CAS race — minor over-creation under contention is acceptable.
-//
-// Per-size free-list capacity is set by freeListCapForSize(size) so a
-// 4 KiB size class gets cap=4096 (covers SHM 1000-stream in-flight
-// working set) while a 1 MiB size class gets cap=64.
 func (p *tightBufferPool) poolFor(size int) *boundedFreeList {
 	if v, ok := p.pools.Load(size); ok {
 		return v.(*boundedFreeList)
@@ -223,7 +194,7 @@ func (p *tightBufferPool) poolFor(size int) *boundedFreeList {
 	if p.sizeClassCount.Load() >= p.maxSizeClasses {
 		return p.overflowList
 	}
-	newList := newBoundedFreeList(freeListCapForSize(size))
+	newList := newBoundedFreeList(defaultTightFreeListCap)
 	actual, loaded := p.pools.LoadOrStore(size, newList)
 	if !loaded {
 		p.sizeClassCount.Add(1)

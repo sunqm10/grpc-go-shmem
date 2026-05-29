@@ -20,55 +20,15 @@ package mem
 
 import "sync"
 
-// defaultStrongRefPoolCap is the FALLBACK per-tier retention cap when
-// the caller doesn't specify one. Most callers should not use this
-// directly — prefer strongRefCapForSize(size) which scales cap inversely
-// with buffer size to bound total resident memory.
+// defaultStrongRefPoolCap is the default per-tier retention cap for
+// strong-ref pools. Sized to cover one outstanding buffer per concurrent
+// stream at the published high-concurrency bench targets (N=1000) with
+// modest headroom. Total per-tier resident memory ≈ cap × tier size.
+// For the default tier set (256 B .. 1 MiB across 7 tiers) this caps
+// resident retained memory at ≈ 1024 × Σ(tier sizes) ≈ 1.7 GiB worst
+// case if every tier saturates, which is far above realistic working
+// sets. The cap exists as a runaway guard, not a routine bound.
 const defaultStrongRefPoolCap = 1024
-
-// strongRefCapForTier returns a per-tier retention cap that scales
-// inversely with tier size. The intent: each tier's worst-case resident
-// memory is bounded at strongRefMemBudgetPerTier (~16 MiB) so the total
-// across all tiers stays near 100–120 MiB for the default 7-tier set.
-//
-// Why size-aware
-//
-// SHM transport's send path holds each marshaled message buffer for
-// ~15–20 µs (chan enqueue + writer drain + ring write + doneCh) before
-// returning it to the pool. At the Jumbo32 1000-stream × 4 KiB cell
-// (~172 K msg/s) this puts ~3500 buffers simultaneously in flight on
-// the 4 KiB tier. A flat cap of 1024 yields ~30 % pool hit rate; the
-// other 70 % become fresh makeslice/GC pressure. Bumping the 4 KiB
-// tier cap to 4096 covers the in-flight working set and drives hit
-// rate near 100 % on that cell.
-//
-// Bigger tiers don't need a big cap: at 1 MiB payloads the bench
-// runs at ~700 ops/sec on 10–10 K streams, giving in-flight buffer
-// count in the dozens, not thousands. Per-tier cap = budget / size
-// gives each tier the right amount of headroom without inflating
-// memory on tiers that don't need it.
-//
-// Floors and ceilings keep the policy sane:
-//   - cap >= 64: even big tiers retain a working set for warm cycles
-//   - cap <= 8192: bound 256-byte tier at 2 MiB (vs unbounded growth)
-func strongRefCapForTier(size int) int {
-	const (
-		budget = 16 * 1024 * 1024 // 16 MiB per tier
-		minCap = 64
-		maxCap = 8192
-	)
-	if size <= 0 {
-		return defaultStrongRefPoolCap
-	}
-	cap := budget / size
-	if cap < minCap {
-		return minCap
-	}
-	if cap > maxCap {
-		return maxCap
-	}
-	return cap
-}
 
 // strongRefSizedPool is a drop-in replacement for sizedBufferPool that
 // holds STRONG references to its retained buffers. Unlike sync.Pool —
@@ -194,15 +154,13 @@ func (p *strongRefSizedPool) Put(b *[]byte) {
 // profile (e.g. mallocgc ≥ 30 % cumulative under a hot-path benchmark).
 // At lower throughputs sync.Pool's per-P sharded fast path is cheaper.
 //
-// Per-tier cap is sized by strongRefCapForTier(size) which scales
-// inversely with tier size: small tiers (e.g. 4 KiB) get cap=4096 to
-// cover SHM's ~3500-buffer in-flight working set at 1000-stream 4 KiB
-// concurrent loads, while large tiers (e.g. 1 MiB) get cap=64. Total
-// resident memory is bounded at ~16 MiB per tier (~120 MiB across the
-// default 7-tier set).
+// Each tier retains up to defaultStrongRefPoolCap buffers. Total
+// resident memory is bounded by Σ_tiers(cap × tier_size); for the
+// default tier set this is ≈ 1.7 GiB worst case, but realistic
+// workloads occupy a small fraction of that.
 func NewStrongRefDirtyBinaryTieredBufferPool(powerOfTwoExponents ...uint8) (*BinaryTieredBufferPool, error) {
 	return newBinaryTiered(func(size int) bufferPool {
-		return newStrongRefSizedBufferPool(size, false, strongRefCapForTier(size))
+		return newStrongRefSizedBufferPool(size, false, defaultStrongRefPoolCap)
 	}, NewDirtySimplePool(), powerOfTwoExponents...)
 }
 
@@ -211,6 +169,6 @@ func NewStrongRefDirtyBinaryTieredBufferPool(powerOfTwoExponents ...uint8) (*Bin
 // being returned from Get.
 func NewStrongRefBinaryTieredBufferPool(powerOfTwoExponents ...uint8) (*BinaryTieredBufferPool, error) {
 	return newBinaryTiered(func(size int) bufferPool {
-		return newStrongRefSizedBufferPool(size, true, strongRefCapForTier(size))
+		return newStrongRefSizedBufferPool(size, true, defaultStrongRefPoolCap)
 	}, &SimpleBufferPool{shouldZero: true}, powerOfTwoExponents...)
 }
