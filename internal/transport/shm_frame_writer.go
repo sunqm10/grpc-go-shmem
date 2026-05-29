@@ -272,6 +272,14 @@ const (
 	// channel full. 2048 absorbs typical fanout without back-pressure on
 	// the async fire-and-forget path.
 	frameWriterQueueSize = 2048
+
+	// maxDrainPerPass caps the greedy drain in writeLoop per outer-select
+	// trip. Bounds inlineMu hold time and ensures the outer select can
+	// observe wuRetryWake signals in a timely manner. Matches .NET's
+	// 512-frame BeginBatch/EndBatch drain. Large enough that high-conc
+	// 4 KiB cells (where ~1000 producers contend on chan-send) coalesce
+	// many late arrivals into one writev+SignalData cycle.
+	maxDrainPerPass = 512
 )
 
 // newShmFrameWriter creates and starts a frame writer for the given ring.
@@ -431,8 +439,12 @@ func (w *shmFrameWriter) writeLoop() {
 			continue
 		}
 		// Check if more frames are queued behind this one.
-		pending := len(w.ch)
-		if pending > 0 {
+		// Greedy non-blocking drain: bundles late arrivals that hit
+		// the chan during processEntry into the same writev+SignalData
+		// cycle (snapshot-then-drain would defer them to the next
+		// outer-select trip). Capped at maxDrainPerPass so inlineMu
+		// hold is bounded and wuRetryWake can be observed promptly.
+		if len(w.ch) > 0 {
 			signalBatchBytes := int(w.tx.Capacity() / 8)
 			batchBytes := 0
 			w.tx.BeginBatch()
@@ -448,10 +460,19 @@ func (w *shmFrameWriter) writeLoop() {
 				w.processEntry(entry)
 				batchBytes += eb
 			}
-			for i := 0; i < pending; i++ {
-				next, ok := <-w.ch
-				if !ok {
-					break
+		Drain:
+			for drained := 1; drained < maxDrainPerPass; drained++ {
+				var (
+					next frameEntry
+					ok   bool
+				)
+				select {
+				case next, ok = <-w.ch:
+					if !ok {
+						break Drain
+					}
+				default:
+					break Drain
 				}
 				if coalescer.absorb(next) {
 					// 4-byte WU frame contributes a fixed minor cost
@@ -470,9 +491,10 @@ func (w *shmFrameWriter) writeLoop() {
 				}
 				// Periodically release the batch so the reader gets a
 				// wake mid-burst and can drain in parallel with the
-				// next group's writes, instead of waiting for the
-				// entire pending queue to complete.
-				if batchBytes >= signalBatchBytes && i < pending-1 {
+				// next group's writes. Skip when chan is already empty
+				// to avoid wasted BeginBatch+EndBatch oscillation on
+				// the final iteration.
+				if batchBytes >= signalBatchBytes && len(w.ch) > 0 {
 					// Flush any pending WU coalesce before signal so
 					// the reader sees credits in this signal cycle,
 					// not the next.
