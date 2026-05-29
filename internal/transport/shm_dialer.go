@@ -220,8 +220,10 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		releaseCtlLock()
 	}()
 
+	myNonce := newConnectNonce()
 	if err := writeCtlFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
 		singleStreamMode: opts.SingleStreamMode,
+		nonce:            myNonce,
 	})); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
@@ -231,22 +233,45 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	// readCtlFrame's two-phase header+payload commit would leave Ring B
 	// mid-frame and corrupt the next dialer's read. The outer
 	// DialShm ConnectTimeout (and any caller-supplied deadline)
-	// still bounds the wait via deadline propagation. Residual risk:
-	// a deadline firing between the header commit and payload read
-	// could still leave bytes pending; the deferred drain attempts a
-	// best-effort cleanup. A wire-level request nonce would close
-	// the remaining window; tracked as a gRFC follow-up.
+	// still bounds the wait via deadline propagation.
+	//
+	// The remaining "stale response" window — a deadline firing between
+	// a prior dialer's lock release and its response landing on Ring B
+	// — is now closed by the v3 per-request nonce: each ACCEPT/REJECT
+	// echoes the CONNECT nonce and we skip any response that does not
+	// match myNonce (see the bounded read loop below).
 	readCtx := context.Background()
 	if d, ok := ctx.Deadline(); ok {
 		var cancel context.CancelFunc
 		readCtx, cancel = context.WithDeadline(context.Background(), d)
 		defer cancel()
 	}
-	respFH, respPayload, err := readCtlFrame(readCtx, ctlRx)
-	if err != nil {
-		// Deferred drain + release handles the abandoned-response
-		// recovery; just surface the read error.
-		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
+	// Read the response, skipping any stale ACCEPT/REJECT left on the
+	// shared Ring B by a previous dialer that timed out and released
+	// the control lock before its response arrived. Each such frame is
+	// fully consumed by readCtlFrame, so a non-matching nonce just means
+	// "read the next one". Bound the retries so a ring full of stale or
+	// adversarial responses fails the dial instead of looping forever.
+	const maxStaleResponses = 3
+	var respFH FrameHeader
+	var respPayload []byte
+	matched := false
+	for attempt := 0; attempt < maxStaleResponses; attempt++ {
+		respFH, respPayload, err = readCtlFrame(readCtx, ctlRx)
+		if err != nil {
+			// Deferred drain + release handles the abandoned-response
+			// recovery; just surface the read error.
+			return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
+		}
+		if respNonce, ok := peekResponseNonce(respFH.Type, respPayload); ok && respNonce != myNonce {
+			continue // stale response for another dialer; consumed, retry
+		}
+		matched = true
+		break
+	}
+	if !matched {
+		return nil, NewShmError(ShmErrConnectionRefused,
+			"no matching connect response after draining stale responses on control ring")
 	}
 	// Mark sentConnect=false BEFORE the explicit release so any
 	// panic in the release path itself does not trigger a stale

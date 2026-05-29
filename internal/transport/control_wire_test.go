@@ -33,10 +33,11 @@ func TestConnectRequest_RoundTrip(t *testing.T) {
 		ringA:            1 << 20,
 		ringB:            2 << 20,
 		singleStreamMode: true,
+		nonce:            0xDEADBEEFCAFEF00D,
 	}
 	enc := encodeConnectRequest(in)
-	if len(enc) != 20 {
-		t.Fatalf("encoded length: got %d want 20", len(enc))
+	if len(enc) != 28 {
+		t.Fatalf("encoded length: got %d want 28", len(enc))
 	}
 	out, err := decodeConnectRequest(enc)
 	if err != nil {
@@ -117,7 +118,7 @@ func TestConnectRequest_RejectsUnknownVersion(t *testing.T) {
 
 // TestConnectResponse_RoundTrip exercises the happy path.
 func TestConnectResponse_RoundTrip(t *testing.T) {
-	in := connectResponse{segmentName: "shm-foo-bar-baz"}
+	in := connectResponse{segmentName: "shm-foo-bar-baz", nonce: 0x0123456789ABCDEF}
 	enc := encodeConnectResponse(in)
 	out, err := decodeConnectResponse(enc)
 	if err != nil {
@@ -166,7 +167,7 @@ func TestConnectResponse_RejectsNonH2Selection(t *testing.T) {
 
 // TestConnectReject_RoundTrip exercises REJECT happy path.
 func TestConnectReject_RoundTrip(t *testing.T) {
-	in := connectReject{message: "no streams available"}
+	in := connectReject{message: "no streams available", nonce: 0xFEEDFACEFEEDFACE}
 	enc := encodeConnectReject(in)
 	out, err := decodeConnectReject(enc)
 	if err != nil {

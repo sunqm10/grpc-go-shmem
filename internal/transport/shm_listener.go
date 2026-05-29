@@ -300,6 +300,10 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 		connReq, err := decodeConnectRequest(payload)
 		if err != nil {
+			// CONNECT could not be decoded, so no nonce is available to
+			// echo (REJECT carries nonce 0). A matched-v3 dialer will
+			// not correlate it and fails the dial generically; this path
+			// is effectively unreachable between matched-version peers.
 			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
@@ -314,7 +318,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
 		if err != nil {
-			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error(), nonce: connReq.nonce}))
 			continue
 		}
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
@@ -357,7 +361,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		readRing.SetEvents(readEvents)
 		writeRing.SetEvents(writeEvents)
 
-		if err := writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName})); err != nil {
+		if err := writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName, nonce: connReq.nonce})); err != nil {
 			if readEvents != nil {
 				readEvents.Close()
 			}
