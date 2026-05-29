@@ -1359,6 +1359,20 @@ func (t *ShmClientTransport) Close(err error) {
 				_ = t.serverToClient.Close()
 			}
 		}
+		// BUG FIX (Opus 4.8 overnight review): Wake any writer goroutine
+		// that may be parked in ReserveWrite -> waitForSpace -> eventfd
+		// WaitForChange BEFORE calling frameWriter.close() (which does
+		// wg.Wait()). Under the Linux eventfd waker, ring.Close()'s
+		// signalSpace wakes only the PEER's eventfd, not the local
+		// writer's, so a writer parked at Close-time would otherwise
+		// hang the wg.Wait() forever. Closing the local eventfd here
+		// makes WaitForChange return ErrRingClosed and the writer can
+		// exit cleanly. The waker's sync.Once makes a second
+		// UnblockSameSideParkers() call later (before readerWG.Wait)
+		// idempotent. No-op on per-address-eventfd/futex paths.
+		if t.segment != nil {
+			t.segment.UnblockSameSideParkers()
+		}
 		t.frameWriter.close()
 
 		// Wake up the keepalive goroutine if it's dormant, so it can exit.

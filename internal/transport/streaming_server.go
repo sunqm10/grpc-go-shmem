@@ -65,6 +65,13 @@ type streamingServerStream struct {
 	// Send coordination
 	sendQueue  chan []byte // buffered queue for outgoing messages
 	senderDone chan struct{}
+	// sendMu serializes SendMsg's `case s.sendQueue <- payload:` send
+	// against SendTrailers's `close(s.sendQueue)`. Without it, a
+	// SendMsg that has already passed the `sendDone.Load()` gate and
+	// is mid-select can race with SendTrailers's CAS+close, causing
+	// "send on closed channel" panic. See client mirror in
+	// streaming_client.go for the equivalent guard.
+	sendMu sync.Mutex
 
 	// Lifecycle
 	recvDone   atomic.Bool   // set when client closes send
@@ -343,6 +350,8 @@ func (s *streamingServerStream) SendHeaders(md []KV) error {
 
 // SendMsg sends a message on the stream (non-blocking, queued)
 func (s *streamingServerStream) SendMsg(payload []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if s.sendDone.Load() {
 		return errors.New("send already closed")
 	}
@@ -358,11 +367,14 @@ func (s *streamingServerStream) SendMsg(payload []byte) error {
 
 // SendTrailers sends trailers and closes the stream
 func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string, md []KV) error {
+	s.sendMu.Lock()
 	if !s.sendDone.CompareAndSwap(false, true) {
+		s.sendMu.Unlock()
 		return errors.New("send already closed")
 	}
 	// Preserve ordering: ensure all queued messages are flushed before trailers.
 	close(s.sendQueue)
+	s.sendMu.Unlock()
 	<-s.senderDone
 
 	tr := TrailersV1{

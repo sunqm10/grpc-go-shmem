@@ -69,6 +69,14 @@ type StreamingClientStream struct {
 	// Send coordination
 	sendQueue  chan []byte // buffered queue for outgoing messages
 	senderDone chan struct{}
+	// sendMu serializes SendMsg's `case s.sendQueue <- payload:` send
+	// against CloseSend's `close(s.sendQueue)`. Without it, a SendMsg
+	// that has already passed the `sendDone.Load()` gate and is mid-
+	// select can race with CloseSend's CAS+close, causing
+	// "send on closed channel" panic. The mutex is held only across
+	// the small select / CAS+close critical sections; the blocking
+	// `<-senderDone` in CloseSend runs after release.
+	sendMu sync.Mutex
 
 	// Lifecycle
 	recvDone atomic.Bool // set when TRAILERS received
@@ -366,6 +374,8 @@ func (c *ShmStreamingClient) dispatchCancel(id uint32) {
 
 // SendMsg sends a message on the stream (non-blocking, queued).
 func (s *StreamingClientStream) SendMsg(payload []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if s.sendDone.Load() {
 		return errors.New("send already closed")
 	}
@@ -381,14 +391,18 @@ func (s *StreamingClientStream) SendMsg(payload []byte) error {
 
 // CloseSend signals that no more messages will be sent.
 func (s *StreamingClientStream) CloseSend() error {
+	s.sendMu.Lock()
 	if !s.sendDone.CompareAndSwap(false, true) {
+		s.sendMu.Unlock()
 		return errors.New("send already closed")
 	}
 	if s.client == nil {
+		s.sendMu.Unlock()
 		return errors.New("client is nil")
 	}
 	// Preserve ordering: ensure all queued messages are sent before half-closing.
 	close(s.sendQueue)
+	s.sendMu.Unlock()
 	<-s.senderDone
 	fh := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
 	return s.client.writeFrameSafe(s.ctx, fh, nil)
