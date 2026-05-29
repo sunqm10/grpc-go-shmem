@@ -263,7 +263,16 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// recovery; just surface the read error.
 			return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
 		}
-		if respNonce, ok := peekResponseNonce(respFH.Type, respPayload); ok && respNonce != myNonce {
+		respNonce, ok := peekResponseNonce(respFH.Type, respPayload)
+		if !ok {
+			// Not a correlatable frame type, or the ACCEPT/REJECT
+			// payload would not decode. Either way it is not the
+			// response to our CONNECT; skip and retry so a stray
+			// or malformed frame on the shared Ring B does not
+			// poison the dial with a wrong-class error.
+			continue
+		}
+		if respNonce != myNonce {
 			continue // stale response for another dialer; consumed, retry
 		}
 		matched = true
@@ -297,9 +306,15 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// which decrements the refcount via CloseHandshakeEvents.
 		// On any failure path before that hand-off the segHandshakeOwned
 		// flag triggers a local CloseHandshakeEvents so we never leak
-		// the dialer-side ref. No-op on Linux.
-		_, hsErr := OpenHandshakeEvents(segName)
-		segHandshakeOwned := hsErr == nil
+		// the dialer-side ref. No-op on Linux. On Windows a failure
+		// here must fail the dial: WaitForServer / SetClientReadyAndSignal
+		// rely on the named event and would otherwise hang.
+		if _, hsErr := OpenHandshakeEvents(segName); hsErr != nil {
+			segment.Close()
+			return nil, NewShmErrorWithCause(ShmErrConnectionRefused,
+				fmt.Sprintf("open handshake events for %q", segName), hsErr)
+		}
+		segHandshakeOwned := true
 		defer func() {
 			if segHandshakeOwned {
 				CloseHandshakeEvents(segName)

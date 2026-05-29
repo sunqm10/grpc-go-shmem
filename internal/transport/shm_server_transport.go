@@ -2001,13 +2001,19 @@ func (t *ShmServerTransport) lookupStream(streamID uint32) *ServerStream {
 	}
 	t.mu.RLock()
 	s := t.streams[streamID]
-	if s != nil {
+	if s != nil && s.getState() != streamDone {
 		// Republish while still under RLock: a close path needs
 		// t.mu.Lock to remove the entry, so it cannot run between
-		// our snapshot and Store. After RUnlock our Store reflects
-		// a state that was true at some point during the RLock
-		// window; any later close will CAS-clear the slot.
+		// our snapshot and Store. The streamDone recheck closes the
+		// window in which closeStream / removeStream / writeStatus
+		// has already transitioned state to streamDone but has not
+		// yet reached t.mu.Lock to delete: without the recheck we
+		// would resurrect a dead-state stream into the slot AND
+		// return it for frame dispatch (caller then enqueues frames
+		// into an already-drained recvBuffer).
 		t.streamSlots[streamSlotIdx(streamID)].Store(s)
+	} else {
+		s = nil
 	}
 	t.mu.RUnlock()
 	return s

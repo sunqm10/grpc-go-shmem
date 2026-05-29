@@ -324,7 +324,20 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
 
 		// Create handshake events for the data segment (Windows).
-		_, _ = CreateHandshakeEvents(segmentName)
+		// On Linux this is a no-op. Propagate failures so a Windows
+		// event create error fails the accept loudly instead of
+		// publishing a half-broken segment that a dialer would block
+		// on indefinitely.
+		if _, hsErr := CreateHandshakeEvents(segmentName); hsErr != nil {
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT},
+				encodeConnectReject(connectReject{
+					message: fmt.Sprintf("create handshake events for %q: %v", segmentName, hsErr),
+					nonce:   connReq.nonce,
+				}))
+			continue
+		}
 		segment.SetServerReadyAndSignal(true)
 
 		// Create rings and events BEFORE sending ACCEPT, so events exist

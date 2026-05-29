@@ -1084,10 +1084,21 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			stream = s
 		} else {
 			t.mu.RLock()
-			var ok bool
-			stream, ok = t.streams[fh.StreamID]
-			if ok {
-				t.streamSlots[streamSlotIdx(fh.StreamID)].Store(stream)
+			s, ok := t.streams[fh.StreamID]
+			if ok && s.getState() != streamDone {
+				// Republish into the slot. Closing path serialises
+				// via t.mu.Lock for delete, so the entry we just
+				// observed cannot disappear while we hold RLock.
+				// The streamDone recheck closes the window in which
+				// closeStream has already transitioned state to
+				// streamDone but has not yet reached t.mu.Lock to
+				// delete: without the recheck we would resurrect a
+				// dead-state stream into the slot AND return it for
+				// dispatch.
+				t.streamSlots[streamSlotIdx(fh.StreamID)].Store(s)
+				stream = s
+			} else {
+				ok = false
 			}
 			t.mu.RUnlock()
 			if !ok {
@@ -2177,6 +2188,14 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, nil
 	}
 
+	// Resolve "is this the last message?" exactly once. Treat a nil
+	// opts the same as opts.Last=false (i.e. MORE on the wire AND
+	// no local state transition). Pre-fix the wire/local split was
+	// inconsistent: nil opts emitted END_STREAM on the wire but kept
+	// local state in streamActive, so a follow-up send would race
+	// with the peer's half-close handling.
+	isLast := opts != nil && opts.Last
+
 	// Set frame flags based on the caller's "last message" signal:
 	//
 	//   - MessageFlagMORE: signals "more frames follow on this stream".
@@ -2188,10 +2207,10 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	//     server-side H2 reader translates END_STREAM back to MORE=0
 	//     so the same handleMessage MORE=0 EOF logic fires.
 	var frameFlags uint8
-	if opts != nil && !opts.Last {
-		frameFlags = MessageFlagMORE
-	} else {
+	if isLast {
 		frameFlags = MessageFlagEndStream
+	} else {
+		frameFlags = MessageFlagMORE
 	}
 	fh := FrameHeader{
 		Type:     FrameTypeMESSAGE,
@@ -2260,7 +2279,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 					return true, err
 				}
 				// ZC succeeded — transition stream state if last.
-				if opts != nil && opts.Last {
+				if isLast {
 					if !s.compareAndSwapState(streamActive, streamWriteDone) {
 						// Race: stream was closed concurrently.
 						// Data is already on the ring which is
@@ -2291,7 +2310,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// upper-layer observes the semantic "I'm done sending" at the
 	// instant writeProto returns. The H2 END_STREAM bit on the
 	// emitted frame is already encoded in fh.Flags.
-	if opts != nil && opts.Last {
+	if isLast {
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
 			return true, errStreamDone
 		}
