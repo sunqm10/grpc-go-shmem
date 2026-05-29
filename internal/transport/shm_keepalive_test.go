@@ -67,7 +67,7 @@ func TestShmKeepaliveClientConfiguration(t *testing.T) {
 	if !clientTransport.kp.PermitWithoutStream {
 		t.Error("Expected PermitWithoutStream=true")
 	}
-	if !clientTransport.keepaliveEnabled {
+	if !clientTransport.keepaliveEnabled.Load() {
 		t.Error("Expected keepaliveEnabled=true since Time != infinity")
 	}
 }
@@ -99,7 +99,7 @@ func TestShmKeepaliveClientDefaults(t *testing.T) {
 		t.Errorf("Expected default Timeout=%v, got %v", defaultClientKeepaliveTimeout, clientTransport.kp.Timeout)
 	}
 	// Time defaults to infinity, so keepalive should be disabled
-	if clientTransport.keepaliveEnabled {
+	if clientTransport.keepaliveEnabled.Load() {
 		t.Error("Expected keepaliveEnabled=false with default Time (infinity)")
 	}
 }

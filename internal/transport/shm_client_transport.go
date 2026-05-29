@@ -213,9 +213,16 @@ type ShmClientTransport struct {
 	readerWG sync.WaitGroup
 
 	// Keepalive
-	lastRead         int64 // Unix nanos; updated atomically on each received frame
-	kp               keepalive.ClientParameters
-	keepaliveEnabled bool
+	lastRead int64 // Unix nanos; updated atomically on each received frame (only when keepaliveEnabled)
+	kp       keepalive.ClientParameters
+	// keepaliveEnabled is set by ConfigureKeepalive (called from the
+	// dialer AFTER NewShmClientTransport has already spawned
+	// processIncomingData). The dispatch loop checks it on every
+	// frame to decide whether to record lastRead. Plain bool would be
+	// a data race on the writer-vs-reader access; atomic.Bool makes
+	// the load free (a single MOV instruction on amd64) compared to
+	// the per-frame time.Now() + atomic.StoreInt64 it gates.
+	keepaliveEnabled atomic.Bool
 	keepaliveDone    chan struct{} // closed when keepalive goroutine exits
 	// kpDormancyCond signals the keepalive goroutine to exit dormant state.
 	// Guarded by mu.
@@ -884,7 +891,7 @@ func (t *ShmClientTransport) ConfigureKeepalive(kp keepalive.ClientParameters) {
 	}
 	t.kp = kp
 	if kp.Time != infinity {
-		t.keepaliveEnabled = true
+		t.keepaliveEnabled.Store(true)
 		go t.keepalive()
 	}
 }
@@ -970,7 +977,19 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		}
 
 		// Update last read timestamp for keepalive tracking.
-		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		// Only the keepalive goroutine reads t.lastRead, and keepalive
+		// is OFF by default (kp.Time = infinity per defaults.go).
+		// When keepalive is OFF the timestamp is never consumed, so
+		// skipping the time.Now() + atomic.StoreInt64 here is pure dead
+		// work removal. Mirrors stock http2_client.go which also gates
+		// this store on keepaliveEnabled. The atomic.Bool field defends
+		// against the dialer setting keepaliveEnabled concurrently with
+		// this reader goroutine (ConfigureKeepalive is called AFTER
+		// NewShmClientTransport spawns the reader; plain-bool access
+		// would race).
+		if t.keepaliveEnabled.Load() {
+			atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		}
 
 		payloadTransferred := false
 		release := func() {
@@ -1323,7 +1342,7 @@ func (t *ShmClientTransport) Close(err error) {
 		t.mu.Unlock()
 
 		// Wait for keepalive goroutine to exit.
-		if t.keepaliveEnabled && t.keepaliveDone != nil {
+		if t.keepaliveEnabled.Load() && t.keepaliveDone != nil {
 			<-t.keepaliveDone
 		}
 
