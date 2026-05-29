@@ -90,6 +90,11 @@ type buffer struct {
 	// The following fields are only set for root buffers.
 	origData *[]byte
 	pool     BufferPool
+
+	// diagOriginPC is the PC of the NewBuffer caller that wrapped this
+	// pool buffer. Used by mem/buffers_diag.go (BENCH_BUFFER_DIAG=1) to
+	// attribute leaks to their allocation site. Zero when diag disabled.
+	diagOriginPC uintptr
 }
 
 func newBuffer() *buffer {
@@ -118,6 +123,9 @@ func NewBuffer(data *[]byte, pool BufferPool) Buffer {
 	b.pool = pool
 	b.rootBuf = b
 	b.refs.Store(1)
+	pc := diagCallerPC()
+	b.diagOriginPC = pc
+	diagOnWrap(pc)
 	return b
 }
 
@@ -150,6 +158,7 @@ func (b *buffer) Ref() {
 	if b.refs.Add(1) <= 1 {
 		panic("Cannot ref freed buffer")
 	}
+	diagOnRef()
 }
 
 func (b *buffer) Free() {
@@ -158,9 +167,11 @@ func (b *buffer) Free() {
 		panic("Cannot free freed buffer")
 	}
 	if refs > 0 {
+		diagOnFreeNonZero()
 		return
 	}
 
+	diagOnFreeZero(b.diagOriginPC)
 	b.data = nil
 	if b.rootBuf == b {
 		// This buffer is the owner of the data slice and its ref count reached
@@ -177,6 +188,7 @@ func (b *buffer) Free() {
 	}
 
 	b.rootBuf = nil
+	b.diagOriginPC = 0
 	bufferObjectPool.Put(b)
 }
 

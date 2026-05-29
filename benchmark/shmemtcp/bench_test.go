@@ -157,6 +157,7 @@ func TestMain(m *testing.M) {
 	// "pool miss rate" puzzle on the Jumbo32 1000-stream × 4 KiB cell.
 	if os.Getenv("BENCH_POOL_DIAG") == "1" {
 		experimental.EnableTightBufferPoolDiag()
+		mem.EnableBufferDiag()
 	}
 
 	sweepStaleShmSegments()
@@ -491,9 +492,13 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	// steady-state bench iterations, then dump at cleanup.
 	if os.Getenv("BENCH_POOL_DIAG") == "1" {
 		experimental.ResetTightBufferPoolDiag()
+		mem.ResetBufferDiag()
 		b.Cleanup(func() {
 			if s := experimental.TightBufferPoolDiagDump(); s != "" {
 				b.Logf("\n--- SHM cell pool diag ---\n%s", s)
+			}
+			if s := mem.BufferDiagDump(); s != "" {
+				b.Logf("\n--- SHM cell buffer diag ---\n%s", s)
 			}
 		})
 	}
