@@ -1521,6 +1521,46 @@ func (w *shmFrameWriter) tryInlineWrite(
 	if w.piggybackWUFn != nil {
 		w.piggybackWUFn(streamPtr.id)
 	}
+	// Piggyback amortization (§7.3 / §7.9 of shm-rfc/C-bench-results.md,
+	// v3 design after v1+v2 regressions). The inline writer just paid
+	// the inlineMu acquire cost — while still holding it, opportunistically
+	// drain up to maxInlinePiggyback frames from the existing w.ch
+	// (NO second queue, NO new mutex, NO new wake mechanism). Reuses the
+	// Go runtime's MPSC-tuned chan as the only producer→writer queue, and
+	// the bound (8) keeps the inlineMu hold from blowing up into a
+	// livelock that starves writeLoop's retryDeferred.
+	//
+	// Wake model: my own emit just fired its single reader-wake immediately
+	// (Reserve/Commit above, no batch wrap), so latency for the calling
+	// stream is unaffected. The drained entries are coalesced inside one
+	// BeginBatch/EndBatch scope so they share a single reader-wake at the
+	// end — same wake economics the writer goroutine would have produced.
+	//
+	// Ordering: chan FIFO preserves the same ordering writeLoop sees, so
+	// nothing new at the protocol layer. The connWUCoalescer used by
+	// writeLoop is intentionally NOT used here — at low concurrency the
+	// drained entries are unlikely to be back-to-back conn WUs (those go
+	// through the lockless WU pending path piggybacked onto outbound
+	// DATA, see piggybackWUFn above); coalescing logic is the writer
+	// goroutine's specialty.
+	const maxInlinePiggyback = 8
+	if len(w.ch) > 0 {
+		w.tx.BeginBatch()
+		for i := 0; i < maxInlinePiggyback; i++ {
+			select {
+			case next, ok := <-w.ch:
+				if !ok {
+					i = maxInlinePiggyback // chan closed mid-drain; stop
+					break
+				}
+				w.processEntry(next)
+				atomic.AddUint64(&shmInlinePiggybackDrain, 1)
+			default:
+				i = maxInlinePiggyback // chan empty; stop
+			}
+		}
+		w.tx.EndBatch()
+	}
 	w.inlineMu.Unlock()
 	atomic.AddUint64(&shmInlineWriteFire, 1)
 	return true, nil

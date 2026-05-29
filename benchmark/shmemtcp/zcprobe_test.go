@@ -116,6 +116,12 @@ func startZCProbe(b *testing.B) func() {
 		report("inline-write-bail-quota/op", delta.InlineWriteBailQuota)
 		report("inline-write-bail-frame/op", delta.InlineWriteBailFrameSize)
 		report("inline-write-bail-zero/op", delta.InlineWriteBailZeroLen)
+		// inline-piggyback-drain/op: frames a tryInlineWrite holder
+		// drained from w.ch (bounded ≤8) before releasing inlineMu.
+		// Amortises writer-goroutine cycles. High at high concurrency
+		// = piggyback working; near-zero at low concurrency = chan
+		// empty (no work to amortise).
+		report("inline-piggyback-drain/op", delta.InlinePiggybackDrain)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)

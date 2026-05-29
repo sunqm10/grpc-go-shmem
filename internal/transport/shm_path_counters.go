@@ -182,6 +182,17 @@ var (
 	// half-close). The channel path's specialised zero-length
 	// MESSAGE handling stays canonical for this rare case.
 	shmInlineWriteBailZeroLen uint64
+
+	// shmInlinePiggybackDrain: count of frames a tryInlineWrite
+	// success-path holder drained from the writer chan (w.ch) BEFORE
+	// releasing inlineMu, amortising the writer-goroutine cycle for
+	// those frames. Bounded at maxInlinePiggyback (8) entries per
+	// inline success. High value at high concurrency = piggyback
+	// working as designed; near-zero at low concurrency = chan was
+	// empty (no work to amortise — which is also expected).
+	// Counter shape: increments by 1 per drained entry, NOT by 1
+	// per inline-write success.
+	shmInlinePiggybackDrain uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -223,6 +234,8 @@ type ShmPathCounters struct {
 	InlineWriteBailQuota         uint64
 	InlineWriteBailFrameSize     uint64
 	InlineWriteBailZeroLen       uint64
+
+	InlinePiggybackDrain uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -261,6 +274,8 @@ func LoadShmPathCounters() ShmPathCounters {
 		InlineWriteBailQuota:         atomic.LoadUint64(&shmInlineWriteBailQuota),
 		InlineWriteBailFrameSize:     atomic.LoadUint64(&shmInlineWriteBailFrameSize),
 		InlineWriteBailZeroLen:       atomic.LoadUint64(&shmInlineWriteBailZeroLen),
+
+		InlinePiggybackDrain: atomic.LoadUint64(&shmInlinePiggybackDrain),
 	}
 }
 
@@ -300,5 +315,7 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		InlineWriteBailQuota:         a.InlineWriteBailQuota - before.InlineWriteBailQuota,
 		InlineWriteBailFrameSize:     a.InlineWriteBailFrameSize - before.InlineWriteBailFrameSize,
 		InlineWriteBailZeroLen:       a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
+
+		InlinePiggybackDrain: a.InlinePiggybackDrain - before.InlinePiggybackDrain,
 	}
 }
