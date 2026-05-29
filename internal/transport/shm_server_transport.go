@@ -1449,17 +1449,30 @@ func (t *ShmServerTransport) Close(err error) {
 		}
 
 		// Snapshot and terminate all active streams.
+		// BUG FIX (GPT-5.5 overnight bug hunt round 3): tombstone each
+		// stream's state to streamDone AND CAS-clear its direct-mapped
+		// slot BEFORE releasing t.mu. Without this, the PR #11
+		// direct-mapped table's fast-path `s.getState() != streamDone`
+		// gate would still accept the stale slot pointer, and any
+		// inbound frame the reader processes after Close emptied
+		// `t.streams` would enqueue ring-backed bytes into the
+		// already-drained recvBuffer — eventual UAF once the segment
+		// unmaps. Pre-PR-#11 the slow path's `t.streams[id]` would
+		// return nil and the dispatch would safely drop the frame.
 		var streams []*ServerStream
 		t.mu.Lock()
 		for _, s := range t.streams {
+			if s == nil {
+				continue
+			}
 			streams = append(streams, s)
+			s.swapState(streamDone)
+			s.pendingWU.Store(0)
+			t.clearStreamSlot(s)
 		}
 		t.streams = make(map[uint32]*ServerStream)
 		t.mu.Unlock()
 		for _, s := range streams {
-			if s == nil {
-				continue
-			}
 			if s.cancel != nil {
 				s.cancel()
 			}
