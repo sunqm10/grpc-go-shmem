@@ -112,8 +112,7 @@ type ShmServerTransport struct {
 	// async-on-CAS-fail PR.
 	connSendQuota atomic.Int64
 
-	connInFlow   trInFlow
-	streamInFlow map[uint32]*inFlow
+	connInFlow trInFlow
 
 	// BDP estimation and dynamic flow control (RFC A73 Phase 5)
 	bdpEst            *shmBDPEstimator
@@ -572,7 +571,6 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		ctx:                ctx,
 		cancel:             cancel,
 		streams:            make(map[uint32]*ServerStream),
-		streamInFlow:       make(map[uint32]*inFlow),
 		errCh:              make(chan struct{}),
 		done:               make(chan struct{}),
 		keepaliveDone:      make(chan struct{}),
@@ -1028,7 +1026,6 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		return nil
 	}
 	t.streams[streamID] = s
-	t.streamInFlow[streamID] = &s.fc
 	// PR #11: publish into direct-mapped slot. Collision policy is
 	// overwrite — the displaced occupant stays fully correct via
 	// the map fallback path in lookupStream.
@@ -1300,7 +1297,6 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, trailers TrailersV1
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
-	delete(t.streamInFlow, streamID)
 	// PR #11: CAS-clear the direct-mapped slot only if it still
 	// points to this stream (a later collision-owner must not be
 	// wiped).
@@ -1350,7 +1346,6 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
-	delete(t.streamInFlow, streamID)
 	// PR #11: CAS-clear the direct-mapped slot only if it still
 	// points to this stream.
 	t.clearStreamSlot(s)
@@ -1870,7 +1865,6 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, s.id)
-	delete(t.streamInFlow, s.id)
 	// PR #11: CAS-clear the direct-mapped slot only if it still
 	// points to this stream.
 	t.clearStreamSlot(s)

@@ -119,7 +119,6 @@ type ShmClientTransport struct {
 	// chunked whole-message path) now also services ZC proto entries
 	// via shmFrameWriter.deferredProto.
 	connSendQuota atomic.Int64
-	streamInFlow          map[uint32]*inFlow
 	connInFlow            trInFlow
 	maxConcurrentStreams  uint32
 	streamQuota           int64
@@ -784,7 +783,6 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		cancel:         cancel,
 		streams:        make(map[uint32]*ClientStream),
 
-		streamInFlow: make(map[uint32]*inFlow),
 		errCh:           make(chan struct{}),
 		goAwayCh:        make(chan struct{}),
 		streamsQuotaAvailable: make(chan struct{}, 1),
@@ -1589,7 +1587,6 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 		// map. The Stream zero-value starts at 0, so we Store the
 		// initial window here.
 		s.sendQuota.Store(streamWindow)
-		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
 			case t.streamsQuotaAvailable <- struct{}{}:
@@ -2006,7 +2003,6 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	case t.frameWriter.wuRetryWake <- struct{}{}:
 	default:
 	}
-	delete(t.streamInFlow, s.id)
 	t.streamQuota++
 	if t.streamQuota > 0 && t.waitingStreams > 0 {
 		select {
