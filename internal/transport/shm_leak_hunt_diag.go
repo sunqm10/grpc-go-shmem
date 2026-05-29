@@ -59,7 +59,24 @@ var (
 	// taken, no writer Free needed — caller's Free brings refcount
 	// to 0).
 	shmLeakHuntTryInlineHandled uint64
+
+	// ShmLeakHuntCallerFreeWired is incremented from upper-layer
+	// (stream.go / server.go) right after the unconditional caller-
+	// side Free of the channel-path marshal'd buffer. Exposed as a
+	// public accessor so the upper layer (which cannot import
+	// internal/transport directly via the package path used by
+	// google.golang.org/grpc itself) can bump it without an import
+	// cycle. Bumped via IncShmLeakHuntCallerFree.
+	shmLeakHuntCallerFree uint64
 )
+
+// IncShmLeakHuntCallerFree is a public symbol used by stream.go's
+// ZC fast path cleanup to record whether encData.Free was actually
+// invoked. If shmLeakHuntCallerFree != marshalWithPool wraps, the
+// caller-side cleanup is being skipped somehow.
+func IncShmLeakHuntCallerFree() {
+	atomic.AddUint64(&shmLeakHuntCallerFree, 1)
+}
 
 // ResetShmLeakHuntCounters zeros all counters.
 func ResetShmLeakHuntCounters() {
@@ -68,6 +85,7 @@ func ResetShmLeakHuntCounters() {
 	atomic.StoreUint64(&shmLeakHuntWriterDirectFree, 0)
 	atomic.StoreUint64(&shmLeakHuntEnqueueRollback, 0)
 	atomic.StoreUint64(&shmLeakHuntTryInlineHandled, 0)
+	atomic.StoreUint64(&shmLeakHuntCallerFree, 0)
 }
 
 // DumpShmLeakHuntCounters returns a human-readable snapshot.
@@ -77,6 +95,7 @@ func DumpShmLeakHuntCounters() string {
 	directFree := atomic.LoadUint64(&shmLeakHuntWriterDirectFree)
 	rollback := atomic.LoadUint64(&shmLeakHuntEnqueueRollback)
 	inline := atomic.LoadUint64(&shmLeakHuntTryInlineHandled)
+	callerFree := atomic.LoadUint64(&shmLeakHuntCallerFree)
 	return fmt.Sprintf(
 		"shm leak-hunt counters:\n"+
 			"  enqueueMessageAndWait Ref:     %12d  (channel-path data.Ref)\n"+
@@ -84,9 +103,10 @@ func DumpShmLeakHuntCounters() string {
 			"  writer d.release:              %12d  (advanceDeferred + processWholeMessage + drain)\n"+
 			"  writer direct Free:            %12d  (processWholeMessage misuse/zero-len)\n"+
 			"  tryInlineWrite handled:        %12d  (no Ref, no writer Free — caller owns lifecycle)\n"+
+			"  caller encData.Free (stream.go):%11d  (after withRetry — should match wraps if it fires)\n"+
 			"  invariant: Ref - rollback == d.release\n"+
 			"             diff = %d (>0 means writer is losing %d Frees)\n",
-		ref, rollback, rel, directFree, inline,
+		ref, rollback, rel, directFree, inline, callerFree,
 		int64(ref-rollback)-int64(rel),
 		int64(ref-rollback)-int64(rel),
 	)

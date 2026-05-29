@@ -1069,6 +1069,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 			// the bail path on some attempt.
 			if encData != nil {
 				encData.Free()
+				transport.IncShmLeakHuntCallerFree()
 			}
 			if encPf.isCompressed() && encPayload != nil {
 				encPayload.Free()
@@ -1112,6 +1113,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 
 	defer func() {
 		data.Free()
+		transport.IncShmLeakHuntCallerFree()
 		// only free payload if compression was made, and therefore it is a different set
 		// of buffers from data.
 		if pf.isCompressed() {
@@ -1949,6 +1951,7 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 
 	defer func() {
 		data.Free()
+		transport.IncShmLeakHuntCallerFree()
 		// only free payload if compression was made, and therefore it is a different set
 		// of buffers from data.
 		if pf.isCompressed() {
