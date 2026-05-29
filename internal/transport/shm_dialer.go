@@ -148,8 +148,21 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlSeg.RegisterRing(ctlRx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
-	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
-	ctlRxEvents, _ := OpenRingEvents(ctlName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): propagate Windows event
+	// open failures instead of silently dropping them; otherwise a
+	// failed open turns into a cross-process hang on the very first
+	// control-frame exchange.
+	ctlTxEvents, ctlTxErr := OpenRingEvents(ctlName, "A")
+	if ctlTxErr != nil {
+		return nil, fmt.Errorf("open control ring A events for %q: %w", ctlName, ctlTxErr)
+	}
+	ctlRxEvents, ctlRxErr := OpenRingEvents(ctlName, "B")
+	if ctlRxErr != nil {
+		if ctlTxEvents != nil {
+			ctlTxEvents.Close()
+		}
+		return nil, fmt.Errorf("open control ring B events for %q: %w", ctlName, ctlRxErr)
+	}
 	defer func() {
 		if ctlTxEvents != nil {
 			ctlTxEvents.Close()
@@ -307,8 +320,24 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// references whether the handshake succeeds or fails.
 			// Otherwise every secured Windows dial leaks one handle
 			// per direction.
-			txEvents, _ := OpenRingEvents(segName, "A")
-			rxEvents, _ := OpenRingEvents(segName, "B")
+			//
+			// BUG FIX (GPT-5.5 overnight bug hunt): propagate Windows
+			// event open failures instead of silently dropping them;
+			// a failed open + handshake attempt would otherwise sit
+			// in a cross-process wait forever.
+			txEvents, txErr := OpenRingEvents(segName, "A")
+			if txErr != nil {
+				segment.Close()
+				return nil, NewShmErrorWithCause(ShmErrUnknown, "open handshake ring A events", txErr)
+			}
+			rxEvents, rxErr := OpenRingEvents(segName, "B")
+			if rxErr != nil {
+				if txEvents != nil {
+					txEvents.Close()
+				}
+				segment.Close()
+				return nil, NewShmErrorWithCause(ShmErrUnknown, "open handshake ring B events", rxErr)
+			}
 			txRing.SetEvents(txEvents)
 			rxRing.SetEvents(rxEvents)
 

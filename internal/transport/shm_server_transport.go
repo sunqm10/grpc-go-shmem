@@ -556,8 +556,21 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 	// Create events for cross-mapping synchronization (Windows).
 	// Server creates events. On Linux, these are no-ops returning nil events.
-	readEvents, _ := CreateRingEvents(segmentName, "A")
-	writeEvents, _ := CreateRingEvents(segmentName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): previously errors were
+	// silently dropped; on Windows that turned a failed event create
+	// into a cross-process hang (nil events -> in-process
+	// WaitOnAddress fallback that does not cross processes).
+	readEvents, rerr := CreateRingEvents(segmentName, "A")
+	if rerr != nil {
+		return nil, fmt.Errorf("create ring A events for %q: %w", segmentName, rerr)
+	}
+	writeEvents, werr := CreateRingEvents(segmentName, "B")
+	if werr != nil {
+		if readEvents != nil {
+			readEvents.Close()
+		}
+		return nil, fmt.Errorf("create ring B events for %q: %w", segmentName, werr)
+	}
 
 	// Attach events to rings
 	clientToServer.SetEvents(readEvents)

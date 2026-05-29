@@ -200,8 +200,25 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	ctlSeg.RegisterRing(l.ctlTx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
-	l.ctlRxEvents, _ = CreateRingEvents(ctlEventName, "A")
-	l.ctlTxEvents, _ = CreateRingEvents(ctlEventName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): propagate errors so a
+	// failed Windows event create surfaces as a listener-create
+	// failure instead of a silent cross-process hang at first accept.
+	var evErr error
+	l.ctlRxEvents, evErr = CreateRingEvents(ctlEventName, "A")
+	if evErr != nil {
+		cancel()
+		ctlSeg.Close()
+		return nil, fmt.Errorf("create control ring A events for %q: %w", ctlEventName, evErr)
+	}
+	l.ctlTxEvents, evErr = CreateRingEvents(ctlEventName, "B")
+	if evErr != nil {
+		if l.ctlRxEvents != nil {
+			l.ctlRxEvents.Close()
+		}
+		cancel()
+		ctlSeg.Close()
+		return nil, fmt.Errorf("create control ring B events for %q: %w", ctlEventName, evErr)
+	}
 
 	// Attach events to control rings
 	l.ctlRx.SetEvents(l.ctlRxEvents)
@@ -315,8 +332,26 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		// Create events for this segment. On Linux, these are no-ops.
 		// Must happen before ACCEPT so client's OpenRingEvents finds them.
-		readEvents, _ := CreateRingEvents(segmentName, "A")
-		writeEvents, _ := CreateRingEvents(segmentName, "B")
+		// BUG FIX (GPT-5.5 overnight bug hunt): propagate errors so a
+		// Windows event create failure aborts the accept instead of
+		// silently producing a half-broken connection.
+		readEvents, readErr := CreateRingEvents(segmentName, "A")
+		if readErr != nil {
+			CloseHandshakeEvents(segmentName)
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			return nil, fmt.Errorf("create data ring A events for %q: %w", segmentName, readErr)
+		}
+		writeEvents, writeErr := CreateRingEvents(segmentName, "B")
+		if writeErr != nil {
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			CloseHandshakeEvents(segmentName)
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			return nil, fmt.Errorf("create data ring B events for %q: %w", segmentName, writeErr)
+		}
 
 		// Attach events to rings
 		readRing.SetEvents(readEvents)
