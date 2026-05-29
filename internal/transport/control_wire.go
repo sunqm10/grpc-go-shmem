@@ -30,19 +30,24 @@ import (
 const (
 	shmControlSuffix = "_ctl"
 	// controlWireVersion is the version byte emitted at the start of
-	// every control-plane frame. v3 appends an 8-byte per-request nonce
-	// to CONNECT, echoed unchanged in ACCEPT and REJECT. The dialer
-	// correlates each response to its in-flight CONNECT by nonce so a
-	// stale ACCEPT/REJECT left on the shared Ring B by a previously
-	// timed-out dialer cannot be mis-consumed (which would otherwise
-	// bind a connection with the wrong peer's singleStreamMode flag).
+	// every control-plane frame. While the gRFC and both reference
+	// implementations remain pre-release, the wire layout is allowed to
+	// evolve freely and this byte is held at 1: mismatched-version
+	// peers are hard-rejected at the handshake boundary, which is the
+	// only behaviour we need during development. Version bumps are
+	// reserved for post-release wire-format evolution.
 	//
-	// v2 added the CONNECT Flags byte and the echoed ACCEPT Flags byte;
-	// v3 keeps those and appends the nonce after the existing trailing
-	// fields. Mismatched-version peers are rejected at the handshake
-	// boundary. The grpc-go and grpc-dotnet implementations are still
-	// pre-1.0 so a breaking wire change is acceptable.
-	controlWireVersion = uint8(3)
+	// Current v1 layout (subject to change before the gRFC is ratified):
+	//   - CONNECT carries a Flags byte and an 8-byte per-request
+	//     correlation nonce.
+	//   - ACCEPT carries a reserved Flags byte and echoes the nonce.
+	//   - REJECT echoes the nonce (or zero when CONNECT could not be
+	//     decoded).
+	// The nonce closes the CONNECT/ACCEPT misbinding race in which a
+	// stale response left on the shared Ring B by a previously
+	// timed-out dialer could otherwise be mis-consumed by the next
+	// dialer (binding it with the wrong peer's singleStreamMode flag).
+	controlWireVersion = uint8(1)
 
 	// wireFormatH2 is the on-wire byte for the HTTP/2 data plane.
 	// Matches grpc-dotnet-shm's ControlWire.ProtocolWireHttp2. The
@@ -101,7 +106,7 @@ func encodeConnectRequest(req connectRequest) []byte {
 	//   + wireFormatCount(1) + wireFormat(1) + nonce(8)
 	//
 	// The wire-format bytes (count=1, format=H2) are mandatory; the
-	// trailing 8-byte nonce (v3) correlates the server's ACCEPT/REJECT
+	// trailing 8-byte nonce correlates the server's ACCEPT/REJECT
 	// back to this exact CONNECT.
 	b := make([]byte, 1+8+8+1+1+1+8)
 	b[0] = controlWireVersion
@@ -167,10 +172,10 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 			"connect request does not advertise HTTP/2; legacy Custom16-only peers are not supported")
 	}
 
-	// Nonce (v3): mandatory 8 bytes after the wire-format advertisement.
+	// Nonce: mandatory 8 bytes after the wire-format advertisement.
 	nonceOff := 19 + count
 	if len(b) < nonceOff+8 {
-		return connectRequest{}, errors.New("connect request missing v3 correlation nonce")
+		return connectRequest{}, errors.New("connect request missing correlation nonce")
 	}
 	req.nonce = binary.LittleEndian.Uint64(b[nonceOff : nonceOff+8])
 	return req, nil
@@ -181,7 +186,7 @@ func encodeConnectResponse(resp connectResponse) []byte {
 	// version(1) + nameLen(4) + name(N) + selectedWire(1)=H2
 	//   + flags(1) + nonce(8).
 	//
-	// Flags is reserved (always zero). The trailing 8-byte nonce (v3)
+	// Flags is reserved (always zero). The trailing 8-byte nonce
 	// echoes the CONNECT nonce so the dialer can confirm this ACCEPT
 	// answers its own in-flight request.
 	b := make([]byte, 1+4+len(name)+1+1+8)
@@ -217,15 +222,15 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 			"connect response selects wire format 0x%02x, expected HTTP/2 (0x%02x)",
 			selected, wireFormatH2)
 	}
-	// Flags byte is mandatory in v3.
+	// Flags byte is mandatory.
 	if len(b) <= 5+nameLen+1 {
 		return connectResponse{}, errors.New(
-			"connect response missing flags byte; v3 servers MUST include the reserved flags byte")
+			"connect response missing flags byte; server MUST include the reserved flags byte")
 	}
-	// Nonce (v3): mandatory 8 bytes after the flags byte.
+	// Nonce: mandatory 8 bytes after the flags byte.
 	nonceOff := 5 + nameLen + 2
 	if len(b) < nonceOff+8 {
-		return connectResponse{}, errors.New("connect response missing v3 correlation nonce")
+		return connectResponse{}, errors.New("connect response missing correlation nonce")
 	}
 	return connectResponse{
 		segmentName: string(b[5 : 5+nameLen]),
@@ -236,9 +241,9 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 func encodeConnectReject(r connectReject) []byte {
 	msg := []byte(r.message)
 	// version(1) + msgLen(4) + msg(N) + nonce(8). The trailing nonce
-	// (v3) echoes the CONNECT nonce so the dialer can correlate the
-	// REJECT to its own request. When the server could not decode the
-	// CONNECT (and thus has no nonce) it echoes zero.
+	// echoes the CONNECT nonce so the dialer can correlate the REJECT
+	// to its own request. When the server could not decode the CONNECT
+	// (and thus has no nonce) it echoes zero.
 	b := make([]byte, 1+4+len(msg)+8)
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint32(b[1:5], uint32(len(msg)))
@@ -260,7 +265,7 @@ func decodeConnectReject(b []byte) (connectReject, error) {
 	}
 	nonceOff := 5 + msgLen
 	if len(b) < nonceOff+8 {
-		return connectReject{}, errors.New("connect reject missing v3 correlation nonce")
+		return connectReject{}, errors.New("connect reject missing correlation nonce")
 	}
 	return connectReject{
 		message: string(b[5 : 5+msgLen]),
