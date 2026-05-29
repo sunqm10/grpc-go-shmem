@@ -199,10 +199,24 @@ type deferredMessage struct {
 	ctx       context.Context
 	streamPtr *Stream
 	fh        FrameHeader
-	cur       *vecCursor
+	cur       vecCursor // embedded by value (was *vecCursor) — see Stream.shmDeferred
 	remaining int
 	isLast    bool
 	doneCh    chan error
+}
+
+// release frees the BufferSlice ref AND nulls the cur slices so that
+// the underlying *mem.Buffer pointers and lpmHdr byte slice can be
+// reclaimed by GC. Used by every terminal path in advanceDeferred /
+// processWholeMessage / close-drain. Equivalent to the old
+// `d.cur.data.Free()` plus explicit cleanup needed for the inline-
+// embedded shmDeferred slot (PR-B): without nulling, the next SendMsg
+// on this stream would inherit stale BufferSlice/lpmHdr pointers
+// pinning pooled buffers in the GC's view.
+func (d *deferredMessage) release() {
+	d.cur.data.Free()
+	d.cur.data = nil
+	d.cur.lpmHdr = nil
 }
 
 // frameEntry represents a single frame to be written to the ring.
@@ -814,16 +828,21 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		entry.data.Free()
 		return
 	}
-	cur := &vecCursor{lpmHdr: entry.hdr, data: entry.data}
-	d := &deferredMessage{
-		ctx:       entry.ctx,
-		streamPtr: entry.streamPtr,
-		fh:        entry.fh,
-		cur:       cur,
-		remaining: payloadLen,
-		isLast:    entry.isLast,
-		doneCh:    entry.doneCh,
-	}
+	// PR-B: reuse Stream's inline-allocated deferred slot instead of
+	// fresh heap alloc. gRPC's one-SendMsg-per-stream invariant
+	// guarantees s.shmDeferred is not currently held by another
+	// in-flight Send (any previous SendMsg has already signalled
+	// its doneCh and the caller-blocking sender returned, releasing
+	// the slot back to us logically). The writer's
+	// w.deferred[streamID] map still owns the lifecycle pointer.
+	d := &entry.streamPtr.shmDeferred
+	d.ctx = entry.ctx
+	d.streamPtr = entry.streamPtr
+	d.fh = entry.fh
+	d.cur = vecCursor{lpmHdr: entry.hdr, data: entry.data}
+	d.remaining = payloadLen
+	d.isLast = entry.isLast
+	d.doneCh = entry.doneCh
 	// Per-stream FIFO vs the async ZC proto path. If this stream
 	// already has deferred proto entries waiting on FC, the chan
 	// arrival order put those entries BEFORE this whole-message
@@ -873,7 +892,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			}
 			delete(w.deferred, streamID)
 			// Balance the Ref taken in enqueueMessageAndWait.
-			d.cur.data.Free()
+			d.release()
 			return
 		}
 		// Observe ctx cancellation — the sender goroutine in
@@ -889,7 +908,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			}
 			delete(w.deferred, streamID)
 			// Balance the Ref taken in enqueueMessageAndWait.
-			d.cur.data.Free()
+			d.release()
 			return
 		}
 		streamQ := d.streamPtr.sendQuota.Load()
@@ -949,7 +968,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			fh.Flags = MessageFlagMORE
 		}
 		_, h2f := translateCustomToH2(fh)
-		committed, err := emitH2DataFromCursor(d.ctx, w.tx, streamID, d.cur, int(grant), h2f)
+		committed, err := emitH2DataFromCursor(d.ctx, w.tx, streamID, &d.cur, int(grant), h2f)
 		if err != nil {
 			// Partial-commit-aware refund. emitH2DataFromCursor may
 			// have committed `committed` bytes to the ring BEFORE
@@ -967,7 +986,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			d.doneCh <- err
 			delete(w.deferred, streamID)
 			// Balance the Ref taken in enqueueMessageAndWait.
-			d.cur.data.Free()
+			d.release()
 			return
 		}
 		d.remaining -= int(grant)
@@ -979,7 +998,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 	d.doneCh <- nil
 	delete(w.deferred, streamID)
 	// Balance the Ref taken in enqueueMessageAndWait.
-	d.cur.data.Free()
+	d.release()
 }
 
 // retryDeferred is called by the writeLoop on every wuRetryWake.
@@ -1499,7 +1518,16 @@ func (w *shmFrameWriter) tryInlineWrite(
 		fh.Flags = MessageFlagMORE
 	}
 	_, h2f := translateCustomToH2(fh)
-	cur := &vecCursor{lpmHdr: hdr, data: data}
+	// PR-B: reuse the Stream's inline-allocated shmDeferred.cur slot
+	// as scratch instead of fresh heap alloc. tryInlineWrite's
+	// post-lock check (`len(w.deferred) > 0` → bail) guarantees no
+	// in-flight whole-msg owns shmDeferred right now, and inlineMu
+	// serialises with the writer-goroutine drain path. After the
+	// emit, we clear cur.data/lpmHdr to drop the BufferSlice ref
+	// (sender's outer scope still holds it for the synchronous
+	// inline path — see enqueueMessageAndWait — so no Free here).
+	cur := &streamPtr.shmDeferred.cur
+	*cur = vecCursor{lpmHdr: hdr, data: data}
 	if committed, emitErr := emitH2DataFromCursor(ctx, w.tx, streamPtr.id, cur, payloadLen, h2f); emitErr != nil {
 		// Partial-commit-aware refund. When shmMaxFrameSize exceeds
 		// h2MaxFramePayload (e.g. shm-tuned mode), emitH2DataFromCursor
@@ -1513,6 +1541,11 @@ func (w *shmFrameWriter) tryInlineWrite(
 			streamPtr.sendQuota.Add(refund)
 			w.connQuota.Add(refund)
 		}
+		// Clear scratch refs so a subsequent SendMsg on this stream
+		// doesn't inherit stale BufferSlice / lpmHdr pinning pooled
+		// buffers in the GC's view.
+		cur.data = nil
+		cur.lpmHdr = nil
 		w.inlineMu.Unlock()
 		// Return handled=true so the caller does NOT fall back to
 		// the channel path (the message has terminally failed).
@@ -1521,6 +1554,9 @@ func (w *shmFrameWriter) tryInlineWrite(
 	if w.piggybackWUFn != nil {
 		w.piggybackWUFn(streamPtr.id)
 	}
+	// Clear scratch refs (success path) — same rationale as above.
+	cur.data = nil
+	cur.lpmHdr = nil
 	// Piggyback amortization (§7.3 / §7.9 of shm-rfc/C-bench-results.md,
 	// v3 design after v1+v2 regressions). The inline writer just paid
 	// the inlineMu acquire cost — while still holding it, opportunistically
@@ -1721,7 +1757,7 @@ func (w *shmFrameWriter) close() {
 		}
 		delete(w.deferred, sid)
 		// Balance the Ref taken in enqueueMessageAndWait.
-		d.cur.data.Free()
+		d.release()
 	}
 	// Drain any ZC proto entries still pending in the deferredProto
 	// map. Senders for these returned success at enqueue time (the

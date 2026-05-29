@@ -371,6 +371,32 @@ type Stream struct {
 	// Unused (and remains false) for the stock TCP/UDS transports.
 	pendingWUDirty atomic.Bool
 
+	// shmDeferred is the inline-allocated state for an in-flight
+	// whole-message DATA emit on the SHM transport. gRPC's stream
+	// contract enforces one SendMsg at a time per stream per
+	// direction, so a single slot per Stream suffices (the
+	// "at-most-one-whole-message-per-stream" invariant).
+	//
+	// `shmFrameWriter.processWholeMessage` populates this slot and
+	// installs `&s.shmDeferred` in `shmFrameWriter.deferred` map.
+	// `shmFrameWriter.tryInlineWrite` reuses `shmDeferred.cur` as
+	// scratch (writer-goroutine-mutually-exclusive via post-lock
+	// `len(w.deferred) > 0` check).
+	//
+	// Embedding by value avoids ~8M sync.Pool/heap allocs/sec at
+	// Jumbo32 1000/4K (~12% of all allocs in profile 2026-05-29).
+	// Cost: ~80 bytes/Stream. Trivial.
+	//
+	// On terminal paths (success, error, ctx-done, stream-done,
+	// transport close), the writer goroutine clears
+	// `shmDeferred.cur.data` and `shmDeferred.cur.lpmHdr` to nil
+	// after `Free()` so the GC can release the underlying mem.Buffer
+	// pointers. The rest of the struct stays allocated for the next
+	// SendMsg's reuse.
+	//
+	// Unused (zero-valued) on TCP/UDS transports.
+	shmDeferred deferredMessage
+
 	// connWaiterElem is retained for binary-compat with stream.go's
 	// general Stream layout (used by other transports if they ever
 	// add similar machinery). The SHM transport's legacy connWaiters
