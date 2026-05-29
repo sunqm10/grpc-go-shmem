@@ -117,13 +117,15 @@ func (f *trInFlow) newLimit(n uint32) uint32 {
 // effectiveWindowSize counter.
 func (f *trInFlow) onData(n uint32) uint32 {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.unacked += n
 	if f.unacked < f.limit/4 {
 		f.updateEffectiveWindowSizeLocked()
+		f.mu.Unlock()
 		return 0
 	}
-	return f.resetLocked()
+	r := f.resetLocked()
+	f.mu.Unlock()
+	return r
 }
 
 // reset returns the current unacked bytes and zeroes the counter.
@@ -264,12 +266,12 @@ func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 		n = uint32(math.MaxInt32)
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	// avail is the remaining receive capacity within current
 	// enforcement bounds: limit + delta - (pendingData + pendingUpdate).
 	avail := int64(f.limit) + int64(f.delta) - int64(f.pendingData) - int64(f.pendingUpdate)
 	need := int64(n) - avail
 	if need <= 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	// Cap so f.limit + f.delta does not exceed HTTP/2 31-bit window.
@@ -278,23 +280,26 @@ func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 		need = headroom
 	}
 	if need <= 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	f.delta += uint32(need)
+	f.mu.Unlock()
 	return uint32(need)
 }
 
 // onData is invoked when some data frame is received. It updates pendingData.
 func (f *inFlow) onData(n uint32) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.pendingData += n
 	if f.pendingData+f.pendingUpdate > f.limit+f.delta {
 		limit := f.limit
 		rcvd := f.pendingData + f.pendingUpdate
+		f.mu.Unlock()
 		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", rcvd, limit)
 	}
+	f.mu.Unlock()
 	return nil
 }
 
@@ -302,9 +307,9 @@ func (f *inFlow) onData(n uint32) error {
 // to be sent to the peer.
 func (f *inFlow) onRead(n uint32) uint32 {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	if f.pendingData == 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	f.pendingData -= n
@@ -319,7 +324,9 @@ func (f *inFlow) onRead(n uint32) uint32 {
 	if f.pendingUpdate >= f.limit/4 {
 		wu := f.pendingUpdate
 		f.pendingUpdate = 0
+		f.mu.Unlock()
 		return wu
 	}
+	f.mu.Unlock()
 	return 0
 }

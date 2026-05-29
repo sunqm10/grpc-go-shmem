@@ -1497,11 +1497,12 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 // Returns false if the writer has been closed.
 func (w *shmFrameWriter) trySend(entry frameEntry) bool {
 	w.closeMu.RLock()
-	defer w.closeMu.RUnlock()
 	if w.closed.Load() {
+		w.closeMu.RUnlock()
 		return false
 	}
 	w.ch <- entry
+	w.closeMu.RUnlock()
 	return true
 }
 
@@ -1639,14 +1640,16 @@ func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 // deadlock if the channel is full (writer goroutine stuck on ring write).
 func (w *shmFrameWriter) tryEnqueueNonBlocking(entry frameEntry) bool {
 	w.closeMu.RLock()
-	defer w.closeMu.RUnlock()
 	if w.closed.Load() {
+		w.closeMu.RUnlock()
 		return false
 	}
 	select {
 	case w.ch <- entry:
+		w.closeMu.RUnlock()
 		return true
 	default:
+		w.closeMu.RUnlock()
 		return false
 	}
 }
@@ -1654,9 +1657,9 @@ func (w *shmFrameWriter) tryEnqueueNonBlocking(entry frameEntry) bool {
 // enqueue submits a frame for asynchronous writing. Returns ErrConnClosing
 // if the writer has been closed or is racing with close.
 func (w *shmFrameWriter) enqueue(entry frameEntry) error {
-	if w.closed.Load() {
-		return ErrConnClosing
-	}
+	// trySend re-checks `w.closed` under closeMu.RLock (the authoritative
+	// close-race gate). Skipping the duplicate fast-path load here is
+	// equivalent and avoids one atomic load per enqueue.
 	if !w.trySend(entry) {
 		return ErrConnClosing
 	}
