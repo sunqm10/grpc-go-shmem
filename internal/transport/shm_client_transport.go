@@ -212,8 +212,22 @@ type ShmClientTransport struct {
 	readerWG sync.WaitGroup
 
 	// Keepalive
-	lastRead int64 // Unix nanos; updated atomically on each received frame (only when keepaliveEnabled)
-	kp       keepalive.ClientParameters
+	// lastReadTick is incremented atomically on every received frame
+	// (including PONG) so the keepalive goroutine can detect activity
+	// by comparing the counter to its previous snapshot. Replacing the
+	// previous nanosecond-timestamp approach saves a per-frame
+	// time.Now() syscall + atomic.StoreInt64; the only loss is the
+	// sub-tick-interval precision optimization (next kpTimer reset is
+	// just kp.Time after the check, vs kp.Time after the actual
+	// last activity). At default kp.Time = infinity on the client
+	// (keepalive goroutine not even started), and 2h on the server,
+	// the loss is negligible.
+	//
+	// Increment is gated on keepaliveEnabled in the dispatch loop;
+	// when keepalive is OFF (the default), even this cheap atomic.Add
+	// is skipped — the consumer goroutine doesn't exist.
+	lastReadTick atomic.Uint64
+	kp           keepalive.ClientParameters
 	// keepaliveEnabled is set by ConfigureKeepalive (called from the
 	// dialer AFTER NewShmClientTransport has already spawned
 	// processIncomingData). The dispatch loop checks it on every
@@ -978,19 +992,19 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 		}
 
-		// Update last read timestamp for keepalive tracking.
-		// Only the keepalive goroutine reads t.lastRead, and keepalive
+		// Update last read tick for keepalive tracking.
+		// Only the keepalive goroutine reads t.lastReadTick, and keepalive
 		// is OFF by default (kp.Time = infinity per defaults.go).
-		// When keepalive is OFF the timestamp is never consumed, so
-		// skipping the time.Now() + atomic.StoreInt64 here is pure dead
-		// work removal. Mirrors stock http2_client.go which also gates
-		// this store on keepaliveEnabled. The atomic.Bool field defends
+		// When keepalive is OFF the counter is never consumed, so
+		// skipping the atomic.Add here is pure dead-work removal.
+		// Mirrors stock http2_client.go which also gates lastRead
+		// tracking on keepaliveEnabled. The atomic.Bool field defends
 		// against the dialer setting keepaliveEnabled concurrently with
 		// this reader goroutine (ConfigureKeepalive is called AFTER
 		// NewShmClientTransport spawns the reader; plain-bool access
 		// would race).
 		if t.keepaliveEnabled.Load() {
-			atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+			t.lastReadTick.Add(1)
 		}
 
 		payloadTransferred := false
@@ -2349,21 +2363,28 @@ func (t *ShmClientTransport) keepalive() {
 	// Amount of time remaining before which we should receive an ACK for the
 	// last sent ping.
 	timeoutLeft := time.Duration(0)
-	// Records the last value of t.lastRead before we go block on the timer.
-	prevNano := time.Now().UnixNano()
+	// Records the last value of t.lastReadTick before we go block on
+	// the timer.
+	prevTick := t.lastReadTick.Load()
 	timer := time.NewTimer(t.kp.Time)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-timer.C:
-			lastRead := atomic.LoadInt64(&t.lastRead)
-			if lastRead > prevNano {
+			curTick := t.lastReadTick.Load()
+			if curTick != prevTick {
 				// There has been read activity since the last time we were here.
 				outstandingPing = false
-				// Next timer should fire at kp.Time seconds from lastRead time.
-				timer.Reset(time.Duration(lastRead) + t.kp.Time - time.Duration(time.Now().UnixNano()))
-				prevNano = lastRead
+				// Reset to kp.Time from now. The old code reset to
+				// "kp.Time after the exact last activity" using a
+				// nanosecond timestamp; the tick-counter approach
+				// loses that sub-interval precision but at default
+				// client kp.Time = infinity (this goroutine wouldn't
+				// even run) and any reasonable configured kp.Time the
+				// extra check is at worst one tick-interval late.
+				timer.Reset(t.kp.Time)
+				prevTick = curTick
 				continue
 			}
 			if outstandingPing && timeoutLeft <= 0 {

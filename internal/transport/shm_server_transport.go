@@ -152,7 +152,17 @@ type ShmServerTransport struct {
 	readerWG sync.WaitGroup
 
 	// Keepalive
-	lastRead      int64 // Unix nanos; updated atomically on each received frame
+	// lastReadTick is incremented atomically on every received frame
+	// (including PONG) so the keepalive goroutine can detect activity
+	// by comparing the counter to its previous snapshot. Replaces the
+	// per-frame time.Now() + atomic.StoreInt64 nanosecond timestamp
+	// previously used; saves a vDSO syscall per inbound frame on the
+	// server hot path. The keepalive goroutine resets its timer to a
+	// flat kp.Time instead of "kp.Time after the exact last activity"
+	// — at default kp.Time = 2h the loss of sub-tick-interval
+	// precision is negligible. NOT gated on keepaliveEnabled (server
+	// keepalive is unconditional).
+	lastReadTick  atomic.Uint64
 	kp            keepalive.ServerParameters
 	kep           keepalive.EnforcementPolicy
 	keepaliveDone chan struct{} // closed when keepalive goroutine exits
@@ -736,8 +746,10 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 		}
 
-		// Update last read timestamp for keepalive tracking.
-		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		// Update last read tick for keepalive tracking. Cheap atomic
+		// increment per frame; the keepalive goroutine reads the
+		// counter on its kp.Time tick (default 2h).
+		t.lastReadTick.Add(1)
 
 		payloadTransferred := false
 		release := func() {
@@ -2084,8 +2096,9 @@ func (t *ShmServerTransport) keepalive() {
 	// Amount of time remaining before which we should receive an ACK for the
 	// last sent ping.
 	kpTimeoutLeft := time.Duration(0)
-	// Records the last value of t.lastRead before we go block on the timer.
-	prevNano := time.Now().UnixNano()
+	// Records the last value of t.lastReadTick before we go block on
+	// the timer.
+	prevTick := t.lastReadTick.Load()
 
 	idleTimer := time.NewTimer(t.kp.MaxConnectionIdle)
 	ageTimer := time.NewTimer(t.kp.MaxConnectionAge)
@@ -2127,12 +2140,14 @@ func (t *ShmServerTransport) keepalive() {
 			}
 			return
 		case <-kpTimer.C:
-			lastRead := atomic.LoadInt64(&t.lastRead)
-			if lastRead > prevNano {
+			curTick := t.lastReadTick.Load()
+			if curTick != prevTick {
 				// There has been read activity.
 				outstandingPing = false
-				kpTimer.Reset(time.Duration(lastRead) + t.kp.Time - time.Duration(time.Now().UnixNano()))
-				prevNano = lastRead
+				// Reset to kp.Time from now (same simplification as the
+				// client; precision loss is at most one tick-interval).
+				kpTimer.Reset(t.kp.Time)
+				prevTick = curTick
 				continue
 			}
 			if outstandingPing && kpTimeoutLeft <= 0 {

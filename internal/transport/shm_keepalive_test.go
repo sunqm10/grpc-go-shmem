@@ -22,7 +22,6 @@ package transport
 
 import (
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,18 +249,18 @@ func TestShmClientLastReadUpdated(t *testing.T) {
 	}
 	defer clientTransport.Close(nil)
 
-	// Verify lastRead starts at 0
-	initialLastRead := atomic.LoadInt64(&clientTransport.lastRead)
-	if initialLastRead != 0 {
-		t.Fatalf("Expected initial lastRead=0, got %d", initialLastRead)
+	// Verify lastReadTick starts at 0
+	initial := clientTransport.lastReadTick.Load()
+	if initial != 0 {
+		t.Fatalf("Expected initial lastReadTick=0, got %d", initial)
 	}
 
-	// Simulate updating lastRead (as would happen when processing incoming data)
-	nowNano := time.Now().UnixNano()
-	atomic.StoreInt64(&clientTransport.lastRead, nowNano)
+	// Simulate the per-frame bump that the dispatch loop would do
+	// when keepalive is enabled.
+	clientTransport.lastReadTick.Add(1)
 
-	updatedLastRead := atomic.LoadInt64(&clientTransport.lastRead)
-	if updatedLastRead != nowNano {
-		t.Errorf("Expected lastRead=%d, got %d", nowNano, updatedLastRead)
+	updated := clientTransport.lastReadTick.Load()
+	if updated != 1 {
+		t.Errorf("Expected lastReadTick=1, got %d", updated)
 	}
 }
