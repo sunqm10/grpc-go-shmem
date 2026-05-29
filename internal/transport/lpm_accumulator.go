@@ -51,12 +51,26 @@ import (
 //
 // Requests above the largest tier fall back to the dirty simple pool
 // which does sync.Pool reuse without size-bucketing.
+//
+// Backing implementation: NewStrongRefDirtyBinaryTieredBufferPool, a
+// bounded strong-ref free list per tier (NOT sync.Pool). At sustained
+// high allocation rates — e.g. the Jumbo32 1000-stream × 4 KiB
+// concurrent ping-pong bench cell, where the SHM transport pushes
+// ~300 K pool ops/sec — sync.Pool's per-GC victim-cache drain causes
+// hit-rate to collapse and forms a positive feedback loop
+// (high alloc rate → frequent GC → pool drained → makeslice fires →
+// more alloc → more GC). Profiles showed `mallocgc` at ~45 % cum
+// CPU vs ~30 % on UDS for the same workload, despite SHM allocating
+// fewer bytes per op. Replacing the sync.Pool backing with a
+// GC-decoupled bounded free list (the C# ArrayPool<byte>.Shared
+// equivalent) breaks this loop. See
+// internal/mem/strong_ref_buffer_pool.go for the full rationale.
 var shmLpmPool = func() mem.BufferPool {
-	p, err := imem.NewDirtyBinaryTieredBufferPool(mem.DefaultBufferPoolSizeExponents()...)
+	p, err := imem.NewStrongRefDirtyBinaryTieredBufferPool(mem.DefaultBufferPoolSizeExponents()...)
 	if err != nil {
 		// Argument list comes from mem.DefaultBufferPoolSizeExponents();
 		// a failure here implies a programming error in imem itself.
-		panic(fmt.Sprintf("shmLpmPool: NewDirtyBinaryTieredBufferPool failed: %v", err))
+		panic(fmt.Sprintf("shmLpmPool: NewStrongRefDirtyBinaryTieredBufferPool failed: %v", err))
 	}
 	return p
 }()
