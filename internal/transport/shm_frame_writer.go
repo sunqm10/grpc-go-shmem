@@ -200,6 +200,14 @@ type deferredMessage struct {
 	streamPtr *Stream
 	fh        FrameHeader
 	cur       vecCursor // embedded by value (was *vecCursor) — see Stream.shmDeferred
+	// origData preserves the original BufferSlice header captured at
+	// processWholeMessage time. cur.data is destructively re-sliced
+	// by vecCursor.writeTo (each emitted segment is dropped via
+	// `c.data = c.data[1:]`), so by the time release() runs cur.data
+	// is typically the empty tail. Freeing cur.data would be a no-op
+	// and the Ref taken in enqueueMessageAndWait would never get
+	// balanced — leaking pooled buffers. Free origData instead.
+	origData  mem.BufferSlice
 	remaining int
 	isLast    bool
 	doneCh    chan error
@@ -208,14 +216,14 @@ type deferredMessage struct {
 // release frees the BufferSlice ref AND nulls the cur slices so that
 // the underlying *mem.Buffer pointers and lpmHdr byte slice can be
 // reclaimed by GC. Used by every terminal path in advanceDeferred /
-// processWholeMessage / close-drain. Equivalent to the old
-// `d.cur.data.Free()` plus explicit cleanup needed for the inline-
-// embedded shmDeferred slot (PR-B): without nulling, the next SendMsg
-// on this stream would inherit stale BufferSlice/lpmHdr pointers
-// pinning pooled buffers in the GC's view.
+// processWholeMessage / close-drain. Frees d.origData (the original
+// caller-supplied BufferSlice header) NOT d.cur.data, because
+// vecCursor.writeTo destructively re-slices cur.data as it emits —
+// see the origData field doc on deferredMessage.
 func (d *deferredMessage) release() {
 	atomic.AddUint64(&shmLeakHuntWriterDRelease, 1)
-	d.cur.data.Free()
+	d.origData.Free()
+	d.origData = nil
 	d.cur.data = nil
 	d.cur.lpmHdr = nil
 }
@@ -865,6 +873,7 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 	d.streamPtr = entry.streamPtr
 	d.fh = entry.fh
 	d.cur = vecCursor{lpmHdr: entry.hdr, data: entry.data}
+	d.origData = entry.data
 	d.remaining = payloadLen
 	d.isLast = entry.isLast
 	d.doneCh = entry.doneCh
