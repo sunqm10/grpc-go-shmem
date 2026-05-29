@@ -46,6 +46,11 @@ type ShmUnaryClient struct {
 
 	readerOnce sync.Once
 	readerDone chan struct{}
+	// readerStarted is set inside readerOnce.Do BEFORE the goroutine
+	// spawn. Close() reads it to decide whether to wait on
+	// readerDone; if startReader was never called, the channel will
+	// never close and an unconditional wait would hang Close forever.
+	readerStarted atomic.Bool
 	closed     atomic.Bool
 
 	// Windows event handles for cross-mapping synchronization
@@ -109,8 +114,14 @@ func (c *ShmUnaryClient) Close() error {
 		c.seg.UnblockSameSideParkers()
 	}
 
-	// Wait for reader goroutine to exit before closing segment
-	<-c.readerDone
+	// Wait for reader goroutine to exit before closing segment.
+	// BUG FIX (GPT-5.5 bug hunt): only wait if startReader was
+	// actually called — otherwise readerDone is never closed and
+	// Close hangs forever (e.g., NewShmUnaryClient(seg); client.Close()
+	// with no intervening UnaryCall).
+	if c.readerStarted.Load() {
+		<-c.readerDone
+	}
 
 	// Close the named events (Windows)
 	if c.txEvents != nil {
@@ -126,6 +137,7 @@ func (c *ShmUnaryClient) Close() error {
 // startReader starts the event-driven frame reader once with a client-level context.
 func (c *ShmUnaryClient) startReader() {
 	c.readerOnce.Do(func() {
+		c.readerStarted.Store(true)
 		go func() {
 			defer close(c.readerDone)
 

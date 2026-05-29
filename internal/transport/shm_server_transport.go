@@ -990,6 +990,21 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	} else {
 		s.ctx, s.cancel = context.WithCancel(ctx)
 	}
+	// BUG FIX (GPT-5.5 overnight bug hunt): the three early-return
+	// paths below (invalid content-type, transport closed mid-handle,
+	// draining-mode rejection) used to leak s.ctx's cancel function
+	// because the stream was never registered into t.streams (which
+	// is the normal path that eventually calls s.cancel during
+	// closeStream / handleCancel / handleTrailers). For deadline
+	// contexts this leaks a runtime timer; for cancel contexts it
+	// leaks a goroutine waiting on parent ctx.Done. Guard with a
+	// "registered" flag and a deferred cancel-if-not-registered.
+	registered := false
+	defer func() {
+		if !registered && s.cancel != nil {
+			s.cancel()
+		}
+	}()
 	s.ctxDone = s.ctx.Done()
 
 	// Attach metadata to context if present
@@ -1042,6 +1057,10 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	// overwrite — the displaced occupant stays fully correct via
 	// the map fallback path in lookupStream.
 	t.streamSlots[streamSlotIdx(streamID)].Store(s)
+	// Mark as registered AFTER the slot publish so any panic between
+	// here and the deferred cleanup still leaves the stream visible
+	// to the dispatch path (the stream owns its cancel from here on).
+	registered = true
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
 	// Reset ping strikes when streams become active.

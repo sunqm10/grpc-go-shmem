@@ -44,6 +44,9 @@ type ShmStreamingServer struct {
 
 	readerOnce sync.Once
 	readerDone chan struct{}
+	// readerStarted gates the Close()-side wait on readerDone. See
+	// client.go for the full rationale.
+	readerStarted atomic.Bool
 	closed     atomic.Bool
 
 	// Handler for new streams
@@ -125,8 +128,12 @@ func (s *ShmStreamingServer) Close() error {
 	// Close rx ring to unblock reader
 	_ = s.rx.Close()
 
-	// Wait for reader to exit
-	<-s.readerDone
+	// Wait for reader to exit. BUG FIX (GPT-5.5 bug hunt): only wait
+	// if startReader was actually called — otherwise readerDone is
+	// never closed and Close hangs forever.
+	if s.readerStarted.Load() {
+		<-s.readerDone
+	}
 
 	// Close all active streams
 	s.streamsM.Lock()
@@ -141,6 +148,7 @@ func (s *ShmStreamingServer) Close() error {
 // startReader starts the event-driven frame reader
 func (s *ShmStreamingServer) startReader() {
 	s.readerOnce.Do(func() {
+		s.readerStarted.Store(true)
 		go func() {
 			defer close(s.readerDone)
 			ctx := context.Background()
