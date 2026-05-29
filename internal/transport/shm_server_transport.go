@@ -458,10 +458,11 @@ func (t *ShmServerTransport) piggybackWUForWriter(streamID uint32) {
 		return
 	}
 	if v := t.pendingConnWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
+		// Reuse the per-transport wuBuf scratch; runs under writer's
+		// inlineMu (single-goroutine). See client-side mirror.
+		binary.BigEndian.PutUint32(t.wuBuf[:], v)
 		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, buf)
+			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
 	}
 	if streamID == 0 {
 		return
@@ -471,10 +472,9 @@ func (t *ShmServerTransport) piggybackWUForWriter(streamID uint32) {
 		return
 	}
 	if v := s.pendingWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
+		binary.BigEndian.PutUint32(t.wuBuf[:], v)
 		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, t.wuBuf[:])
 	}
 }
 

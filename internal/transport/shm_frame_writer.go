@@ -59,6 +59,13 @@ type shmFrameWriter struct {
 	ch     chan frameEntry // data + control frames from app goroutines
 	wg     sync.WaitGroup
 	closed atomic.Bool
+	// wuScratch is a 4-byte writer-owned buffer used by
+	// connWUCoalescer.flush() to render the BE-uint32 WU increment
+	// without a per-flush make([]byte,4). Safe because writeLoop is
+	// single-goroutine and writeFrame copies the payload into the
+	// ring synchronously (so the scratch is fully consumed before any
+	// subsequent flush can reuse it).
+	wuScratch [4]byte
 	// closeMu synchronizes channel close with concurrent senders.
 	// Senders hold RLock; close() holds Lock.
 	closeMu sync.RWMutex
@@ -641,8 +648,12 @@ func (c *connWUCoalescer) flush() {
 	if !c.hasAny {
 		return
 	}
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, uint32(c.pending))
+	// Reuse the writer's wuScratch. Safe: connWUCoalescer is owned by
+	// writeLoop (single-goroutine); processEntry -> writeFrameH2
+	// reserves+copies the payload into the ring synchronously before
+	// returning, so any subsequent flush in the same drain can reuse
+	// the same 4 bytes. Removes 1 alloc per coalesced WU flush.
+	binary.BigEndian.PutUint32(c.w.wuScratch[:], uint32(c.pending))
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -650,7 +661,7 @@ func (c *connWUCoalescer) flush() {
 	c.w.processEntry(frameEntry{
 		ctx:     ctx,
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0},
-		payload: buf,
+		payload: c.w.wuScratch[:],
 	})
 	shmConnWUCoalesced.Add(1)
 	c.pending = 0
