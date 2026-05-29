@@ -493,12 +493,16 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	if os.Getenv("BENCH_POOL_DIAG") == "1" {
 		experimental.ResetTightBufferPoolDiag()
 		mem.ResetBufferDiag()
+		transport.ResetShmLeakHuntCounters()
 		b.Cleanup(func() {
 			if s := experimental.TightBufferPoolDiagDump(); s != "" {
 				b.Logf("\n--- SHM cell pool diag ---\n%s", s)
 			}
 			if s := mem.BufferDiagDump(); s != "" {
 				b.Logf("\n--- SHM cell buffer diag ---\n%s", s)
+			}
+			if s := transport.DumpShmLeakHuntCounters(); s != "" {
+				b.Logf("\n--- SHM cell leak-hunt counters ---\n%s", s)
 			}
 		})
 	}

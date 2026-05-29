@@ -214,6 +214,7 @@ type deferredMessage struct {
 // on this stream would inherit stale BufferSlice/lpmHdr pointers
 // pinning pooled buffers in the GC's view.
 func (d *deferredMessage) release() {
+	atomic.AddUint64(&shmLeakHuntWriterDRelease, 1)
 	d.cur.data.Free()
 	d.cur.data = nil
 	d.cur.lpmHdr = nil
@@ -826,6 +827,7 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		}
 		// Balance the Ref taken in enqueueMessageAndWait.
 		entry.data.Free()
+		atomic.AddUint64(&shmLeakHuntWriterDirectFree, 1)
 		return
 	}
 	payloadLen := len(entry.hdr) + entry.data.Len()
@@ -848,6 +850,7 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		entry.doneCh <- err
 		// Balance the Ref taken in enqueueMessageAndWait.
 		entry.data.Free()
+		atomic.AddUint64(&shmLeakHuntWriterDirectFree, 1)
 		return
 	}
 	// PR-B: reuse Stream's inline-allocated deferred slot instead of
@@ -1673,6 +1676,7 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	// bump is required because the caller's existing reference
 	// keeps the BufferSlice alive for the duration of this function.
 	if handled, ierr := w.tryInlineWrite(ctx, streamPtr, hdr, data, isLast); handled {
+		atomic.AddUint64(&shmLeakHuntTryInlineHandled, 1)
 		return ierr
 	}
 
@@ -1700,10 +1704,12 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	// close()-time drain). Buffers backed by mem.DefaultBufferPool are
 	// refcounted so the cost is one atomic add per call.
 	data.Ref()
+	atomic.AddUint64(&shmLeakHuntEnqueueMsgRef, 1)
 	if !w.trySend(entry) {
 		// trySend failed (writer closed before we enqueued); roll back
 		// the Ref so the caller's Free is balanced.
 		data.Free()
+		atomic.AddUint64(&shmLeakHuntEnqueueRollback, 1)
 		putDoneCh(doneCh)
 		return ErrConnClosing
 	}
