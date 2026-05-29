@@ -193,7 +193,8 @@ func (p *tightBufferPool) Put(b *[]byte) {
 	}
 	*b = (*b)[:c] // restore length so cap is preserved on reuse
 	pool := p.poolFor(c)
-	pool.push(b) // drop on overflow is fine — GC will reclaim
+	accepted := pool.push(b) // drop on overflow is fine — GC will reclaim
+	diagRecordPut(c, accepted)
 }
 
 // poolFor locates (or creates) the *boundedFreeList dedicated to the given

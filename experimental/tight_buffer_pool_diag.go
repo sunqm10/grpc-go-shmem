@@ -44,11 +44,17 @@ var tightBufferPoolDiagCounters = struct {
 	gets    map[int]*atomic.Uint64
 	hits    map[int]*atomic.Uint64
 	misses  map[int]*atomic.Uint64
+	puts    map[int]*atomic.Uint64 // Put attempts (regardless of accept/drop)
+	accepts map[int]*atomic.Uint64 // Put accepted (pool had room)
+	drops   map[int]*atomic.Uint64 // Put dropped (pool was full)
 	enabled atomic.Bool
 }{
-	gets:   make(map[int]*atomic.Uint64),
-	hits:   make(map[int]*atomic.Uint64),
-	misses: make(map[int]*atomic.Uint64),
+	gets:    make(map[int]*atomic.Uint64),
+	hits:    make(map[int]*atomic.Uint64),
+	misses:  make(map[int]*atomic.Uint64),
+	puts:    make(map[int]*atomic.Uint64),
+	accepts: make(map[int]*atomic.Uint64),
+	drops:   make(map[int]*atomic.Uint64),
 }
 
 // EnableTightBufferPoolDiag turns on per-size hit/miss counter tracking
@@ -66,6 +72,9 @@ func ResetTightBufferPoolDiag() {
 	tightBufferPoolDiagCounters.gets = make(map[int]*atomic.Uint64)
 	tightBufferPoolDiagCounters.hits = make(map[int]*atomic.Uint64)
 	tightBufferPoolDiagCounters.misses = make(map[int]*atomic.Uint64)
+	tightBufferPoolDiagCounters.puts = make(map[int]*atomic.Uint64)
+	tightBufferPoolDiagCounters.accepts = make(map[int]*atomic.Uint64)
+	tightBufferPoolDiagCounters.drops = make(map[int]*atomic.Uint64)
 }
 
 // TightBufferPoolDiagDump returns a human-readable summary of the counters,
@@ -78,11 +87,11 @@ func TightBufferPoolDiagDump() string {
 		return ""
 	}
 	type row struct {
-		size           int
-		gets, hits, misses uint64
+		size                                       int
+		gets, hits, misses, puts, accepts, drops uint64
 	}
 	rows := make([]row, 0, len(tightBufferPoolDiagCounters.gets))
-	var totalGets, totalHits, totalMisses uint64
+	var totalGets, totalHits, totalMisses, totalPuts, totalAccepts, totalDrops uint64
 	for size, getCtr := range tightBufferPoolDiagCounters.gets {
 		gets := getCtr.Load()
 		hits := uint64(0)
@@ -93,24 +102,48 @@ func TightBufferPoolDiagDump() string {
 		if m := tightBufferPoolDiagCounters.misses[size]; m != nil {
 			misses = m.Load()
 		}
-		rows = append(rows, row{size, gets, hits, misses})
+		puts := uint64(0)
+		if p := tightBufferPoolDiagCounters.puts[size]; p != nil {
+			puts = p.Load()
+		}
+		accepts := uint64(0)
+		if a := tightBufferPoolDiagCounters.accepts[size]; a != nil {
+			accepts = a.Load()
+		}
+		drops := uint64(0)
+		if d := tightBufferPoolDiagCounters.drops[size]; d != nil {
+			drops = d.Load()
+		}
+		rows = append(rows, row{size, gets, hits, misses, puts, accepts, drops})
 		totalGets += gets
 		totalHits += hits
 		totalMisses += misses
+		totalPuts += puts
+		totalAccepts += accepts
+		totalDrops += drops
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].gets > rows[j].gets })
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "=== tightBufferPool diag: %d size classes, %d gets total (%d hits / %d misses = %.1f%% hit rate) ===\n",
-		len(rows), totalGets, totalHits, totalMisses, 100.0*float64(totalHits)/float64(max(totalGets, 1)))
-	fmt.Fprintf(&b, "%-10s %12s %12s %12s %10s\n", "size", "gets", "hits", "misses", "hit%")
+	hitPct := 100.0 * float64(totalHits) / float64(max(totalGets, 1))
+	putGetRatio := 100.0 * float64(totalPuts) / float64(max(totalGets, 1))
+	dropPct := 100.0 * float64(totalDrops) / float64(max(totalPuts, 1))
+	fmt.Fprintf(&b, "=== tightBufferPool diag: %d size classes ===\n", len(rows))
+	fmt.Fprintf(&b, "Gets:    %12d  (%d hits / %d misses = %.1f%% hit rate)\n",
+		totalGets, totalHits, totalMisses, hitPct)
+	fmt.Fprintf(&b, "Puts:    %12d  (%.1f%% of Gets — should be ~100%% if Free path works!)\n",
+		totalPuts, putGetRatio)
+	fmt.Fprintf(&b, "         %12d accepts, %d drops (%.1f%% of Puts dropped due to pool-full)\n",
+		totalAccepts, totalDrops, dropPct)
+	fmt.Fprintf(&b, "%-10s %12s %12s %12s %10s %12s %12s\n", "size", "gets", "hits", "misses", "hit%", "puts", "drops")
 	for i, r := range rows {
 		if i >= 25 { // top 25 only
 			fmt.Fprintf(&b, "  ... (%d more size classes)\n", len(rows)-25)
 			break
 		}
-		hitPct := 100.0 * float64(r.hits) / float64(max(r.gets, 1))
-		fmt.Fprintf(&b, "%-10d %12d %12d %12d %9.1f%%\n", r.size, r.gets, r.hits, r.misses, hitPct)
+		rowHit := 100.0 * float64(r.hits) / float64(max(r.gets, 1))
+		fmt.Fprintf(&b, "%-10d %12d %12d %12d %9.1f%% %12d %12d\n",
+			r.size, r.gets, r.hits, r.misses, rowHit, r.puts, r.drops)
 	}
 	return b.String()
 }
@@ -140,5 +173,20 @@ func diagRecord(size int, hit bool) {
 		diagCounter(tightBufferPoolDiagCounters.hits, size).Add(1)
 	} else {
 		diagCounter(tightBufferPoolDiagCounters.misses, size).Add(1)
+	}
+}
+
+// diagRecordPut is called from tightBufferPool.Put. accepted=true means
+// the buffer was successfully added to the free list; false means dropped
+// because the list was already at cap.
+func diagRecordPut(size int, accepted bool) {
+	if !tightBufferPoolDiagCounters.enabled.Load() {
+		return
+	}
+	diagCounter(tightBufferPoolDiagCounters.puts, size).Add(1)
+	if accepted {
+		diagCounter(tightBufferPoolDiagCounters.accepts, size).Add(1)
+	} else {
+		diagCounter(tightBufferPoolDiagCounters.drops, size).Add(1)
 	}
 }
