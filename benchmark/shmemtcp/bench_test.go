@@ -151,6 +151,14 @@ func TestMain(m *testing.M) {
 	// to compare against the futex fallback.
 	transport.ConfigureShmEventfdWakerForBench(true)
 
+	// BENCH_POOL_DIAG=1 enables per-size hit/miss counters inside
+	// tightBufferPool. Stats are printed at the end of each bench cell
+	// via b.Cleanup. NOT for production use — investigating the
+	// "pool miss rate" puzzle on the Jumbo32 1000-stream × 4 KiB cell.
+	if os.Getenv("BENCH_POOL_DIAG") == "1" {
+		experimental.EnableTightBufferPoolDiag()
+	}
+
 	sweepStaleShmSegments()
 	code := m.Run()
 	sweepStaleShmSegments()
@@ -478,6 +486,17 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 
 	client := testgrpc.NewBenchmarkServiceClient(conn)
 	warmUpGRPC(b, client)
+
+	// BENCH_POOL_DIAG=1: reset counters AFTER warmup so we capture only
+	// steady-state bench iterations, then dump at cleanup.
+	if os.Getenv("BENCH_POOL_DIAG") == "1" {
+		experimental.ResetTightBufferPoolDiag()
+		b.Cleanup(func() {
+			if s := experimental.TightBufferPoolDiagDump(); s != "" {
+				b.Logf("\n--- SHM cell pool diag ---\n%s", s)
+			}
+		})
+	}
 
 	return &grpcBenchEnv{
 		stopSrv: stop,

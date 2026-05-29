@@ -155,12 +155,14 @@ func (p *tightBufferPool) Get(size int) *[]byte {
 	pool := p.poolFor(size)
 	if b := pool.pop(); b != nil {
 		if cap(*b) >= size {
+			diagRecord(size, true)
 			*b = (*b)[:size]
 			return b
 		}
 		// Capacity shrank below request (shouldn't happen — push preserves
 		// cap, and free-list entries are keyed by cap). Discard and alloc.
 	}
+	diagRecord(size, false)
 	buf := make([]byte, size)
 	return &buf
 }
