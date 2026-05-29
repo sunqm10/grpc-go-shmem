@@ -83,7 +83,20 @@ const (
 	// at the published high-concurrency bench targets (N=1000) with
 	// modest headroom. See strong_ref_buffer_pool.go in internal/mem
 	// for the equivalent constant rationale.
-	defaultTightFreeListCap = 1024
+	//
+	// DIAG bump 2026-05-29: raised from 1024 → 8192 to confirm whether
+	// pool capacity is the dominant driver of mallocgc / gcAssistAlloc
+	// CPU on the Jumbo32 1000-stream × 4 KiB bench cell. Diagnostic
+	// counters showed 14 % hit rate at cap=1024 → in-flight working set
+	// far exceeds cap → 86 % Puts dropped → 290 MB/s GC garbage from
+	// dropped buffers. If 8192 lifts hit rate to >90 % and throughput
+	// rises, GC pressure was indeed a real driver and the cap should be
+	// permanently raised (or made adaptive). If throughput is flat, GC
+	// pressure is not the bottleneck and the scheduler (doneCh park) is
+	// the dominant cost — confirming D-NEW as the required fix.
+	//
+	// 4 KiB hot tier at cap 8192 ≈ 32 MiB resident memory.
+	defaultTightFreeListCap = 8192
 )
 
 // boundedFreeList is a per-size-class bounded strong-ref free list.
