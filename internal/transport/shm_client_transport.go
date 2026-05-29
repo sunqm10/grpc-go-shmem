@@ -1111,9 +1111,12 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			if len(h.Metadata) > 0 {
 				md = make(metadata.MD, len(h.Metadata))
 				for _, kv := range h.Metadata {
-					vals := make([]string, 0, len(kv.Values))
-					for _, v := range kv.Values {
-						vals = append(vals, string(v))
+					// Pre-size with len() + indexed assignment: skip
+					// the append-growth bookkeeping. Same strings,
+					// same order.
+					vals := make([]string, len(kv.Values))
+					for i, v := range kv.Values {
+						vals[i] = string(v)
 					}
 					md[kv.Key] = vals
 				}
@@ -1252,12 +1255,20 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				release()
 				t.closeStream(stream, err, false, 0, nil, nil, false)
 			} else {
-				// Convert metadata from protocol format to map
-				trailerMap := make(map[string][]string)
-				for _, kv := range tr.Metadata {
-					trailerMap[kv.Key] = make([]string, len(kv.Values))
-					for i, v := range kv.Values {
-						trailerMap[kv.Key][i] = string(v)
+				// Convert metadata from protocol format to map.
+				// Mirror of PR #10 (C2): skip allocation when there are
+				// no trailer metadata entries (the common case for
+				// stock gRPC unary RPCs). closeStream accepts nil for
+				// the mdata arg.
+				var trailerMap map[string][]string
+				if len(tr.Metadata) > 0 {
+					trailerMap = make(map[string][]string, len(tr.Metadata))
+					for _, kv := range tr.Metadata {
+						vals := make([]string, len(kv.Values))
+						for i, v := range kv.Values {
+							vals[i] = string(v)
+						}
+						trailerMap[kv.Key] = vals
 					}
 				}
 
@@ -1615,31 +1626,45 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 			deadlineUnixNano = uint64(unixNano)
 		}
 	}
-	var kvs []KV
-	hasKey := func(key string) bool {
-		for _, kv := range kvs {
-			if kv.Key == key {
-				return true
-			}
-		}
-		return false
-	}
+	// Pre-size kvs to len(md)+3 to cover up to three appended gRPC
+	// fields (content-type, grpc-encoding, grpc-accept-encoding).
+	// Track presence via 3 typed bools while copying outgoing
+	// metadata so the later "add if missing" checks don't need a
+	// hasKey closure (escape-prone and O(n) per check).
+	var (
+		kvs                []KV
+		hasContentType    bool
+		hasGrpcEncoding   bool
+		hasAcceptEncoding bool
+	)
 	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		kvs = make([]KV, 0, len(md)+3)
 		for k, vals := range md {
-			byteVals := make([][]byte, 0, len(vals))
-			for _, v := range vals {
-				byteVals = append(byteVals, []byte(v))
+			// Pre-size byteVals: skip append-growth bookkeeping.
+			byteVals := make([][]byte, len(vals))
+			for i, v := range vals {
+				byteVals[i] = []byte(v)
+			}
+			switch k {
+			case "content-type":
+				hasContentType = true
+			case "grpc-encoding":
+				hasGrpcEncoding = true
+			case "grpc-accept-encoding":
+				hasAcceptEncoding = true
 			}
 			kvs = append(kvs, KV{Key: k, Values: byteVals})
 		}
+	} else {
+		kvs = make([]KV, 0, 3)
 	}
 	// Add gRPC-required/expected metadata fields if not already present.
-	if !hasKey("content-type") {
+	if !hasContentType {
 		kvs = append(kvs, KV{Key: "content-type", Values: [][]byte{[]byte(grpcutil.ContentType(callHdr.ContentSubtype))}})
 	}
 	registeredCompressors := grpcutil.RegisteredCompressors()
 	if callHdr.SendCompress != "" {
-		if !hasKey("grpc-encoding") {
+		if !hasGrpcEncoding {
 			kvs = append(kvs, KV{Key: "grpc-encoding", Values: [][]byte{[]byte(callHdr.SendCompress)}})
 		}
 		if !grpcutil.IsCompressorNameRegistered(callHdr.SendCompress) {
@@ -1649,7 +1674,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 			registeredCompressors += callHdr.SendCompress
 		}
 	}
-	if registeredCompressors != "" && !hasKey("grpc-accept-encoding") {
+	if registeredCompressors != "" && !hasAcceptEncoding {
 		kvs = append(kvs, KV{Key: "grpc-accept-encoding", Values: [][]byte{[]byte(registeredCompressors)}})
 	}
 	hdr := HeadersV1{

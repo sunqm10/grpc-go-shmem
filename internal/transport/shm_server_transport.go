@@ -1514,12 +1514,15 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		shmDebugf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
 	}
 
-	// Convert metadata.MD to []KV format
-	var kvs []KV
+	// Convert metadata.MD to []KV format.
+	// Pre-size kvs to len(md)+1 to cover the optional grpc-encoding
+	// append below; pre-size byteVals from len(vals) to avoid append-
+	// growth bookkeeping.
+	kvs := make([]KV, 0, len(md)+1)
 	for k, vals := range md {
-		var byteVals [][]byte
-		for _, v := range vals {
-			byteVals = append(byteVals, []byte(v))
+		byteVals := make([][]byte, len(vals))
+		for i, v := range vals {
+			byteVals[i] = []byte(v)
 		}
 		kvs = append(kvs, KV{Key: k, Values: byteVals})
 	}
@@ -1781,11 +1784,12 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	trMD := s.trailer.Copy()
 	s.hdrMu.Unlock()
 
-	var kvs []KV
+	// Pre-size kvs from len(trMD); pre-size byteVals from len(vals).
+	kvs := make([]KV, 0, len(trMD))
 	for k, vals := range trMD {
-		var byteVals [][]byte
-		for _, v := range vals {
-			byteVals = append(byteVals, []byte(v))
+		byteVals := make([][]byte, len(vals))
+		for i, v := range vals {
+			byteVals[i] = []byte(v)
 		}
 		kvs = append(kvs, KV{Key: k, Values: byteVals})
 	}
