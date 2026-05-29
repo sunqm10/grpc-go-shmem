@@ -174,6 +174,33 @@ type ShmClientTransport struct {
 	// outbound send quota.
 	pendingConnWU atomic.Uint32
 
+	// wuDirty is the per-stream restore-WU dirty list, used by
+	// drainPendingWUForWriter to skip the legacy O(N=streams) walk.
+	// Two-slot ping-pong design (Opus 4.8 review):
+	//   - wuDirty[wuLiveIdx] is the LIVE slice that producers
+	//     append into (under wuDirtyMu) when their stream-WU emit
+	//     hit errFrameWriterFull and CAS-set Stream.pendingWUDirty.
+	//   - wuDirty[wuLiveIdx^1] is the SPARE slice (pre-truncated
+	//     to [:0]) that the drainer rotates into the live slot
+	//     while it processes the ex-live snapshot.
+	// Two backing arrays, amortised zero allocation per drain, NO
+	// aliasing data race (drainer's snapshot and producer's
+	// concurrent appends touch physically distinct arrays).
+	//
+	// Simple `wuDirtyList = nil` would force a fresh alloc per
+	// drain; `wuDirtyList = wuDirtyList[:0]` would alias with the
+	// drainer's snapshot and corrupt under concurrent producer
+	// append. Ping-pong is the only zero-alloc design that is also
+	// race-free.
+	//
+	// wuBuf is a 4-byte scratch for WINDOW_UPDATE frame payload,
+	// safe to share across drain calls because drainPendingWUForWriter
+	// runs under frameWriter.inlineMu (single-writer serialisation).
+	wuDirtyMu sync.Mutex
+	wuDirty   [2][]*ClientStream
+	wuLiveIdx int
+	wuBuf     [4]byte
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -469,11 +496,29 @@ func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		// Restore credit to the right accumulator and trigger a
 		// guaranteed retry. The wuRetryWake channel is buffer=1;
 		// a pending signal is sufficient — the writer loop drains
-		// all known accumulators each time it wakes.
+		// pending atomics on its next wake.
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
+			// Conn-level: no dirty flag. drainPendingWUForWriter
+			// always Swaps pendingConnWU unconditionally — one
+			// atomic on every drain is cheaper than maintaining
+			// a CAS-gated dirty bit. Saves the bit + a producer-
+			// side atomic + an ordering surface.
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
+			// Per-stream dirty enqueue: CAS-dedup ensures at most
+			// one producer per dirty-cycle appends the stream
+			// pointer to the dirty list. Order is Add(v) BEFORE
+			// CAS(false→true): if the drainer's CAS-clear races
+			// our CAS-set, the worst case is a redundant re-enqueue
+			// (drainer's next pass Swap'ing 0); no WU is ever lost.
+			// See drainPendingWUForWriter for the full ordering
+			// proof.
+			if s.pendingWUDirty.CompareAndSwap(false, true) {
+				t.wuDirtyMu.Lock()
+				t.wuDirty[t.wuLiveIdx] = append(t.wuDirty[t.wuLiveIdx], s)
+				t.wuDirtyMu.Unlock()
+			}
 		}
 		// If stream is closed, credit is dropped (the peer has no
 		// further use for it; the close path emits RST/TRAILERS).
@@ -486,58 +531,97 @@ func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 
 // drainPendingWUForWriter is the writer-loop callback registered via
 // frameWriter.setDrainPendingWUFn. Invoked under inlineMu when
-// wuRetryWake fires, it Swaps every pending WU accumulator (conn-
-// level + every registered stream's pendingWU) and writes one
-// WINDOW_UPDATE frame per non-zero value DIRECTLY to the ring,
-// bypassing the writer's chan / TryLock path (which would deadlock
-// because inlineMu is already held by the writer goroutine).
+// wuRetryWake fires (i.e., an earlier emitWindowUpdateFrame hit
+// errFrameWriterFull and restored its captured credit + signalled
+// the wake).
 //
-// Performance note: per-stream walk is O(active_streams) per retry
-// wake. Retry wakes only fire on errFrameWriterFull (the writer's
-// async channel was full at emit time), which is rare. At 1000
-// streams the O(N) walk is ~1 μs of atomic loads — fully amortised
-// against the rare wake.
+// Algorithm:
+//  1. CONN-LEVEL: unconditionally Swap pendingConnWU. One atomic on
+//     every drain is cheaper than maintaining a CAS-gated dirty
+//     bit (Opus 4.8 review: "delete connWUDirty, always-drain").
+//  2. PER-STREAM: rotate the live dirty slice into a snapshot under
+//     the mutex (ping-pong with the spare slot), release the mutex,
+//     then iterate the snapshot. For each stream: clear
+//     pendingWUDirty 1→0 BEFORE Swap'ing pendingWU.
 //
-// Ordering: conn WU before per-stream WUs so the peer's conn
-// window is refilled BEFORE any stream-level credit pre-credits an
-// inbound LPM. This matches the wire ordering invariant the legacy
-// connWUCoalescer also enforces (flush before non-WU frames).
+// LOST-WU PREVENTION INVARIANT (clear-dirty BEFORE Swap-pending):
+//
+//   Producer sequence: pendingWU.Add(v) THEN pendingWUDirty.CAS(f→t).
+//   Drainer sequence: pendingWUDirty.Store(false) THEN pendingWU.Swap(0).
+//
+//   If we Swap'd pending FIRST then cleared dirty:
+//     - Producer Adds v after our Swap (we got 0)
+//     - Producer's CAS sees true (we haven't cleared) → FAILS, no
+//       re-enqueue
+//     - We then clear dirty
+//     - State: pending=v, dirty=false, stream NOT in list → LOST WU
+//
+//   By clearing dirty FIRST:
+//     - Producer Adds v after our clear-dirty
+//     - Producer's CAS sees false (we just cleared) → SUCCEEDS,
+//       re-enqueues stream
+//     - We then Swap pending (get 0 or v, doesn't matter)
+//     - Stream is in next drain's list → next drain picks it up
+//     - Worst case: duplicate enqueue + wasted Swap of 0. NO lost WU.
+//
+// COMPLEXITY: O(D) where D is dirty count this cycle (usually 0-few
+// at Jumbo32 since per-stream WU below threshold doesn't restore).
+// Versus the previous O(N=streams) walk that fired ~15K/sec at
+// 1000-stream Jumbo32 1000/4K — a 14% CPU savings on the writer's
+// serial path (profile 2026-05-29).
+//
+// ORDERING: conn WU before per-stream WUs so the peer's conn window
+// is refilled BEFORE any stream-level credit pre-credits an inbound
+// LPM. This matches the wire ordering invariant the connWUCoalescer
+// also enforces (flush before non-WU frames).
 func (t *ShmClientTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
-	// Conn-level pending.
+	// CONN-LEVEL: unconditional Swap (no dirty gate).
 	if v := t.pendingConnWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
+		binary.BigEndian.PutUint32(t.wuBuf[:], v)
 		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, buf)
+			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
 	}
-	// Per-stream pending. Snapshot under mu.RLock so we don't hold
-	// the transport lock across the ring writes (which can block on
-	// ring backpressure).
-	t.mu.RLock()
-	if len(t.streams) == 0 {
-		t.mu.RUnlock()
+	// PER-STREAM: ping-pong rotate under brief lock.
+	t.wuDirtyMu.Lock()
+	if len(t.wuDirty[t.wuLiveIdx]) == 0 {
+		t.wuDirtyMu.Unlock()
 		return
 	}
-	snapshot := make([]*ClientStream, 0, len(t.streams))
-	for _, s := range t.streams {
-		snapshot = append(snapshot, s)
-	}
-	t.mu.RUnlock()
-	for _, s := range snapshot {
+	dirty := t.wuDirty[t.wuLiveIdx]
+	// Rotate to the spare slot. Spare was pre-truncated to [:0]
+	// either at construction or at the end of the previous drain.
+	// Producers' next append will land in the spare slot (now live);
+	// our snapshot `dirty` is the ex-live array, physically distinct.
+	t.wuLiveIdx ^= 1
+	t.wuDirtyMu.Unlock()
+
+	for _, s := range dirty {
+		// INVARIANT: clear dirty BEFORE Swap pending. See function
+		// comment for the lost-WU prevention proof.
+		s.pendingWUDirty.Store(false)
 		if s.getState() == streamDone {
 			s.pendingWU.Store(0)
 			continue
 		}
 		if v := s.pendingWU.Swap(0); v > 0 {
-			buf := make([]byte, 4)
-			binary.BigEndian.PutUint32(buf, v)
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
 			_ = writeFrame(context.Background(), t.frameWriter.tx,
-				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, buf)
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, t.wuBuf[:])
 		}
 	}
+
+	// Recycle the snapshot array back into the spare slot for the
+	// next drain. Keep the larger array if it grew (rare). Truncate
+	// to [:0] so the next ping-pong rotation finds a clean spare.
+	t.wuDirtyMu.Lock()
+	spareIdx := t.wuLiveIdx ^ 1
+	if cap(dirty) > cap(t.wuDirty[spareIdx]) {
+		t.wuDirty[spareIdx] = dirty[:0]
+	}
+	t.wuDirtyMu.Unlock()
 }
 
 // piggybackWUForWriter is the per-chunk piggyback callback registered

@@ -352,6 +352,25 @@ type Stream struct {
 	// pending stream-WU state inside inFlow.pendingUpdate.
 	pendingWU atomic.Uint32
 
+	// pendingWUDirty is the dirty-list membership flag for the SHM
+	// transport's drainPendingWUForWriter restore path. When an
+	// emitWindowUpdateFrame call returns errFrameWriterFull (writer
+	// chan full at WU emit time), the producer Adds the captured
+	// credit back to pendingWU and then CAS-sets pendingWUDirty
+	// 0→1. The single producer that wins the CAS appends this stream
+	// pointer to the transport's wuDirty[] live slice; concurrent
+	// late producers' CAS attempts fail (atomic dedup, single
+	// enqueue per dirty cycle).
+	//
+	// The writer goroutine's drainPendingWUForWriter swaps the
+	// live slice out under wuDirtyMu, then for each entry: clears
+	// pendingWUDirty 1→0 BEFORE Swap'ing pendingWU. The clear-first
+	// ordering is the lost-WU prevention invariant — see
+	// drainPendingWUForWriter for the full proof.
+	//
+	// Unused (and remains false) for the stock TCP/UDS transports.
+	pendingWUDirty atomic.Bool
+
 	// connWaiterElem is retained for binary-compat with stream.go's
 	// general Stream layout (used by other transports if they ever
 	// add similar machinery). The SHM transport's legacy connWaiters

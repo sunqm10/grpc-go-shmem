@@ -136,6 +136,16 @@ type ShmServerTransport struct {
 	// rationale ("WU Lockless Path").
 	pendingConnWU atomic.Uint32
 
+	// wuDirty is the per-stream restore-WU dirty list — see
+	// ShmClientTransport.wuDirty for the full design rationale
+	// (ping-pong double buffer, lost-WU prevention invariant,
+	// always-drain conn-level Swap). This is the server-side
+	// mirror.
+	wuDirtyMu sync.Mutex
+	wuDirty   [2][]*ServerStream
+	wuLiveIdx int
+	wuBuf     [4]byte
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -371,8 +381,18 @@ func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		shmWUFramesBackpressured.Add(1)
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
+			// Conn-level: no dirty flag. drainPendingWUForWriter
+			// always Swaps unconditionally — see client mirror for
+			// the design rationale.
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
+			// Per-stream dirty enqueue: CAS-dedup. See client mirror
+			// for the lost-WU prevention proof.
+			if s.pendingWUDirty.CompareAndSwap(false, true) {
+				t.wuDirtyMu.Lock()
+				t.wuDirty[t.wuLiveIdx] = append(t.wuDirty[t.wuLiveIdx], s)
+				t.wuDirtyMu.Unlock()
+			}
 		}
 		select {
 		case t.frameWriter.wuRetryWake <- struct{}{}:
@@ -383,40 +403,51 @@ func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 
 // drainPendingWUForWriter is the writer-loop callback registered via
 // frameWriter.setDrainPendingWUFn. See client-side
-// drainPendingWUForWriter for the full contract; this is the
-// server-side mirror.
+// drainPendingWUForWriter for the full contract, lost-WU prevention
+// invariant proof, and complexity rationale (O(D=dirty count) vs
+// the legacy O(N=streams) walk). This is the server-side mirror.
 func (t *ShmServerTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
+	// CONN-LEVEL: unconditional Swap.
 	if v := t.pendingConnWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
+		binary.BigEndian.PutUint32(t.wuBuf[:], v)
 		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, buf)
+			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
 	}
-	t.mu.RLock()
-	if len(t.streams) == 0 {
-		t.mu.RUnlock()
+	// PER-STREAM: ping-pong rotate.
+	t.wuDirtyMu.Lock()
+	if len(t.wuDirty[t.wuLiveIdx]) == 0 {
+		t.wuDirtyMu.Unlock()
 		return
 	}
-	snapshot := make([]*ServerStream, 0, len(t.streams))
-	for _, s := range t.streams {
-		snapshot = append(snapshot, s)
-	}
-	t.mu.RUnlock()
-	for _, s := range snapshot {
+	dirty := t.wuDirty[t.wuLiveIdx]
+	t.wuLiveIdx ^= 1
+	t.wuDirtyMu.Unlock()
+
+	for _, s := range dirty {
+		// Clear dirty BEFORE Swap pending — lost-WU prevention.
+		s.pendingWUDirty.Store(false)
 		if s.getState() == streamDone {
 			s.pendingWU.Store(0)
 			continue
 		}
 		if v := s.pendingWU.Swap(0); v > 0 {
-			buf := make([]byte, 4)
-			binary.BigEndian.PutUint32(buf, v)
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
 			_ = writeFrame(context.Background(), t.frameWriter.tx,
-				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, buf)
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, t.wuBuf[:])
 		}
 	}
+
+	// Recycle snapshot array back into spare slot, keeping the
+	// larger array if it grew (rare).
+	t.wuDirtyMu.Lock()
+	spareIdx := t.wuLiveIdx ^ 1
+	if cap(dirty) > cap(t.wuDirty[spareIdx]) {
+		t.wuDirty[spareIdx] = dirty[:0]
+	}
+	t.wuDirtyMu.Unlock()
 }
 
 // piggybackWUForWriter is the per-chunk piggyback callback for the
