@@ -2012,6 +2012,17 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 	if n <= 0 {
 		return nil, nil, nil, errors.New("read size must be positive")
 	}
+	// BUG FIX (Opus 4.8 overnight bug hunt round 2): mirror the
+	// ReserveWrite oversize check. Without it, a hostile or buggy
+	// peer that advertises an H2 frame Length > ring capacity makes
+	// this loop wait forever for `availableBefore >= n` bytes that
+	// the ring physically cannot hold — a DoS/permanent reader stall
+	// on user-configured small rings (RingASize/RingBSize down to
+	// MinRingCapacity = 4 KiB). h2MaxFramePayload caps Length at
+	// 16 MiB which exceeds the 4 KiB floor by ~4000x.
+	if uint64(n) > r.capacity {
+		return nil, nil, nil, fmt.Errorf("shm ring read size %d exceeds ring capacity %d", n, r.capacity)
+	}
 
 	// Check local closed flag first - this is safe even if memory is unmapped.
 	// However, in single-process tests, producer and consumer share the same ShmRing
