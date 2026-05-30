@@ -260,12 +260,41 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 // balanced.
 //
 // Returns the additional credit (bytes) to emit as a stream-level
-// WINDOW_UPDATE, or 0 if existing capacity already admits the LPM.
+// WINDOW_UPDATE, or 0 if existing capacity already admits the LPM
+// OR backpressure should fire (receiver already buffering too much
+// pending data — sender MUST wait for the app to drain).
+//
+// Backpressure cap: we will not pre-credit beyond what would leave
+// the total receiver-buffered bytes (pendingData + pendingUpdate +
+// this LPM's `n`) exceeding `n + limit` — that is, "1 LPM in
+// flight + 1 stream-window's worth of slack". When an app stops
+// draining, pendingData accumulates; once it reaches the cap, this
+// function returns 0, no WU is emitted, the sender's send-quota is
+// not replenished, and Write parks correctly (HTTP/2-correct
+// backpressure semantics).
+//
+// Without this cap, a slow-reading app on an unbounded-Send client
+// would let delta grow to ~2 GiB (maxWindowSize) before saturation;
+// at saturation onData's `pendingData + n > limit + delta` check
+// trips and the server cancels the stream with
+// "received N-bytes data exceeding the limit M bytes" — exactly
+// the bug demo agents have observed under client-streaming with
+// `response_size=0` and `payload >= window`.
 func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 	if n > uint32(math.MaxInt32) {
 		n = uint32(math.MaxInt32)
 	}
 	f.mu.Lock()
+	// Backpressure gate: if admitting this LPM would push total
+	// outstanding buffered bytes above `n + limit`, refuse pre-credit
+	// and force the sender to wait. The cap allows exactly one LPM in
+	// flight plus one stream-window's worth of slack (matches HTTP/2's
+	// "1 message in transit, 1 ready to read" buffer depth).
+	maxBuffered := int64(f.limit) + int64(n)
+	if int64(f.pendingData)+int64(f.pendingUpdate)+int64(n) > maxBuffered {
+		f.mu.Unlock()
+		return 0
+	}
 	// avail is the remaining receive capacity within current
 	// enforcement bounds: limit + delta - (pendingData + pendingUpdate).
 	avail := int64(f.limit) + int64(f.delta) - int64(f.pendingData) - int64(f.pendingUpdate)
