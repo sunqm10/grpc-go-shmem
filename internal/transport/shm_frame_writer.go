@@ -888,10 +888,12 @@ func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
 	}
 	// FIFO with same-stream DATA: if DATA is queued, defer.
 	if _, ok := w.deferred[sid]; ok {
+		atomic.AddUint64(&shmTrailerDeferredFire, 1)
 		w.deferredTrailers[sid] = entry
 		return
 	}
 	if len(w.deferredProto[sid]) > 0 {
+		atomic.AddUint64(&shmTrailerDeferredFire, 1)
 		w.deferredTrailers[sid] = entry
 		return
 	}
@@ -1683,6 +1685,7 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 		return ErrConnClosing
 	}
 	if w.inlineMu.TryLock() {
+		atomic.AddUint64(&shmEnqueueWaitInline, 1)
 		var err error
 		if entry.data != nil {
 			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
@@ -1696,6 +1699,7 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	w.closeMu.RUnlock()
 
 	// Slow path: writer goroutine is busy, enqueue to channel.
+	atomic.AddUint64(&shmEnqueueWaitAsync, 1)
 	entry.doneCh = getDoneCh()
 	if !w.trySend(entry) {
 		putDoneCh(entry.doneCh)

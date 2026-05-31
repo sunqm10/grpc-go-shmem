@@ -28,6 +28,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -1664,6 +1665,66 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 	return t.writeHeader(s, md)
 }
 
+// shmM1ACoalesceHeadersData controls the M1a optimisation: in
+// writeProto, when the implicit HEADERS frame has not yet been sent,
+// emit HEADERS + first DATA under a single inlineMu acquisition wrapped
+// in BeginBatch/EndBatch so the reader sees ONE signalData wake per
+// response instead of two. Saves a kernel wake per RPC (~3-5 µs on
+// Windows SetEvent, ~5-10 µs on ARM, ~1-2 µs on Linux eventfd).
+//
+// Default OFF pending Linux + ARM A/B validation. Set SHM_GO_M1A=1
+// to enable. Win EPYC validation showed wake-count reduction
+// (5.35→3.93 signal-data/op) confirming the mechanism, but throughput
+// delta was within host noise band (8-31% per-cell variance); enable
+// on platforms with lower noise floor or higher wake cost to see the
+// throughput win. See repo memory grpc-go-shm-m1a-m1b-results-may31.md
+// for the design audit + alt design ("Opus alt #2": writer-side
+// TRAILERS coalesce into the same drain batch) tracked as follow-up.
+var shmM1ACoalesceEnabled = os.Getenv("SHM_GO_M1A") == "1"
+
+// buildServerInitialHeaderPayload constructs the wire-format HEADERS
+// frame body (FrameHeader + payload) for a stream's implicit server-
+// initial response headers. Returns (fh, payload, true) when caller
+// is now responsible for emitting the frame on the wire; returns
+// (_, _, false) when headers were already sent (no-op, fast path).
+//
+// The atomic headerSent CAS happens INSIDE — same dedup contract as
+// writeHeader. Callers must guarantee they will emit (fh, payload)
+// on success, or call writeHeader (legacy path) to re-emit on failure.
+func (t *ShmServerTransport) buildServerInitialHeaderPayload(s *ServerStream) (FrameHeader, []byte, bool) {
+	// CAS dedup — first writer wins, exact contract of writeHeader.
+	if s.updateHeaderSent() {
+		return FrameHeader{}, nil, false
+	}
+	s.hdrMu.Lock()
+	md := s.header.Copy()
+	s.hdrMu.Unlock()
+	// Convert metadata.MD → []KV. Pre-size for grpc-encoding append.
+	kvs := make([]KV, 0, len(md)+1)
+	for k, vals := range md {
+		byteVals := make([][]byte, len(vals))
+		for i, v := range vals {
+			byteVals[i] = []byte(v)
+		}
+		kvs = append(kvs, KV{Key: k, Values: byteVals})
+	}
+	if s.sendCompress != "" {
+		kvs = append(kvs, KV{Key: "grpc-encoding", Values: [][]byte{[]byte(s.sendCompress)}})
+	}
+	hdr := HeadersV1{
+		Version:  1,
+		HdrType:  1, // server-initial
+		Metadata: kvs,
+	}
+	payload := encodeHeaders(hdr)
+	fh := FrameHeader{
+		Type:     FrameTypeHEADERS,
+		StreamID: s.id,
+		Length:   uint32(len(payload)),
+	}
+	return fh, payload, true
+}
+
 // writeProto serializes a proto.Message directly into the ring buffer,
 // bypassing the standard encode→copy path. Returns (true, err) if handled,
 // (false, nil) if the caller should fall back to the standard path.
@@ -1684,8 +1745,14 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		return false, errStreamDone
 	}
 
-	if err := t.maybeWriteHeader(s); err != nil {
-		return false, err
+	// When M1a is DISABLED, emit the implicit HEADERS via the legacy
+	// path before we enter the inline write. When M1a is enabled the
+	// HEADERS payload is built + emitted inside the inlineMu+BeginBatch
+	// scope below so HEADERS+DATA fire one wake.
+	if !shmM1ACoalesceEnabled {
+		if err := t.maybeWriteHeader(s); err != nil {
+			return false, err
+		}
 	}
 
 	pSize := protoSize(pm)
@@ -1694,6 +1761,11 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 
 	// Skip ZC if the message is too large for a single frame.
 	if uint64(ringSize) > t.serverToClient.Capacity()/3 {
+		// Fall back to chunked write — still need to ensure headers
+		// get emitted first, the standard path will handle it.
+		if err := t.maybeWriteHeader(s); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 
@@ -1705,6 +1777,9 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	// fc.onData violation before onMessageStart's pre-credit can fire.
 	if quotaSize > shmMaxFrameSize {
 		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
+		if err := t.maybeWriteHeader(s); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 
@@ -1717,6 +1792,9 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	// Lockless quota inspect via atomic Loads.
 	if s.sendQuota.Load() < int64(quotaSize) || t.connSendQuota.Load() < int64(quotaSize) {
 		atomic.AddUint64(&shmZCWriteSkipQuota, 1)
+		if err := t.maybeWriteHeader(s); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 
@@ -1741,12 +1819,57 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		// that comment for ordering rationale.
 		if s.protoInFlight.Load() == 0 {
 			if tryReserveSendQuota(&t.connSendQuota, &s.sendQuota, int64(quotaSize)) {
-				ok2, err := writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
+				// M1a: coalesce HEADERS + DATA into one signalData wake.
+				// When this is the FIRST send for the stream and the
+				// implicit HEADERS frame has not yet been emitted, wrap
+				// (HEADERS, DATA) in BeginBatch/EndBatch so that the
+				// reader sees exactly one wake for the entire response.
+				// Without this, HEADERS and DATA would each fire their
+				// own signalData (~5 µs/wake on Windows kernel transition).
+				//
+				// The CAS-set headerSent + payload build happen INSIDE
+				// buildServerInitialHeaderPayload; returning false means
+				// headers already sent (e.g. SendHeader called explicitly,
+				// or this is a subsequent message in a server-streaming
+				// RPC). On false, skip the batch and use the legacy
+				// single-frame path that fires one wake anyway.
+				var (
+					hFh        FrameHeader
+					hPayload   []byte
+					emitHeader bool
+					headerErr  error
+				)
+				if shmM1ACoalesceEnabled {
+					hFh, hPayload, emitHeader = t.buildServerInitialHeaderPayload(s)
+				}
+				if emitHeader {
+					t.serverToClient.BeginBatch()
+					headerErr = writeFrame(s.ctx, t.serverToClient, hFh, hPayload)
+				}
+				var ok2 bool
+				var err error
+				if headerErr == nil {
+					ok2, err = writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
+				}
+				if emitHeader {
+					t.serverToClient.EndBatch()
+				}
 				t.frameWriter.inlineMu.Unlock()
 				t.frameWriter.closeMu.RUnlock()
+				if headerErr != nil {
+					// HEADERS write failed — refund quota, headerSent
+					// already CAS'd so caller cannot legally re-emit
+					// via maybeWriteHeader. Surface to gRPC layer
+					// which will RST the stream.
+					t.connSendQuota.Add(int64(quotaSize))
+					s.sendQuota.Add(int64(quotaSize))
+					return true, headerErr
+				}
 				if !ok2 {
 					// Insufficient contiguous ring space — refund and
-					// fall back to chunked path.
+					// fall back to chunked path. HEADERS already on
+					// the wire; chunked path will skip its own
+					// maybeWriteHeader via headerSent CAS dedup.
 					t.connSendQuota.Add(int64(quotaSize))
 					s.sendQuota.Add(int64(quotaSize))
 					select {
@@ -1781,6 +1904,15 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 	}
 	t.frameWriter.closeMu.RUnlock()
+
+	// Async path: emit HEADERS first (idempotent via headerSent CAS),
+	// then enqueue the async proto DATA. The writer goroutine handles
+	// FC + chunking; the writeStatus trailer-sentinel guarantees
+	// DATA-before-TRAILERS even when async DATA is still draining when
+	// writeStatus arrives.
+	if err := t.maybeWriteHeader(s); err != nil {
+		return false, err
+	}
 
 	// Async path (re-enabled May 2026): writer goroutine owns FC
 	// reservation. The writeStatus trailer sentinel synchronises
@@ -1901,6 +2033,16 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	// emitTrailerEntry at the moment of the actual ring write, so
 	// processProtoEntry's streamDone drop check happens-after every
 	// DATA we drained.
+	//
+	// Note (2026-05-31): an "inline trailer" fast path (M1b) was
+	// prototyped but caused a -11% regression on Fair 1K Unary because
+	// holding inlineMu across the synchronous TRAILERS ring write
+	// blocked sibling streams' writeProto TryLock, which in turn broke
+	// their M1a HEADERS+DATA coalesce, adding back a wake per victim
+	// RPC. The wake-saving alternative is to let the writer goroutine's
+	// existing batch drain absorb TRAILERS into the same EndBatch as
+	// the DATA it sits behind (see grpc-go-shm-m1a-m1b-results-may31
+	// memo "Opus alt #2"). Tracked as a follow-up PR.
 	doneCh := getDoneCh()
 	entry := frameEntry{
 		ctx:       context.Background(),
@@ -1909,6 +2051,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		doneCh:    doneCh,
 		streamPtr: &s.Stream,
 	}
+	atomic.AddUint64(&shmTrailerAsyncFire, 1)
 	if !t.frameWriter.trySend(entry) {
 		putDoneCh(doneCh)
 		// Writer closed mid-enqueue. Mirror the earlier behaviour
@@ -1942,7 +2085,14 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 	}
 
-	// Remove stream from active streams and finish draining if needed.
+	return t.finishWriteStatus(s, werr)
+}
+
+// finishWriteStatus runs the post-TRAILERS-emit cleanup shared by
+// the legacy chan-sentinel path: removes the stream from the active
+// map, clears the direct-mapped slot, runs the drain-close trigger,
+// and returns the err observed at emit time.
+func (t *ShmServerTransport) finishWriteStatus(s *ServerStream, werr error) error {
 	var shouldClose bool
 	var dbg string
 	t.mu.Lock()
@@ -1962,7 +2112,6 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	if shouldClose {
 		go t.Close(errors.New("transport drained: " + dbg))
 	}
-
 	return werr
 }
 

@@ -122,6 +122,29 @@ func startZCProbe(b *testing.B) func() {
 		// = piggyback working; near-zero at low concurrency = chan
 		// empty (no work to amortise).
 		report("inline-piggyback-drain/op", delta.InlinePiggybackDrain)
+		// Wake / response-path diagnostics (2026-05-31).
+		// signal-data/op = number of ring signalData() calls per
+		// bench iteration (sum of both directions). For a unary
+		// ping-pong the floor is 2 (1 client request + 1 server
+		// response); higher = response side emits multiple
+		// independent wakes (HEADERS, DATA, TRAILERS each fire).
+		report("signal-data/op", delta.SignalDataFire)
+		report("signal-space/op", delta.SignalSpaceFire)
+		// enq-wait-inline = enqueueAndWait took inline fast path
+		// (TryLock succeeded → caller wrote ring directly, no
+		// chan / writer goroutine round-trip). enq-wait-async =
+		// fell back to chan + doneCh.
+		report("enq-wait-inline/op", delta.EnqueueWaitInline)
+		report("enq-wait-async/op", delta.EnqueueWaitAsync)
+		// trailer-async/op = writeStatus enqueued TRAILERS via the
+		// async chan-sentinel path (this is the only path TRAILERS
+		// take today; counter exists to baseline before adding an
+		// optional inline-TRAILERS optimisation).
+		report("trailer-async/op", delta.TrailerAsyncFire)
+		// trailer-deferred/op = processTrailerEntry parked TRAILERS
+		// behind in-flight DATA. Near-zero in unary, may be non-
+		// zero under server-streaming + async sends.
+		report("trailer-deferred/op", delta.TrailerDeferredFire)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)

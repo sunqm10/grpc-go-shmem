@@ -193,6 +193,57 @@ var (
 	// Counter shape: increments by 1 per drained entry, NOT by 1
 	// per inline-write success.
 	shmInlinePiggybackDrain uint64
+
+	// --- Wake / response-path diagnostics (2026-05-31) ---
+	// These counters trace the unary-response critical path on the
+	// server side. Goal: prove or refute the "3-wake-per-unary"
+	// hypothesis (HEADERS + DATA + TRAILERS each emit an independent
+	// signalData) that motivates the M1 coalesce optimisation.
+
+	// shmSignalDataFire: number of signalData() calls observed at
+	// the ring layer (both directions of every ShmRing). One call
+	// = one ring "DataSeq increment + peer wake" attempt. Note that
+	// when peer is not parked this is still counted (the SetEvent /
+	// futex_wake / eventfd write still runs); only the BeginBatch
+	// suppress path skips it.
+	shmSignalDataFire uint64
+
+	// shmSignalSpaceFire: number of signalSpace() calls observed.
+	// Same semantics as shmSignalDataFire but for the reader-after-
+	// commit-read "hey writer, space freed" wake.
+	shmSignalSpaceFire uint64
+
+	// shmEnqueueWaitInline: enqueueAndWait used its inline fast
+	// path (TryLock succeeded → caller wrote ring directly, no
+	// chan / doneCh / writer-goroutine round-trip). Used for
+	// server HEADERS and other synchronous control frames.
+	shmEnqueueWaitInline uint64
+
+	// shmEnqueueWaitAsync: enqueueAndWait fell back to the chan
+	// path because TryLock(inlineMu) failed (writer goroutine
+	// mid-batch). Caller paid 2 goroutine context switches +
+	// chan-send + doneCh-wait.
+	shmEnqueueWaitAsync uint64
+
+	// shmTrailerAsyncFire: writeStatus enqueued a TRAILERS frame
+	// via trySend (the async chan-sentinel path). Per design this
+	// is the ONLY path TRAILERS take today (to preserve DATA-
+	// before-TRAILERS ordering). A 2026-05-31 M1b experiment that
+	// added an inline trailer fast path regressed throughput by
+	// 5-11% due to inlineMu contention breaking sibling streams'
+	// M1a HEADERS+DATA coalesce, so the inline path was removed.
+	// See grpc-go-shm-m1a-m1b-results-may31 memo for the alternative
+	// design ("Opus alt #2": writer-side TRAILERS coalesce into the
+	// existing batch drain) tracked as a follow-up PR.
+	shmTrailerAsyncFire uint64
+
+	// shmTrailerDeferredFire: processTrailerEntry parked the
+	// TRAILERS in deferredTrailers because DATA was still in flight
+	// for the same streamID. Indicates the trailer-sentinel
+	// machinery actually engaged. Near-zero in unary ping-pong
+	// (handler returns synchronously) but non-trivial in async
+	// server-streaming workloads.
+	shmTrailerDeferredFire uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -236,6 +287,13 @@ type ShmPathCounters struct {
 	InlineWriteBailZeroLen       uint64
 
 	InlinePiggybackDrain uint64
+
+	SignalDataFire         uint64
+	SignalSpaceFire        uint64
+	EnqueueWaitInline      uint64
+	EnqueueWaitAsync       uint64
+	TrailerAsyncFire       uint64
+	TrailerDeferredFire    uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -276,6 +334,13 @@ func LoadShmPathCounters() ShmPathCounters {
 		InlineWriteBailZeroLen:       atomic.LoadUint64(&shmInlineWriteBailZeroLen),
 
 		InlinePiggybackDrain: atomic.LoadUint64(&shmInlinePiggybackDrain),
+
+		SignalDataFire:      atomic.LoadUint64(&shmSignalDataFire),
+		SignalSpaceFire:     atomic.LoadUint64(&shmSignalSpaceFire),
+		EnqueueWaitInline:   atomic.LoadUint64(&shmEnqueueWaitInline),
+		EnqueueWaitAsync:    atomic.LoadUint64(&shmEnqueueWaitAsync),
+		TrailerAsyncFire:    atomic.LoadUint64(&shmTrailerAsyncFire),
+		TrailerDeferredFire: atomic.LoadUint64(&shmTrailerDeferredFire),
 	}
 }
 
@@ -317,5 +382,12 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		InlineWriteBailZeroLen:       a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
 
 		InlinePiggybackDrain: a.InlinePiggybackDrain - before.InlinePiggybackDrain,
+
+		SignalDataFire:      a.SignalDataFire - before.SignalDataFire,
+		SignalSpaceFire:     a.SignalSpaceFire - before.SignalSpaceFire,
+		EnqueueWaitInline:   a.EnqueueWaitInline - before.EnqueueWaitInline,
+		EnqueueWaitAsync:    a.EnqueueWaitAsync - before.EnqueueWaitAsync,
+		TrailerAsyncFire:    a.TrailerAsyncFire - before.TrailerAsyncFire,
+		TrailerDeferredFire: a.TrailerDeferredFire - before.TrailerDeferredFire,
 	}
 }

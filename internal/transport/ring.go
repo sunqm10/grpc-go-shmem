@@ -780,6 +780,7 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 // exercise the futex wake primitive must disable the eventfd waker
 // via ConfigureShmEventfdWakerForBench(false).
 func (r *ShmRing) signalData(addr *uint32) {
+	atomic.AddUint64(&shmSignalDataFire, 1)
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
 		return
@@ -797,6 +798,7 @@ func (r *ShmRing) signalData(addr *uint32) {
 // See signalData for the rationale on skipping futex_wake when the
 // eventfd waker is active.
 func (r *ShmRing) signalSpace(addr *uint32) {
+	atomic.AddUint64(&shmSignalSpaceFire, 1)
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
 		return
