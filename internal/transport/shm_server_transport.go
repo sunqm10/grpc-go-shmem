@@ -648,7 +648,14 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// Per-transport WU emission threshold. See computeWUThreshold for the
 	// deadlock-correctness note. Atomic for lockless WU emit path.
 	t.wuThreshold.Store(computeWUThreshold(t.initialWindowSize))
-	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
+	// BDP estimator intentionally NOT initialized for SHM. See the
+	// matching comment in shm_client_transport.go for the rationale:
+	// SHM is a local memcpy, BDP is effectively infinite, RTT is
+	// sub-microsecond. Running BDP estimation only adds periodic
+	// PING+ACK overhead and lock-contended updateFlowControl passes
+	// without ever discovering useful new information. The nil
+	// bdpEst short-circuits at every call site that reads it.
+	t.bdpEst = nil
 
 	max := segment.H.MaxStreams()
 	if max == 0 {

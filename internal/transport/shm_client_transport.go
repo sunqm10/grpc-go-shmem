@@ -881,7 +881,18 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// deadlock this avoids. Atomic so lockless WU emission can read it
 	// without taking sendQuotaMu.
 	t.wuThreshold.Store(computeWUThreshold(t.initialWindowSize))
-	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
+	// BDP estimator intentionally NOT initialized for SHM. The BDP
+	// estimator's purpose is to discover the bandwidth-delay product
+	// for a TCP path with unknown bandwidth and non-trivial RTT, then
+	// grow the receive window to keep the pipe full. SHM is a local
+	// memcpy: BDP is effectively infinite, RTT is sub-microsecond, and
+	// the receive window is already chosen to amortise per-frame
+	// overhead (32 MiB default). Running BDP estimation here costs a
+	// periodic PING+ACK round-trip plus a lock-contended updateFlowControl
+	// pass on every BDP recalculation, and was measured as a noticeable
+	// fixed-cost overhead on 1 KiB Unary RPCs (ARM/x64 alike). The
+	// nil bdpEst short-circuits at every call site that reads it.
+	t.bdpEst = nil
 
 	max := segment.H.MaxStreams()
 	if max == 0 {
