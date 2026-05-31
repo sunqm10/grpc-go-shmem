@@ -254,6 +254,16 @@ var (
 	// (handler returns synchronously) but non-trivial in async
 	// server-streaming workloads.
 	shmTrailerDeferredFire uint64
+
+	// shmM1aBatchFire: ShmServerTransport.writeProto's M1a
+	// wake-coalesce branch entered BeginBatch around HEADERS+DATA
+	// for the first server response message. The unfused fallback
+	// (where emitHeader=false, e.g. subsequent streaming messages,
+	// explicit prior SendHeader, or M1a disabled) does NOT
+	// increment this counter. A regression that disables or breaks
+	// the M1a path would observe this counter stay at zero after
+	// the first server response. Used by TestShmM1aFusesHeaders*.
+	shmM1aBatchFire uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -305,6 +315,11 @@ type ShmPathCounters struct {
 	TrailerAsyncFire             uint64
 	TrailerCommitParkedReader    uint64
 	TrailerDeferredFire          uint64
+
+	// M1aBatchFire counts ShmServerTransport.writeProto entries
+	// into the HEADERS+DATA wake-coalesce batch (M1a). Zero after
+	// a server response would indicate the M1a path regressed.
+	M1aBatchFire uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -353,6 +368,8 @@ func LoadShmPathCounters() ShmPathCounters {
 		TrailerAsyncFire:          atomic.LoadUint64(&shmTrailerAsyncFire),
 		TrailerCommitParkedReader: atomic.LoadUint64(&shmTrailerCommitParkedReader),
 		TrailerDeferredFire:       atomic.LoadUint64(&shmTrailerDeferredFire),
+
+		M1aBatchFire: atomic.LoadUint64(&shmM1aBatchFire),
 	}
 }
 
@@ -402,5 +419,7 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		TrailerAsyncFire:          a.TrailerAsyncFire - before.TrailerAsyncFire,
 		TrailerCommitParkedReader: a.TrailerCommitParkedReader - before.TrailerCommitParkedReader,
 		TrailerDeferredFire:       a.TrailerDeferredFire - before.TrailerDeferredFire,
+
+		M1aBatchFire: a.M1aBatchFire - before.M1aBatchFire,
 	}
 }

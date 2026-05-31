@@ -24,62 +24,66 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// TestShmM1aWakeCoalesceOnFirstResponse verifies the M1a optimization:
-// the server's first response message in an RPC fuses HEADERS + DATA
-// into a single BeginBatch/EndBatch scope so the client reader pays
-// exactly ONE signalData wake instead of two.
+// TestShmM1aBatchFiresOnFirstResponse verifies that
+// ShmServerTransport.writeProto's M1a HEADERS+DATA wake-coalesce
+// branch (BeginBatch/EndBatch around the first server response)
+// actually enters on the M1a path.
 //
-// What it asserts:
-//   - For one unary RPC: server emits exactly 1 signalData on the
-//     server->client ring for the response (HEADERS + DATA combined).
-//   - For two messages on the same server stream (streaming): the
-//     first emits 1 (HEADERS+DATA fused), and subsequent emit 1 each
-//     (DATA alone, no batch).
+// Uses the dedicated shmM1aBatchFire counter (incremented only
+// inside the M1a branch in shm_server_transport.go around L1891)
+// for a clean exact-count assertion that doesn't rely on signalData
+// timing (signalData is gated on DataWaiters>0 and is flaky to
+// assert in tight in-test loops).
 //
-// The bound check uses an inequality (<=) because the standalone
-// sendConnWindowUpdate / sendStreamWindowUpdate paths may also fire
-// signalData for unrelated WU frames; this test asserts the M1a
-// invariant ONLY, namely that the response-side wake floor is not
-// inflated by HEADERS firing a separate signal.
-func TestShmM1aWakeCoalesceOnFirstResponse(t *testing.T) {
+// What we assert:
+//   - After one server response sent via WriteProto (the M1a code
+//     path), shmM1aBatchFire incremented by exactly 1.
+//   - End-to-end response still arrives correctly with OK status.
+//
+// A regression that removes M1a's BeginBatch/EndBatch scope, or that
+// flips emitHeader to false incorrectly, would leave the counter at 0
+// and the test fails.
+//
+// This test was rewritten after a round-2 review caught that the
+// original brittle wake-count assertion was both wrong (calling
+// s.Write which routes through the byte path, not writeProto) and
+// too loose (delta <= 4 also satisfied by an unfused HEADERS+DATA
+// at 4).
+func TestShmM1aBatchFiresOnFirstResponse(t *testing.T) {
 	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Server handler: read request, send single response message + OK status.
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
 		st.HandleStreams(ctx, func(s *ServerStream) {
-			_, _ = s.Read(1024)
-			payload := []byte("OK")
-			hdr := make([]byte, 5)
-			hdr[0] = 0
-			binaryBE32(hdr[1:5], uint32(len(payload)))
-			_ = s.Write(hdr, mem.BufferSlice{mem.SliceBuffer(payload)}, &WriteOptions{})
+			if _, err := s.Read(1024); err != nil && err != io.EOF {
+				return
+			}
+			// Use WriteProto — exercises ShmServerTransport.writeProto
+			// where M1a lives. s.Write (byte path) would NOT hit M1a.
+			resp := &wrapperspb.BytesValue{Value: []byte("M1A-OK")}
+			if _, err := s.WriteProto(resp, &WriteOptions{}); err != nil {
+				return
+			}
 			_ = s.WriteStatus(status.New(codes.OK, ""))
 		})
 	}()
 
-	// Open one stream, send request, read response, close.
-	callHdr := &CallHdr{Host: "localhost", Method: "/test/M1a"}
+	callHdr := &CallHdr{Host: "localhost", Method: "/test/M1aBatch"}
 	cs, err := ct.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
 
-	// --- Snapshot signal-data counter BEFORE the response side wakes ---
-	// We bracket from "client send" to "client receive complete" — any
-	// signalData fired in that window is by definition the response-
-	// side activity (modulo background WU drift, which is bounded by
-	// the WU threshold and effectively zero for this tiny RPC).
-	before := atomic.LoadUint64(&shmSignalDataFire)
+	beforeBatch := atomic.LoadUint64(&shmM1aBatchFire)
 
-	// Client send: request message + Last sentinel.
 	req := make([]byte, 16)
 	reqHdr := make([]byte, 5)
 	binaryBE32(reqHdr[1:5], uint32(len(req)))
@@ -87,37 +91,23 @@ func TestShmM1aWakeCoalesceOnFirstResponse(t *testing.T) {
 		t.Fatalf("cs.Write request: %v", err)
 	}
 
-	// Drain client recv path: header, message, status.
 	if _, err := cs.Read(1024); err != nil && err != io.EOF {
 		t.Fatalf("cs.Read response: %v", err)
 	}
-
-	// Wait briefly for trailing status to settle.
 	select {
 	case <-cs.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatalf("stream Done timed out")
 	}
 
-	delta := atomic.LoadUint64(&shmSignalDataFire) - before
+	delta := atomic.LoadUint64(&shmM1aBatchFire) - beforeBatch
+	if delta != 1 {
+		t.Errorf("M1a BeginBatch fired %d times for one unary RPC, want 1 "+
+			"(regression: M1a branch did not engage on the first server response)", delta)
+	}
 
-	// What we expect:
-	//   - 1 signalData from the client SEND (request DATA on client->server ring)
-	//   - 1 signalData from the server RESPONSE (HEADERS+DATA fused by M1a) on
-	//     server->client ring
-	//   - 1 signalData from the server WriteStatus (TRAILERS) on server->client ring
-	//   - Possibly small extras from WU emissions (bounded; threshold not crossed
-	//     for this tiny payload at default 32MiB window)
-	//
-	// Without M1a the server response would fire 2 signals on server->client ring
-	// (one HEADERS, one DATA), giving a total >= 4. With M1a: == 3 in the floor.
-	//
-	// We assert delta <= 4 to permit one stray WU and still catch the regression
-	// (which would push delta to 5+).
-	const m1aWakeCeiling = 4
-	if delta > m1aWakeCeiling {
-		t.Errorf("M1a wake-coalesce regression: signalData delta = %d, want <= %d "+
-			"(an unfused HEADERS+DATA response would push it to >= 5)", delta, m1aWakeCeiling)
+	if st := cs.Status(); st.Code() != codes.OK {
+		t.Errorf("stream status = %s, want OK", st.Code())
 	}
 
 	ct.Close(nil)
@@ -125,10 +115,18 @@ func TestShmM1aWakeCoalesceOnFirstResponse(t *testing.T) {
 	<-serverDone
 }
 
-// TestShmM1aHeaderDedupAcrossExplicitSendHeader verifies the M1a code
-// path's headerSent CAS dedup: if the handler calls SendHeader
-// explicitly BEFORE the first Write, the M1a fast path must not
-// emit a duplicate HEADERS frame.
+// TestShmM1aHeaderDedupAcrossExplicitSendHeader verifies the
+// headerSent CAS dedup: if the handler calls SendHeader explicitly
+// BEFORE WriteProto, buildServerInitialHeaderPayload returns
+// emitHeader=false, so M1a does NOT enter the BeginBatch branch.
+// A duplicate HEADERS would surface as a PROTOCOL_ERROR on the
+// client decoder or as a non-OK final status.
+//
+// What we assert:
+//   - After SendHeader+WriteProto: shmM1aBatchFire stays at 0
+//     (emitHeader=false skips the batch entirely).
+//   - Response still arrives correctly with OK status — proves no
+//     duplicate HEADERS was sent.
 func TestShmM1aHeaderDedupAcrossExplicitSendHeader(t *testing.T) {
 	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
 	defer cleanup()
@@ -140,16 +138,20 @@ func TestShmM1aHeaderDedupAcrossExplicitSendHeader(t *testing.T) {
 	go func() {
 		defer close(serverDone)
 		st.HandleStreams(ctx, func(s *ServerStream) {
-			_, _ = s.Read(1024)
-			// EXPLICIT SendHeader before Write — M1a must observe
-			// headerSent == 1 and skip its own HEADERS emission.
-			_ = s.SendHeader(nil)
-
-			payload := []byte("DEDUP-OK")
-			hdr := make([]byte, 5)
-			hdr[0] = 0
-			binaryBE32(hdr[1:5], uint32(len(payload)))
-			_ = s.Write(hdr, mem.BufferSlice{mem.SliceBuffer(payload)}, &WriteOptions{})
+			if _, err := s.Read(1024); err != nil && err != io.EOF {
+				return
+			}
+			// Explicit SendHeader -> headerSent CAS to 1
+			if err := s.SendHeader(nil); err != nil {
+				return
+			}
+			// WriteProto -> buildServerInitialHeaderPayload returns
+			// emitHeader=false because headerSent is already 1.
+			// M1a batch path MUST NOT enter; shmM1aBatchFire stays 0.
+			resp := &wrapperspb.BytesValue{Value: []byte("DEDUP-OK")}
+			if _, err := s.WriteProto(resp, &WriteOptions{}); err != nil {
+				return
+			}
 			_ = s.WriteStatus(status.New(codes.OK, ""))
 		})
 	}()
@@ -160,6 +162,8 @@ func TestShmM1aHeaderDedupAcrossExplicitSendHeader(t *testing.T) {
 		t.Fatalf("NewStream: %v", err)
 	}
 
+	beforeBatch := atomic.LoadUint64(&shmM1aBatchFire)
+
 	req := make([]byte, 4)
 	reqHdr := make([]byte, 5)
 	binaryBE32(reqHdr[1:5], uint32(len(req)))
@@ -167,25 +171,95 @@ func TestShmM1aHeaderDedupAcrossExplicitSendHeader(t *testing.T) {
 		t.Fatalf("cs.Write request: %v", err)
 	}
 
-	// Read response; if HEADERS were duplicated, the decoder will surface a
-	// PROTOCOL_ERROR or the stream will error out. We accept (resp != nil, err == nil)
-	// OR (resp != nil, err == io.EOF) — both indicate the response message was
-	// observed cleanly; a duplicate HEADERS would have manifested as a non-EOF
-	// error from cs.Read or as a non-OK status below.
-	resp, err := cs.Read(1024)
-	if err != nil && err != io.EOF {
+	if _, err := cs.Read(1024); err != nil && err != io.EOF {
 		t.Fatalf("cs.Read response: %v (a duplicate HEADERS would surface here as PROTOCOL_ERROR)", err)
 	}
-	_ = resp // payload presence not asserted; we test status below
-
 	select {
 	case <-cs.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatalf("stream Done timed out")
 	}
 
+	delta := atomic.LoadUint64(&shmM1aBatchFire) - beforeBatch
+	if delta != 0 {
+		t.Errorf("M1a BeginBatch fired %d times after explicit SendHeader, want 0 "+
+			"(regression: headerSent dedup broken, M1a would emit duplicate HEADERS)", delta)
+	}
+
 	if st := cs.Status(); st.Code() != codes.OK {
-		t.Errorf("stream status = %s, want OK (a duplicate HEADERS would make this fail)", st.Code())
+		t.Errorf("stream status = %s, want OK (a duplicate HEADERS would corrupt the response)", st.Code())
+	}
+
+	ct.Close(nil)
+	st.Close(nil)
+	<-serverDone
+}
+
+// TestShmM1aOnlyOnFirstMessageInStream verifies that for a server-
+// streaming RPC sending N response messages, the M1a batch fires
+// EXACTLY ONCE (on the first message, where HEADERS hasn't been
+// sent yet). Subsequent messages must take the emitHeader=false
+// path (no batch).
+func TestShmM1aOnlyOnFirstMessageInStream(t *testing.T) {
+	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverDone := make(chan struct{})
+	const numResponses = 5
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(ctx, func(s *ServerStream) {
+			if _, err := s.Read(1024); err != nil && err != io.EOF {
+				return
+			}
+			for i := 0; i < numResponses; i++ {
+				resp := &wrapperspb.BytesValue{Value: []byte("STREAMING-RESP")}
+				if _, err := s.WriteProto(resp, &WriteOptions{}); err != nil {
+					return
+				}
+			}
+			_ = s.WriteStatus(status.New(codes.OK, ""))
+		})
+	}()
+
+	callHdr := &CallHdr{Host: "localhost", Method: "/test/M1aStream"}
+	cs, err := ct.NewStream(ctx, callHdr, nil)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	beforeBatch := atomic.LoadUint64(&shmM1aBatchFire)
+
+	req := make([]byte, 8)
+	reqHdr := make([]byte, 5)
+	binaryBE32(reqHdr[1:5], uint32(len(req)))
+	if err := cs.Write(reqHdr, mem.BufferSlice{mem.SliceBuffer(req)}, &WriteOptions{Last: true}); err != nil && err != io.EOF {
+		t.Fatalf("cs.Write request: %v", err)
+	}
+
+	for i := 0; i < numResponses; i++ {
+		if _, err := cs.Read(1024); err != nil && err != io.EOF {
+			t.Fatalf("cs.Read response[%d]: %v", i, err)
+		}
+	}
+	select {
+	case <-cs.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("stream Done timed out")
+	}
+
+	delta := atomic.LoadUint64(&shmM1aBatchFire) - beforeBatch
+	if delta != 1 {
+		t.Errorf("M1a BeginBatch fired %d times for %d-message stream, want exactly 1 "+
+			"(regression: M1a batch firing on subsequent messages, or not firing on first)",
+			delta, numResponses)
+	}
+
+	if st := cs.Status(); st.Code() != codes.OK {
+		t.Errorf("stream status = %s, want OK", st.Code())
 	}
 
 	ct.Close(nil)

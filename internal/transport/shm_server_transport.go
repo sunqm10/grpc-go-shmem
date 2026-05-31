@@ -1888,6 +1888,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				hFh, hPayload, emitHeader := t.buildServerInitialHeaderPayload(s)
 				var headerErr error
 				if emitHeader {
+					atomic.AddUint64(&shmM1aBatchFire, 1)
 					t.serverToClient.BeginBatch()
 					headerErr = writeFrame(s.ctx, t.serverToClient, hFh, hPayload)
 				}
