@@ -1871,19 +1871,31 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				// pendingConnWU or pendingWU(s) for this stream
 				// from consuming the client request, this drains
 				// those WU frames inside inlineMu so they ride out
-				// on the SAME writer position. When emitHeader is
-				// true (M1a active) the WU writeFrame's Commit
-				// also benefits from the open BeginBatch and the
-				// WU joins the HEADERS+DATA wake. When emitHeader
-				// is false (subsequent server-streaming message,
-				// SendHeader-already-called etc.) there is no open
-				// batch so WU and DATA each fire their own wake,
-				// but still saves the writer-goroutine chan-hop
-				// for the WU frame. No-op when nothing pending.
-				// The lookupStream slow path takes t.mu.RLock —
-				// safe under inlineMu (see piggybackWUForWriter
-				// LOCK ORDERING comment).
-				if ok2 && err == nil && t.frameWriter.piggybackWUFn != nil {
+				// on the SAME writer position.
+				//
+				// CRITICAL: skip when emitHeader=true (M1a active).
+				// Reasoning: M1a's win is wake-coalesce -- the
+				// EndBatch is the single signalData that the client
+				// reader unparks on. Piggybacking the WU's
+				// writeFrame.Commit INSIDE the open batch would
+				// suppress that wake too but adds ~200ns of ring
+				// reservation+copy work BETWEEN the DATA commit and
+				// the EndBatch signal, delaying the client reader's
+				// unpark by exactly that much per RPC. Empirically
+				// (Win ARM 2026-05-31 cross-impl bench) this drove
+				// the fair 4K-256K SHM/UDS ratio down ~0.15-0.23
+				// because every fair RPC at >=4K crosses the 16K
+				// WU threshold and queues a pending WU. The same
+				// pattern that killed M1c. Subsequent server-
+				// streaming messages (emitHeader=false) keep the
+				// piggyback win because their DATA Commit fires its
+				// own wake immediately and the WU writeFrame runs
+				// AFTER that, not before.
+				//
+				// Lock-ordering: lookupStream slow path takes
+				// t.mu.RLock -- safe under inlineMu (see
+				// piggybackWUForWriter LOCK ORDERING comment).
+				if ok2 && err == nil && !emitHeader && t.frameWriter.piggybackWUFn != nil {
 					t.frameWriter.piggybackWUFn(s.id)
 				}
 				if emitHeader {
