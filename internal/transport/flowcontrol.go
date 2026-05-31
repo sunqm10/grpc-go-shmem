@@ -285,13 +285,16 @@ func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 		n = uint32(math.MaxInt32)
 	}
 	f.mu.Lock()
-	// Backpressure gate: if admitting this LPM would push total
-	// outstanding buffered bytes above `n + limit`, refuse pre-credit
-	// and force the sender to wait. The cap allows exactly one LPM in
-	// flight plus one stream-window's worth of slack (matches HTTP/2's
-	// "1 message in transit, 1 ready to read" buffer depth).
-	maxBuffered := int64(f.limit) + int64(n)
-	if int64(f.pendingData)+int64(f.pendingUpdate)+int64(n) > maxBuffered {
+	// Backpressure gate: refuse pre-credit if total outstanding
+	// receiver-buffered bytes (pendingData + pendingUpdate) already
+	// exceeds f.limit. The +n on both sides of an earlier formulation
+	// cancelled algebraically; the cap is just "buffered <= limit", i.e.
+	// "1 window's worth of slack can sit ahead of consumption before a
+	// pending LPM is refused". Matches HTTP/2's "1 message in transit,
+	// 1 ready to read" depth model — the new LPM (n bytes) can be
+	// admitted only when the buffer has not yet absorbed a full window
+	// of unread bytes.
+	if int64(f.pendingData)+int64(f.pendingUpdate) > int64(f.limit) {
 		f.mu.Unlock()
 		return 0
 	}

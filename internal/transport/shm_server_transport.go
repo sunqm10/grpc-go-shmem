@@ -28,7 +28,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -1665,27 +1664,31 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 	return t.writeHeader(s, md)
 }
 
-// shmM1ACoalesceHeadersData controls the M1a optimisation: in
-// writeProto, when the implicit HEADERS frame has not yet been sent,
-// emit HEADERS + first DATA under a single inlineMu acquisition wrapped
-// in BeginBatch/EndBatch so the reader sees ONE signalData wake per
-// response instead of two. Saves a kernel wake per RPC (~3-5 µs on
+// M1a — HEADERS+DATA coalesce in writeProto.
+//
+// When the inline ZC fast path succeeds AND the implicit HEADERS frame
+// has not yet been sent for this stream, the response HEADERS frame is
+// built and emitted into the SAME BeginBatch/EndBatch scope as the
+// response DATA. The reader therefore sees ONE signalData wake covering
+// both frames instead of two — saving a kernel wake per RPC (~3-5 µs on
 // Windows SetEvent, ~5-10 µs on ARM, ~1-2 µs on Linux eventfd).
 //
-// Default ON. Set SHM_GO_M1A=0 to fall back to the legacy 2-wake
-// path for A/B comparison.
+// Always on. The mechanism is purely additive (the legacy two-wake path
+// remains the fallback whenever the inline path skips: !TryLock,
+// protoInFlight>0, CAS-fail, fragments-too-large, headers already sent
+// via explicit SendHeader). No A/B switch in production code; benchmark
+// validation is done by reading the per-op `signal-data/op` and
+// `enq-wait-inline/op` counters under `SHM_BENCH_ZC=1`.
 //
-// Validation status (2026-05-31):
-//   - Mechanism proven on Win EPYC: signal-data/op drops 5.35 → 3.93
-//     (-1.4 wakes/op) when enabled.
-//   - Win EPYC throughput delta within host noise band (8-31% per-cell
-//     variance) — visible benefit needs lower-noise hardware.
-//   - Estimated +5% on Win EPYC, +15-30% on Win ARM 1K Unary (where
-//     SetEvent is ~2× slower), +1-3% on Linux x64 (eventfd cheaper).
-//   - Fully race-tested; no API / wire-format change.
+// Note: the M1a branch builds the HEADERS payload (md.Copy + KV alloc +
+// encodeHeaders) while holding inlineMu. This extends the ring critical
+// section by ~200-500 ns vs. the legacy path where the encode happened
+// off-lock. The trade is acceptable because the M1a branch only fires on
+// the low-contention inline fast path (TryLock + protoInFlight==0); at
+// higher concurrency the path drops to async automatically.
 //
-// See repo memory grpc-go-shm-m1a-m1b-results-may31.md.
-var shmM1ACoalesceEnabled = os.Getenv("SHM_GO_M1A") != "0"
+// See repo memory grpc-go-shm-m1a-m1b-results-may31.md for the M1a/M1b/M1c
+// design audit and the rejected M1c follow-up.
 
 // buildServerInitialHeaderPayload constructs the wire-format HEADERS
 // frame body (FrameHeader + payload) for a stream's implicit server-
@@ -1762,16 +1765,6 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	// Check stream is still active before doing work.
 	if s.getState() != streamActive {
 		return false, errStreamDone
-	}
-
-	// When M1a is DISABLED, emit the implicit HEADERS via the legacy
-	// path before we enter the inline write. When M1a is enabled the
-	// HEADERS payload is built + emitted inside the inlineMu+BeginBatch
-	// scope below so HEADERS+DATA fire one wake.
-	if !shmM1ACoalesceEnabled {
-		if err := t.maybeWriteHeader(s); err != nil {
-			return false, err
-		}
 	}
 
 	pSize := protoSize(pm)
@@ -1852,15 +1845,8 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				// or this is a subsequent message in a server-streaming
 				// RPC). On false, skip the batch and use the legacy
 				// single-frame path that fires one wake anyway.
-				var (
-					hFh        FrameHeader
-					hPayload   []byte
-					emitHeader bool
-					headerErr  error
-				)
-				if shmM1ACoalesceEnabled {
-					hFh, hPayload, emitHeader = t.buildServerInitialHeaderPayload(s)
-				}
+				hFh, hPayload, emitHeader := t.buildServerInitialHeaderPayload(s)
+				var headerErr error
 				if emitHeader {
 					t.serverToClient.BeginBatch()
 					headerErr = writeFrame(s.ctx, t.serverToClient, hFh, hPayload)
@@ -1869,6 +1855,19 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				var err error
 				if headerErr == nil {
 					ok2, err = writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
+				}
+				// Piggyback any pending WU credit onto the same batch
+				// (mirrors tryInlineWrite / processWholeMessage / chunked
+				// paths). When the server has accumulated pendingConnWU
+				// or pendingWU(s) for this stream from consuming the
+				// client request, this folds those WU frames INTO the
+				// HEADERS+DATA wake instead of emitting a separate
+				// frame+wake later. No-op when nothing pending. Runs
+				// only on successful DATA commit; the lookupStream slow
+				// path takes t.mu.RLock — safe under inlineMu (see
+				// piggybackWUForWriter LOCK ORDERING comment).
+				if ok2 && err == nil && t.frameWriter.piggybackWUFn != nil {
+					t.frameWriter.piggybackWUFn(s.id)
 				}
 				if emitHeader {
 					t.serverToClient.EndBatch()
@@ -1978,6 +1977,23 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 }
 
 // writeStatus writes status for a stream (trailers)
+//
+// statusOKTrailerPayload is the pre-built TRAILERS payload for the
+// common "status=OK, no message, no trailer metadata" case — the
+// dominant outcome for successful unary handlers. Built once at
+// package init; immutable thereafter (writeFrame only reads). Reusing
+// it skips a per-call `s.trailer.Copy()` map clone + an 11-byte
+// `make([]byte, ...)` + the byte-write loop in encodeTrailers — saves
+// ~80 ns + 1 alloc on every successful unary RPC. Larger savings on
+// streaming server when status is OK with no late trailers (which is
+// the common case for streaming RPCs too).
+var statusOKTrailerPayload = encodeTrailers(TrailersV1{
+	Version:        1,
+	GRPCStatusCode: 0,
+	GRPCStatusMsg:  "",
+})
+
+// writeStatus writes status for a stream (trailers)
 func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) error {
 	if t.closed.Load() {
 		return ErrConnClosing
@@ -2008,32 +2024,49 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
 	}
 
-	// Snapshot trailer metadata.
-	s.hdrMu.Lock()
-	trMD := s.trailer.Copy()
-	s.hdrMu.Unlock()
-
-	// Pre-size kvs from len(trMD); pre-size byteVals from len(vals).
-	kvs := make([]KV, 0, len(trMD))
-	for k, vals := range trMD {
-		byteVals := make([][]byte, len(vals))
-		for i, v := range vals {
-			byteVals[i] = []byte(v)
+	// Fast path: the common OK + no-message + no-trailer-metadata case
+	// uses a pre-built immutable payload, skipping s.trailer.Copy() +
+	// kvs allocation + encodeTrailers. Probe `len(s.trailer)` under
+	// hdrMu since SetTrailer can race the response path; for the
+	// successful unary handler that never called SetTrailer, len==0.
+	var payload []byte
+	var fh FrameHeader
+	if st.Code() == codes.OK && st.Message() == "" {
+		s.hdrMu.Lock()
+		emptyTrailer := len(s.trailer) == 0
+		s.hdrMu.Unlock()
+		if emptyTrailer {
+			payload = statusOKTrailerPayload
 		}
-		kvs = append(kvs, KV{Key: k, Values: byteVals})
+	}
+	if payload == nil {
+		// Slow path: snapshot trailer metadata + build full payload.
+		s.hdrMu.Lock()
+		trMD := s.trailer.Copy()
+		s.hdrMu.Unlock()
+
+		// Pre-size kvs from len(trMD); pre-size byteVals from len(vals).
+		kvs := make([]KV, 0, len(trMD))
+		for k, vals := range trMD {
+			byteVals := make([][]byte, len(vals))
+			for i, v := range vals {
+				byteVals[i] = []byte(v)
+			}
+			kvs = append(kvs, KV{Key: k, Values: byteVals})
+		}
+
+		// Create trailers frame
+		trailers := TrailersV1{
+			Version:        1,
+			GRPCStatusCode: uint32(st.Code()),
+			GRPCStatusMsg:  st.Message(),
+			Metadata:       kvs,
+		}
+
+		payload = encodeTrailers(trailers)
 	}
 
-	// Create trailers frame
-	trailers := TrailersV1{
-		Version:        1,
-		GRPCStatusCode: uint32(st.Code()),
-		GRPCStatusMsg:  st.Message(),
-		Metadata:       kvs,
-	}
-
-	payload := encodeTrailers(trailers)
-
-	fh := FrameHeader{
+	fh = FrameHeader{
 		Type:     FrameTypeTRAILERS,
 		StreamID: s.id,
 		Length:   uint32(len(payload)),

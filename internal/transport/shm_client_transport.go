@@ -737,11 +737,20 @@ func (t *ShmClientTransport) updateFlowControl(n uint32) {
 }
 
 // sendBDPPing sends a BDP estimation ping to the server.
+//
+// UNREACHABLE in production today. BDP estimator is permanently
+// disabled on the SHM path (NewShmClientTransport sets t.bdpEst = nil
+// — SHM has no bandwidth-delay product to discover, see commit
+// 79b5b9732). Callers go through `t.bdpEst.add(...)` which short-
+// circuits on nil. If a future edit re-wires any caller of
+// sendBDPPing without also restoring t.bdpEst, the `t.bdpEst.timesnap()`
+// below will nil-panic — keep it that way deliberately so the broken
+// wiring fails loud and fast.
 func (t *ShmClientTransport) sendBDPPing() {
 	if t.closed.Load() {
 		return
 	}
-	t.bdpEst.timesnap()
+	t.bdpEst.timesnap() // intentional tripwire: see doc comment.
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP},
