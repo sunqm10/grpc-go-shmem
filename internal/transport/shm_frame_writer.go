@@ -114,12 +114,13 @@ type shmFrameWriter struct {
 	// for writing under the existing inlineMu invariant.
 	drainPendingWUFn func()
 
-	// piggybackWUFn, if non-nil, is invoked by the writer goroutine
-	// after each DATA chunk emit (advanceDeferred / processWholeMessage;
-	// control frames via processEntry) WHILE STILL HOLDING inlineMu,
-	// just before the function returns and releases the lock. The
-	// callback receives the streamID of the just-emitted DATA chunk
-	// and is expected to drain the transport's connection-level WU
+	// piggybackWUFn, if non-nil, is invoked WHILE inlineMu is held
+	// by the caller (either the writer goroutine in advanceDeferred /
+	// processWholeMessage / control frames via processEntry, OR by a
+	// request goroutine running the inline ZC fast path — e.g.
+	// tryInlineWrite, server-side M1a writeProto). The callback
+	// receives the streamID of the just-emitted DATA frame/chunk and
+	// is expected to drain the transport's connection-level WU
 	// accumulator AND that stream's pending WU into additional ring
 	// writes that ride out in the same SPSC writer position.
 	//

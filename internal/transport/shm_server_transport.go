@@ -508,11 +508,20 @@ func (t *ShmServerTransport) updateFlowControl(n uint32) {
 }
 
 // sendBDPPing sends a BDP estimation ping to the client.
+//
+// UNREACHABLE in production today. BDP estimator is permanently
+// disabled on the SHM path (NewShmServerTransport sets t.bdpEst = nil
+// — SHM has no bandwidth-delay product to discover, see commit
+// 79b5b9732). Callers go through `t.bdpEst.add(...)` which short-
+// circuits on nil. If a future edit re-wires any caller of
+// sendBDPPing without also restoring t.bdpEst, the `t.bdpEst.timesnap()`
+// below will nil-panic — keep it that way deliberately so the broken
+// wiring fails loud and fast.
 func (t *ShmServerTransport) sendBDPPing() {
 	if t.closed.Load() {
 		return
 	}
-	t.bdpEst.timesnap()
+	t.bdpEst.timesnap() // intentional tripwire: see doc comment.
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP},
@@ -1856,16 +1865,24 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 				if headerErr == nil {
 					ok2, err = writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
 				}
-				// Piggyback any pending WU credit onto the same batch
-				// (mirrors tryInlineWrite / processWholeMessage / chunked
-				// paths). When the server has accumulated pendingConnWU
-				// or pendingWU(s) for this stream from consuming the
-				// client request, this folds those WU frames INTO the
-				// HEADERS+DATA wake instead of emitting a separate
-				// frame+wake later. No-op when nothing pending. Runs
-				// only on successful DATA commit; the lookupStream slow
-				// path takes t.mu.RLock — safe under inlineMu (see
-				// piggybackWUForWriter LOCK ORDERING comment).
+				// Piggyback any pending WU credit (mirrors
+				// tryInlineWrite / processWholeMessage / chunked
+				// paths). When the server has accumulated
+				// pendingConnWU or pendingWU(s) for this stream
+				// from consuming the client request, this drains
+				// those WU frames inside inlineMu so they ride out
+				// on the SAME writer position. When emitHeader is
+				// true (M1a active) the WU writeFrame's Commit
+				// also benefits from the open BeginBatch and the
+				// WU joins the HEADERS+DATA wake. When emitHeader
+				// is false (subsequent server-streaming message,
+				// SendHeader-already-called etc.) there is no open
+				// batch so WU and DATA each fire their own wake,
+				// but still saves the writer-goroutine chan-hop
+				// for the WU frame. No-op when nothing pending.
+				// The lookupStream slow path takes t.mu.RLock —
+				// safe under inlineMu (see piggybackWUForWriter
+				// LOCK ORDERING comment).
 				if ok2 && err == nil && t.frameWriter.piggybackWUFn != nil {
 					t.frameWriter.piggybackWUFn(s.id)
 				}
