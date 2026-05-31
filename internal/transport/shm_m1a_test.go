@@ -27,6 +27,11 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// Note: these tests intentionally do NOT call t.Parallel() because they
+// share the global shmM1aBatchFire counter. Parallel execution with any
+// other M1a-counter test (or any future test that triggers WriteProto)
+// would race the delta assertions. Keep them sequential.
+
 // TestShmM1aBatchFiresOnFirstResponse verifies that
 // ShmServerTransport.writeProto's M1a HEADERS+DATA wake-coalesce
 // branch (BeginBatch/EndBatch around the first server response)
