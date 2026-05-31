@@ -252,6 +252,80 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 	}
 }
 
+// TestShmPiggybackWUThresholdGate exercises the threshold gating in
+// piggybackWUForWriter (both client and server). Below threshold the
+// piggyback must leave pendingConnWU intact (so the standalone
+// sendConnWindowUpdate path remains the sole emission point at
+// the documented batching cadence); at or above threshold the
+// piggyback drains the accumulator.
+//
+// Regression cover: an earlier version of piggybackWUForWriter did an
+// unconditional Swap(0), defeating the wuThreshold gate and emitting
+// one extra WINDOW_UPDATE frame per RT under bidi streaming
+// (measured at +25-30us/op on max profile 1 KiB Windows).
+func TestShmPiggybackWUThresholdGate(t *testing.T) {
+	segName := testSegName("test_wu_piggyback_gate")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	seg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("OpenSegment: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segName + "_c"}
+	serverAddr := &ShmAddr{Name: segName + "_s"}
+
+	ct, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("NewShmClientTransport: %v", err)
+	}
+	defer ct.Close(nil)
+
+	thresh := ct.wuThreshold.Load()
+	if thresh == 0 {
+		t.Fatalf("wuThreshold is zero; cannot exercise gate")
+	}
+
+	// Case 1: pending well below threshold. Piggyback must not drain.
+	subThresh := thresh / 4
+	if subThresh == 0 {
+		subThresh = 1
+	}
+	ct.pendingConnWU.Store(subThresh)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != subThresh {
+		t.Errorf("below-threshold piggyback: pendingConnWU = %d, want %d (must not drain)", got, subThresh)
+	}
+
+	// Case 2: pending at threshold. Piggyback must drain.
+	ct.pendingConnWU.Store(thresh)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("threshold-met piggyback: pendingConnWU = %d, want 0 (must drain)", got)
+	}
+
+	// Case 3: pending above threshold. Piggyback must drain entirely.
+	ct.pendingConnWU.Store(thresh * 2)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("above-threshold piggyback: pendingConnWU = %d, want 0 (must drain)", got)
+	}
+
+	// Case 4: zero pending. Piggyback must remain a no-op.
+	ct.pendingConnWU.Store(0)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("zero-pending piggyback: pendingConnWU = %d, want 0", got)
+	}
+}
+
 func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	// Verify that per-stream pending WU credit is cleared via the real
 	// closeStream path. Under the WU Lockless Path, per-stream pending

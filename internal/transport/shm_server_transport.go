@@ -467,12 +467,30 @@ func (t *ShmServerTransport) piggybackWUForWriter(streamID uint32) {
 	if t.closed.Load() {
 		return
 	}
-	if v := t.pendingConnWU.Swap(0); v > 0 {
-		// Reuse the per-transport wuBuf scratch; runs under writer's
-		// inlineMu (single-goroutine). See client-side mirror.
-		binary.BigEndian.PutUint32(t.wuBuf[:], v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+	// Conn-level WU: only piggyback when pending credit reaches the
+	// batching threshold. An unconditional Swap(0) would defeat the
+	// wuThreshold batching gate (window/4: ~16 KiB under fair, ~8 MiB
+	// under shm-tuned). Under bidi streaming the receiver accumulates
+	// ~payload bytes of pendingConnWU per DATA frame, so unconditional
+	// piggyback emits one extra WINDOW_UPDATE frame per RT (≈2 extra
+	// syscalls/RT — measured at +25–30 µs/op on max profile 1 KiB
+	// Windows, 87→62 µs in-proc / 104→72 µs xproc). The standalone
+	// sendConnWindowUpdate path still fires at threshold, so flow
+	// credit is not delayed beyond the normal threshold cadence; the
+	// sub-threshold remainder is intentionally deferred to the next
+	// standalone emission or wuRetryWake retry-drain.
+	thresh := t.wuThreshold.Load()
+	if thresh == 0 {
+		thresh = 1 // never elide entirely; preserve liveness
+	}
+	if uint32(t.pendingConnWU.Load()) >= thresh {
+		if v := t.pendingConnWU.Swap(0); v > 0 {
+			// Reuse the per-transport wuBuf scratch; runs under writer's
+			// inlineMu (single-goroutine). See client-side mirror.
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+		}
 	}
 	if streamID == 0 {
 		return
@@ -481,10 +499,23 @@ func (t *ShmServerTransport) piggybackWUForWriter(streamID uint32) {
 	if s == nil || s.getState() == streamDone {
 		return
 	}
-	if v := s.pendingWU.Swap(0); v > 0 {
-		binary.BigEndian.PutUint32(t.wuBuf[:], v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, t.wuBuf[:])
+	// Stream-level WU: same threshold gating rationale. The stream's
+	// dedicated sendStreamWindowUpdate path still emits at threshold;
+	// piggyback only fuses when there's a meaningful chunk of credit.
+	if uint32(s.pendingWU.Load()) >= thresh {
+		if v := s.pendingWU.Swap(0); v > 0 {
+			// Re-check streamDone after the Swap: a concurrent close
+			// between getState() and Swap could leave a stream WU
+			// targeted at a defunct stream. RFC 7540 §6.9.1 permits
+			// the peer to ignore late WU on a closed stream, so this
+			// is benign — but matches sendStreamWindowUpdate's pattern.
+			if s.getState() == streamDone {
+				return
+			}
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, t.wuBuf[:])
+		}
 	}
 }
 

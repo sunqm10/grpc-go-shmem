@@ -146,7 +146,12 @@ type shmFrameWriter struct {
 	//
 	// Implementations on ShmClientTransport and ShmServerTransport
 	// look up the *Stream by streamID, check streamDone state, and
-	// Swap+writeFrame for any non-zero pending WU. Set in the owning
+	// emit additional WU frames ONLY when the accumulated pending
+	// credit has reached the transport's wuThreshold (the same gate
+	// the standalone sendConnWindowUpdate / sendStreamWindowUpdate
+	// paths apply). Sub-threshold credit is intentionally left for
+	// the next standalone emission or wuRetryWake retry-drain, so the
+	// piggyback does not defeat WU batching. Set in the owning
 	// transport's constructor before the writer goroutine begins
 	// servicing real traffic.
 	piggybackWUFn func(streamID uint32)
