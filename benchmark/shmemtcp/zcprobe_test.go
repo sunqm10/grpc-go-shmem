@@ -141,6 +141,9 @@ func startZCProbe(b *testing.B) func() {
 		// take today; counter exists to baseline before adding an
 		// optional inline-TRAILERS optimisation).
 		report("trailer-async/op", delta.TrailerAsyncFire)
+		report("trailer-fused/op", delta.TrailerFusedFire)
+		report("trailer-fuse-cas-lost/op", delta.TrailerFuseSkipCASLost)
+		report("trailer-fuse-err/op", delta.TrailerFuseTrailerErr)
 		// trailer-deferred/op = processTrailerEntry parked TRAILERS
 		// behind in-flight DATA. Near-zero in unary, may be non-
 		// zero under server-streaming + async sends.
