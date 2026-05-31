@@ -907,6 +907,17 @@ func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
 // sender's doneCh. Caller MUST have already verified no DATA is
 // pending for this stream.
 func (w *shmFrameWriter) emitTrailerEntry(entry frameEntry) {
+	// Snapshot DataWaiters right before publishing TRAILERS. A
+	// non-zero observation means the client reader is currently
+	// parked AND the upcoming Commit will fire a real signalData
+	// syscall (~3-5us Win EPYC, ~7-10us ARM, ~1-2us Linux eventfd).
+	// A zero observation means the wake will be elided -- reader is
+	// still mid-drain or yielded-then-spinning. Used by
+	// `trailer-commit-parked/op` diag to tell platforms apart
+	// without relying on noisy throughput numbers.
+	if w.tx != nil && w.tx.header().DataWaiters() > 0 {
+		atomic.AddUint64(&shmTrailerCommitParkedReader, 1)
+	}
 	err := writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 	if entry.streamPtr != nil {
 		// Swap state inside the writer at TRAILERS-emit time so

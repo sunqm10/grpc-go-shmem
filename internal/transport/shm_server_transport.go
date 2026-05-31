@@ -1730,74 +1730,27 @@ func (t *ShmServerTransport) buildServerInitialHeaderPayload(s *ServerStream) (F
 	return fh, payload, true
 }
 
-// shmM1CFuseEnabled controls the M1c optimisation: in writeProto,
-// when (a) the gRPC framework signalled this is the last/only message
-// for the stream via WriteOptions.Last (unary handler path), (b) no
-// outbound compression is configured, and (c) the inline ZC fast
-// path is going to succeed, fuse HEADERS + DATA + OK-TRAILERS into a
-// single BeginBatch/EndBatch under inlineMu — the reader sees ONE
-// signalData wake for the entire server response, vs 2 wakes with
-// M1a alone.
-//
-// Late-CAS design (subagent-reviewed 2026-05-31): wantFuse is a
-// pure structural predicate computed before BeginBatch; the
-// s.statusSent CAS happens ONLY after HEADERS+DATA are confirmed
-// committed and immediately before the trailer writeFrame. This
-// ensures benign fallbacks (ring-full, header error) never consume
-// statusSent and cleanly fall back to the legacy two-frame path
-// (framework's WriteStatus(statusOK) emits TRAILERS separately).
-// The CAS is also the mutex against concurrent terminators
-// (deadline / cancel / RST / drain) per writeStatus's idempotence
-// contract.
-//
-// Default OFF for first ship; set SHM_GO_M1C=1 to enable. Expected
-// throughput gain (relative to M1a-only): +1 wake/op saved =
-// ~3-5 µs Win EPYC, ~5-10 µs Win ARM, ~1-2 µs Linux eventfd.
-//
-// See repo memory grpc-go-shm-m1a-m1b-results-may31.md.
-var shmM1CFuseEnabled = os.Getenv("SHM_GO_M1C") == "1"
-
-// buildOKTrailerPayload constructs the wire-format TRAILERS frame
-// body for a successful (statusOK, code=0, empty message) response,
-// including any trailer metadata the handler set via SetTrailer.
-//
-// Caller MUST have established (via late-CAS on s.statusSent) that
-// it owns the trailer emit. Lazy build (after the CAS wins) avoids
-// paying the trailer.Copy() + encode cost on benign fallback paths.
-func (t *ShmServerTransport) buildOKTrailerPayload(s *ServerStream) (FrameHeader, []byte) {
-	s.hdrMu.Lock()
-	trMD := s.trailer.Copy()
-	s.hdrMu.Unlock()
-	kvs := make([]KV, 0, len(trMD))
-	for k, vals := range trMD {
-		byteVals := make([][]byte, len(vals))
-		for i, v := range vals {
-			byteVals[i] = []byte(v)
-		}
-		kvs = append(kvs, KV{Key: k, Values: byteVals})
-	}
-	trailers := TrailersV1{
-		Version:        1,
-		GRPCStatusCode: 0, // OK
-		GRPCStatusMsg:  "",
-		Metadata:       kvs,
-	}
-	payload := encodeTrailers(trailers)
-	fh := FrameHeader{
-		Type:     FrameTypeTRAILERS,
-		StreamID: s.id,
-		Length:   uint32(len(payload)),
-	}
-	return fh, payload
-}
-
 // writeProto serializes a proto.Message directly into the ring buffer,
 // bypassing the standard encode→copy path. Returns (true, err) if handled,
 // (false, nil) if the caller should fall back to the standard path.
 //
 // Only handles contiguous (non-wrap-around) writes. Wrap-around, non-proto
 // messages, and oversized messages fall back.
-func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOptions) (bool, error) {
+//
+// NOTE on opts: ignored by today's implementation. An earlier M1c
+// experiment fused HEADERS + DATA + OK-TRAILERS into a single batch
+// when opts.Last was set (unary handler hint), eliminating one
+// signalData wake per RPC. Reviewed and dropped 2026-05-31 because
+// the fusion serializes the trailer build ahead of the DATA wake
+// AND causes the client reader's HasPendingData() yield gate to
+// observe TRAILERS-already-pending — making it skip the
+// post-MESSAGE Gosched, delaying the app's response unmarshal.
+// On Win EPYC this measured a -7% regression on 1K Unary. The legacy
+// async TRAILERS path keeps app/transport parallelism by letting the
+// writer goroutine emit the trailer concurrently with the app
+// goroutine's unmarshal. See repo memory
+// grpc-go-shm-m1a-m1b-results-may31.md.
+func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOptions) (bool, error) {
 	pm, ok := msg.(protoMessage)
 	if !ok {
 		return false, nil
@@ -1908,20 +1861,8 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOpt
 				if shmM1ACoalesceEnabled {
 					hFh, hPayload, emitHeader = t.buildServerInitialHeaderPayload(s)
 				}
-				// M1c (C-lite) structural eligibility — pure predicate,
-				// no side effects. The s.statusSent CAS happens LATER,
-				// after HEADERS+DATA are confirmed committed, so benign
-				// fallbacks (header err, !ok2 ring-full) do not consume
-				// the status claim and cleanly route through the legacy
-				// WriteStatus(statusOK) path.
-				wantFuse := shmM1CFuseEnabled &&
-					shmM1ACoalesceEnabled &&
-					opts != nil && opts.Last &&
-					s.sendCompress == ""
-				if emitHeader || wantFuse {
-					t.serverToClient.BeginBatch()
-				}
 				if emitHeader {
+					t.serverToClient.BeginBatch()
 					headerErr = writeFrame(s.ctx, t.serverToClient, hFh, hPayload)
 				}
 				var ok2 bool
@@ -1929,38 +1870,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOpt
 				if headerErr == nil {
 					ok2, err = writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
 				}
-				// M1c late-CAS + trailer emit. Only attempt if
-				// HEADERS (if any) and DATA both committed cleanly.
-				var (
-					fusedTrailer bool
-					trailerErr   error
-				)
-				if wantFuse && headerErr == nil && ok2 && err == nil {
-					// Late-CAS — the mutex against concurrent
-					// terminators (deadline / cancel / RST / drain
-					// → writeStatus). Winner owns trailer + cleanup;
-					// loser flushes the open batch and returns.
-					if s.statusSent.CompareAndSwap(false, true) {
-						tFh, tPayload := t.buildOKTrailerPayload(s)
-						trailerErr = writeFrame(context.Background(), t.serverToClient, tFh, tPayload)
-						if trailerErr == nil {
-							// Mirror writeStatus / emitTrailerEntry
-							// state transitions at trailer-emit time.
-							s.compareAndSwapState(streamActive, streamDone)
-							s.pendingWU.Store(0)
-							fusedTrailer = true
-							atomic.AddUint64(&shmTrailerFusedFire, 1)
-						} else {
-							atomic.AddUint64(&shmTrailerFuseTrailerErr, 1)
-						}
-					} else {
-						// Concurrent terminator already claimed
-						// status; do not emit a duplicate trailer.
-						// Cleanup is owned by the winner.
-						atomic.AddUint64(&shmTrailerFuseSkipCASLost, 1)
-					}
-				}
-				if emitHeader || wantFuse {
+				if emitHeader {
 					t.serverToClient.EndBatch()
 				}
 				t.frameWriter.inlineMu.Unlock()
@@ -1979,9 +1889,6 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOpt
 					// fall back to chunked path. HEADERS already on
 					// the wire; chunked path will skip its own
 					// maybeWriteHeader via headerSent CAS dedup.
-					// M1c was NOT engaged (late-CAS gates on ok2),
-					// so statusSent stays false and the legacy
-					// WriteStatus path still emits TRAILERS.
 					t.connSendQuota.Add(int64(quotaSize))
 					s.sendQuota.Add(int64(quotaSize))
 					select {
@@ -2000,28 +1907,8 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOpt
 					case t.frameWriter.wuRetryWake <- struct{}{}:
 					default:
 					}
-					return true, err
 				}
-				if fusedTrailer {
-					// M1c success — we won the statusSent CAS and
-					// emitted TRAILERS. Framework's subsequent
-					// WriteStatus(statusOK) will short-circuit on
-					// the CAS-fail return; cleanup belongs to us.
-					return true, t.finishWriteStatus(s, nil)
-				}
-				if trailerErr != nil {
-					// M1c won the CAS but trailer write failed.
-					// HEADERS+DATA already on wire; we own cleanup
-					// for the partial reply. Stream effectively
-					// RSTs via the returned error.
-					return true, t.finishWriteStatus(s, trailerErr)
-				}
-				// wantFuse was false, OR wantFuse was true but CAS
-				// lost to a terminator. In the CAS-loss case the
-				// terminator owns cleanup. In the no-wantFuse case
-				// the framework will call WriteStatus(statusOK)
-				// which emits TRAILERS via the legacy path.
-				return true, nil
+				return true, err
 			}
 			// CAS-fail → drop through to async (was: bail to sync).
 			// The trailer-sentinel in writeStatus + processTrailerEntry

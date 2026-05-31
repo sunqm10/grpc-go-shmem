@@ -141,9 +141,12 @@ func startZCProbe(b *testing.B) func() {
 		// take today; counter exists to baseline before adding an
 		// optional inline-TRAILERS optimisation).
 		report("trailer-async/op", delta.TrailerAsyncFire)
-		report("trailer-fused/op", delta.TrailerFusedFire)
-		report("trailer-fuse-cas-lost/op", delta.TrailerFuseSkipCASLost)
-		report("trailer-fuse-err/op", delta.TrailerFuseTrailerErr)
+		// trailer-commit-parked/op: how often legacy TRAILERS commit
+		// observed a parked client reader (DataWaiters>0) at signal
+		// time -- i.e. the trailer wake genuinely fires a kernel
+		// syscall. A trailer-fusion design (M1c-class) can only save
+		// syscall cost when this is materially > 0.
+		report("trailer-commit-parked/op", delta.TrailerCommitParkedReader)
 		// trailer-deferred/op = processTrailerEntry parked TRAILERS
 		// behind in-flight DATA. Near-zero in unary, may be non-
 		// zero under server-streaming + async sends.

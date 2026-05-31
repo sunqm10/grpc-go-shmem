@@ -226,37 +226,26 @@ var (
 	shmEnqueueWaitAsync uint64
 
 	// shmTrailerAsyncFire: writeStatus enqueued a TRAILERS frame
-	// via trySend (the async chan-sentinel path). Per design this
-	// is the ONLY path TRAILERS take today (to preserve DATA-
-	// before-TRAILERS ordering). A 2026-05-31 M1b experiment that
-	// added an inline trailer fast path regressed throughput by
-	// 5-11% due to inlineMu contention breaking sibling streams'
-	// M1a HEADERS+DATA coalesce, so the inline path was removed.
-	// See grpc-go-shm-m1a-m1b-results-may31 memo for the alternative
-	// design ("Opus alt #2": writer-side TRAILERS coalesce into the
-	// existing batch drain) tracked as a follow-up PR.
+	// via trySend (the async chan-sentinel path). This is the
+	// ONLY path TRAILERS take today (preserves DATA-before-TRAILERS
+	// ordering via writer-FIFO + deferredTrailers; experiments
+	// fusing TRAILERS into the writeProto inline batch regressed
+	// throughput by sacrificing producer/consumer parallelism with
+	// the client reader's post-MESSAGE yield gate — see repo memory
+	// grpc-go-shm-m1a-m1b-results-may31.md).
 	shmTrailerAsyncFire uint64
 
-	// shmTrailerFusedFire: server writeProto successfully fused
-	// HEADERS + DATA + OK-TRAILERS into a single inlineMu+BeginBatch
-	// scope under the M1c (SHM_GO_M1C=1) optimisation. The server
-	// response then fires exactly ONE signalData wake total for the
-	// entire RPC reply, vs. 2-3 wakes pre-optimisation.
-	shmTrailerFusedFire uint64
-
-	// shmTrailerFuseSkipCASLost: M1c late-CAS on s.statusSent lost
-	// to a concurrent terminator (transport teardown / deadline /
-	// RST). The fused trailer is NOT emitted by C-lite; the winner
-	// owns trailer + cleanup. HEADERS+DATA already on the wire are
-	// flushed via the still-open BeginBatch's EndBatch.
-	shmTrailerFuseSkipCASLost uint64
-
-	// shmTrailerFuseTrailerErr: M1c won the statusSent CAS but the
-	// trailer writeFrame failed (ring exhaustion mid-emit etc.).
-	// HEADERS+DATA were already committed; stream RSTs via the
-	// returned error. Rare; counts protocol-violating partial-reply
-	// situations.
-	shmTrailerFuseTrailerErr uint64
+	// shmTrailerCommitParkedReader: legacy TRAILERS Commit observed
+	// DataWaiters() > 0 at signal time, meaning the client reader
+	// had already parked waiting for the trailer and the wake
+	// genuinely fires a kernel syscall (~3-5 us Win EPYC, ~7-10 us
+	// ARM, ~1-2 us Linux eventfd). When low / 0 the reader was
+	// still mid-drain or yielded-then-spinning and the wake is
+	// elided -- no kernel cost. This counter is the platform-
+	// independent way to tell whether a TRAILERS-fusion design
+	// (M1c-class) could ever save real syscall cost on a given
+	// host without relying on noisy throughput numbers.
+	shmTrailerCommitParkedReader uint64
 
 	// shmTrailerDeferredFire: processTrailerEntry parked the
 	// TRAILERS in deferredTrailers because DATA was still in flight
@@ -313,11 +302,9 @@ type ShmPathCounters struct {
 	SignalSpaceFire        uint64
 	EnqueueWaitInline      uint64
 	EnqueueWaitAsync       uint64
-	TrailerAsyncFire       uint64
-	TrailerFusedFire       uint64
-	TrailerFuseSkipCASLost uint64
-	TrailerFuseTrailerErr  uint64
-	TrailerDeferredFire    uint64
+	TrailerAsyncFire             uint64
+	TrailerCommitParkedReader    uint64
+	TrailerDeferredFire          uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -363,11 +350,9 @@ func LoadShmPathCounters() ShmPathCounters {
 		SignalSpaceFire:     atomic.LoadUint64(&shmSignalSpaceFire),
 		EnqueueWaitInline:   atomic.LoadUint64(&shmEnqueueWaitInline),
 		EnqueueWaitAsync:    atomic.LoadUint64(&shmEnqueueWaitAsync),
-		TrailerAsyncFire:       atomic.LoadUint64(&shmTrailerAsyncFire),
-		TrailerFusedFire:       atomic.LoadUint64(&shmTrailerFusedFire),
-		TrailerFuseSkipCASLost: atomic.LoadUint64(&shmTrailerFuseSkipCASLost),
-		TrailerFuseTrailerErr:  atomic.LoadUint64(&shmTrailerFuseTrailerErr),
-		TrailerDeferredFire:    atomic.LoadUint64(&shmTrailerDeferredFire),
+		TrailerAsyncFire:          atomic.LoadUint64(&shmTrailerAsyncFire),
+		TrailerCommitParkedReader: atomic.LoadUint64(&shmTrailerCommitParkedReader),
+		TrailerDeferredFire:       atomic.LoadUint64(&shmTrailerDeferredFire),
 	}
 }
 
@@ -414,10 +399,8 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		SignalSpaceFire:     a.SignalSpaceFire - before.SignalSpaceFire,
 		EnqueueWaitInline:   a.EnqueueWaitInline - before.EnqueueWaitInline,
 		EnqueueWaitAsync:    a.EnqueueWaitAsync - before.EnqueueWaitAsync,
-		TrailerAsyncFire:       a.TrailerAsyncFire - before.TrailerAsyncFire,
-		TrailerFusedFire:       a.TrailerFusedFire - before.TrailerFusedFire,
-		TrailerFuseSkipCASLost: a.TrailerFuseSkipCASLost - before.TrailerFuseSkipCASLost,
-		TrailerFuseTrailerErr:  a.TrailerFuseTrailerErr - before.TrailerFuseTrailerErr,
-		TrailerDeferredFire:    a.TrailerDeferredFire - before.TrailerDeferredFire,
+		TrailerAsyncFire:          a.TrailerAsyncFire - before.TrailerAsyncFire,
+		TrailerCommitParkedReader: a.TrailerCommitParkedReader - before.TrailerCommitParkedReader,
+		TrailerDeferredFire:       a.TrailerDeferredFire - before.TrailerDeferredFire,
 	}
 }
