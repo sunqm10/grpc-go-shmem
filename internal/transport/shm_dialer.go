@@ -220,7 +220,10 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		releaseCtlLock()
 	}()
 
-	myNonce := newConnectNonce()
+	myNonce, err := newConnectNonce()
+	if err != nil {
+		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "generate connect nonce", err)
+	}
 	if err := writeCtlFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
 		singleStreamMode: opts.SingleStreamMode,
 		nonce:            myNonce,

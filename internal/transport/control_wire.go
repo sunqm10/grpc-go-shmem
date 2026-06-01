@@ -93,11 +93,19 @@ type connectReject struct {
 // CONNECT with its ACCEPT/REJECT. crypto/rand is used (not math/rand)
 // so the nonce is unpredictable, closing any future "guess the nonce"
 // vector even though the current threat model only needs uniqueness.
-// crypto/rand.Read does not fail on supported platforms.
-func newConnectNonce() uint64 {
+//
+// crypto/rand.Read is documented as never failing on supported
+// platforms, but the runtime contract is best-effort and an unexpected
+// kernel-entropy failure is preferable surfaced as a dial-time error
+// than silently producing zero entropy (which would defeat stale-
+// response correlation under bug-replay conditions). Callers fail the
+// dial on error.
+func newConnectNonce() (uint64, error) {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return binary.LittleEndian.Uint64(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("shm: crypto/rand.Read failed generating connect nonce: %w", err)
+	}
+	return binary.LittleEndian.Uint64(b[:]), nil
 }
 
 func encodeConnectRequest(req connectRequest) []byte {
