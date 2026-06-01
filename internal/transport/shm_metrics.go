@@ -18,15 +18,12 @@ import (
 )
 
 // HTTP/2-compatible flow control is the only profile on the SHM
-// transport. Earlier drafts had a NoWU mode toggled via
-// ConfigureShmNoWindowUpdate / a FlowControlMode enum / a CONNECT
-// Flags bit; that mode has been removed in favor of a single unified
-// path that achieves NoWU-equivalent behavior simply by configuring a
-// large initial window (the SHM-tuned default `shmInitialWindowSize`
-// of 32 MiB, which exceeds typical per-message sizes so WINDOW_UPDATE
-// emission stays dormant in production). To exercise HTTP/2-strict
-// flow control set `grpc.WithInitialWindowSize` / a smaller window
-// via `DialOptions.InitialWindowSize`.
+// transport. NoWU-equivalent behavior is achieved simply by
+// configuring a large initial window (the SHM-tuned default
+// `shmInitialWindowSize` of 32 MiB, which exceeds typical per-message
+// sizes so WINDOW_UPDATE emission stays dormant in production). To
+// exercise HTTP/2-strict flow control set `grpc.WithInitialWindowSize`
+// / a smaller window via `DialOptions.InitialWindowSize`.
 //
 // Counters below are kept for bench/metrics visibility.
 var (
