@@ -555,9 +555,9 @@ and is not subject to these rules.
 HTTP/2 frame parsing on this transport is byte-stream oriented and
 identical to HTTP/2 over any other transport. A frame's 9-byte header and
 its payload MAY be produced and consumed across multiple ring write or
-read operations. Receivers MUST process frame bytes incrementally;
-senders MAY advance `WriteIdx` mid-frame so that the receiver can begin
-draining payload while the rest is still being written.
+read operations. Receivers MUST process frame bytes incrementally; senders
+MAY advance `WriteIdx` at any granularity (per-frame, mid-frame, or
+batched across multiple frames).
 
 Ring capacity is therefore independent of `MAX_FRAME_SIZE`. A ring
 smaller than the peer's advertised `MAX_FRAME_SIZE` is well-formed; a
