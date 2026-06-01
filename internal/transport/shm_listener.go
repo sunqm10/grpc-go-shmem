@@ -520,9 +520,11 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment.Close()
 			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
-			// Unlink the cross-process control lock file (Linux) so a
-			// later listener start does not inherit a stale inode.
-			// No-op on Windows where the named mutex is refcounted.
+			// Unlink the cross-process control lock file so a later
+			// listener start does not inherit a stale inode (Linux) or
+			// stale file HANDLE state (Windows). Both platforms use a
+			// sibling `<ctl-segment>.lock` file under the same
+			// LockFileEx / flock advisory scheme.
 			removeControlLock(l.baseName + shmControlSuffix)
 
 			// Release the listener's reference on the control-ring events.

@@ -273,11 +273,19 @@ from multiple client processes, the SPSC assumption does not hold on this
 ring. Implementations MUST serialize writes to Ring A using an OS-level
 mutual exclusion primitive tied to the control segment name:
 
-- **Linux / POSIX**: advisory lock (`flock`) on the control segment's
-  backing file.
-- **Windows**: a named mutex whose name is the control segment name with
-  a `.lock` suffix (e.g. if the control segment is `grpc_ctl`, the mutex
-  is `grpc_ctl.lock`).
+- **Linux / POSIX**: advisory lock (`flock`) on a sibling lock file
+  named `<control-segment>.lock` (e.g. if the control segment is
+  `grpc_ctl`, the lock file is `grpc_ctl.lock` in the same directory).
+- **Windows**: a byte-range lock (`LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK`)
+  on the same sibling `<control-segment>.lock` file.
+
+The sibling-file scheme is used uniformly because Windows named-mutex
+ownership is bound to the acquiring thread, which is incompatible with
+Go's goroutine migration across OS threads: a Go runtime that re-schedules
+the acquiring goroutine onto a different thread between `Acquire` and
+`Release` would leave the mutex held forever. `LockFileEx` ownership is
+tied to the file HANDLE, which crosses thread boundaries cleanly and
+is automatically released on process exit by the kernel.
 
 The client acquires the lock before writing CONNECT and releases it after
 reading ACCEPT or REJECT. While the lock is held, the holding client is
