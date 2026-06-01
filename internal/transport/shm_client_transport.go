@@ -173,6 +173,31 @@ type ShmClientTransport struct {
 	// outbound send quota.
 	pendingConnWU atomic.Uint32
 
+	// pendingConnWUForceCredit is the liveness backstop flag for the
+	// drainPendingWUForWriter conn-level threshold gate. When
+	// sendConnWindowUpdate(_, force=true) emits a sub-threshold
+	// conn-WU and the emission hits errFrameWriterFull, the restore
+	// path Adds the value back to pendingConnWU AND sets this flag
+	// to 1. drainPendingWUForWriter Swap(0)s this flag at the start
+	// of every drain cycle; if it was 1 OR pendingConnWU has
+	// crossed wuThreshold, it emits unconditionally. Otherwise it
+	// skips, deferring the (sub-threshold) drip remainder until the
+	// next standalone sendConnWindowUpdate (threshold-cross) or
+	// piggybackWUForWriter (outbound DATA chunk) emit.
+	//
+	// Why a flag instead of a separate accumulator: only the
+	// emit-restore path needs the bypass; ordinary drip accumulation
+	// can sit below the threshold without harm. A single atomic bit
+	// preserves liveness for the restored force-credit corner case
+	// without complicating the producer-side fast paths.
+	//
+	// Clear-before-Swap-pending ordering avoids ABA: drainer
+	// Swap(0)s this flag FIRST, then Swap(0)s pendingConnWU. A
+	// concurrent producer that races to Set(1) after our drain
+	// Swap'd 0 wins ownership of its credit: the next drain (or
+	// piggyback) finds flag=1 and emits the residual value.
+	pendingConnWUForceCredit atomic.Uint32
+
 	// wuDirty is the per-stream restore-WU dirty list, used by
 	// drainPendingWUForWriter to skip the legacy O(N=streams) walk.
 	// Two-slot ping-pong design (Opus 4.8 review):
@@ -447,7 +472,12 @@ func (t *ShmClientTransport) sendConnWindowUpdate(delta uint32, force bool) {
 		// emit a frame carrying our delta (plus theirs). No work to do.
 		return
 	}
-	t.emitWindowUpdateFrame(0, v, nil)
+	if force {
+		shmConnWUForce.Add(1)
+	} else {
+		shmConnWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(0, v, nil, force)
 }
 
 // sendStreamWindowUpdate is the lockless emission path for stream-
@@ -482,7 +512,12 @@ func (t *ShmClientTransport) sendStreamWindowUpdate(s *ClientStream, delta uint3
 		// Raced close after our Swap. Credit is now ours; drop it.
 		return
 	}
-	t.emitWindowUpdateFrame(s.id, v, s)
+	if force {
+		shmStreamWUForce.Add(1)
+	} else {
+		shmStreamWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(s.id, v, s, false)
 }
 
 // emitWindowUpdateFrame writes a single WINDOW_UPDATE frame via the
@@ -498,7 +533,8 @@ func (t *ShmClientTransport) sendStreamWindowUpdate(s *ClientStream, delta uint3
 // signal, or (b) dropped because the stream closed. Therefore no
 // WINDOW_UPDATE credit can stall indefinitely on the SHM transport
 // once a value crosses Swap.
-func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ClientStream) {
+func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ClientStream, connForce bool) {
+	shmWUFrameEmit.Add(1)
 	buf := make([]byte, 4)
 	// RFC 7540 §6.9.1: WINDOW_UPDATE Window Size Increment is a 31-bit
 	// big-endian unsigned integer. Match the spec so the codec's
@@ -519,11 +555,19 @@ func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		// pending atomics on its next wake.
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
-			// Conn-level: no dirty flag. drainPendingWUForWriter
-			// always Swaps pendingConnWU unconditionally — one
-			// atomic on every drain is cheaper than maintaining
-			// a CAS-gated dirty bit. Saves the bit + a producer-
-			// side atomic + an ordering surface.
+			if connForce {
+				// Force restore: arm the liveness backstop so the
+				// drainPendingWUForWriter threshold gate cannot strand
+				// a sub-threshold force credit. See pendingConnWUForceCredit
+				// field doc for the clear-before-Swap-pending ordering.
+				t.pendingConnWUForceCredit.Store(1)
+			}
+			// Conn-level: no per-producer dirty flag. drainPendingWUForWriter
+			// gates the conn-level drain on (force-credit OR pending >=
+			// wuThreshold) so the ordinary drip remainder can sit below
+			// the threshold without firing an extra wake on every
+			// wuRetryWake cycle (see pendingConnWUForceCredit for the
+			// liveness backstop covering the sub-threshold force case).
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
 			// Per-stream dirty enqueue: CAS-dedup ensures at most
@@ -598,11 +642,27 @@ func (t *ShmClientTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
-	// CONN-LEVEL: unconditional Swap (no dirty gate).
-	if v := t.pendingConnWU.Swap(0); v > 0 {
-		binary.BigEndian.PutUint32(t.wuBuf[:], v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+	// CONN-LEVEL: threshold-gated, with a force-credit liveness
+	// backstop. The clear-before-Swap-pending ordering (Swap the
+	// flag FIRST, then check threshold/Swap pending) ensures that
+	// any producer racing to Set(1) after our flag Swap retains
+	// ownership of its credit: the next drain (or piggyback) will
+	// see flag=1 and emit. Without this gate the drain would emit
+	// a tiny WU frame on every wuRetryWake cycle (one per inbound
+	// peer WU = one per RT for small payloads), wasting a
+	// signalData wake per op and ~5-15µs of cross-process latency
+	// at 1K/4K fair-default.
+	forceFlag := t.pendingConnWUForceCredit.Swap(0)
+	thresh := t.wuThreshold.Load()
+	if thresh == 0 {
+		thresh = 1 // never elide entirely; preserve liveness
+	}
+	if forceFlag != 0 || uint32(t.pendingConnWU.Load()) >= thresh {
+		if v := t.pendingConnWU.Swap(0); v > 0 {
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+		}
 	}
 	// PER-STREAM: ping-pong rotate under brief lock.
 	t.wuDirtyMu.Lock()

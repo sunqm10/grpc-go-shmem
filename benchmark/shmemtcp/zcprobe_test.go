@@ -151,6 +151,16 @@ func startZCProbe(b *testing.B) func() {
 		// behind in-flight DATA. Near-zero in unary, may be non-
 		// zero under server-streaming + async sends.
 		report("trailer-deferred/op", delta.TrailerDeferredFire)
+		// wu-frames/op = total WINDOW_UPDATE frames serialized to the
+		// ring (sum of both directions, post-coalesce). For a fair-
+		// window unary ping-pong with single-frame messages this
+		// SHOULD be 0; non-zero indicates flow-control drip overhead
+		// contributing extra signalData wakes per op.
+		report("wu-frames/op", delta.WUFrameEmit)
+		report("wu-conn-force/op", delta.ConnWUForce)
+		report("wu-conn-drip/op", delta.ConnWUDrip)
+		report("wu-stream-force/op", delta.StreamWUForce)
+		report("wu-stream-drip/op", delta.StreamWUDrip)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)

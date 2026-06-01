@@ -320,6 +320,23 @@ type ShmPathCounters struct {
 	// into the HEADERS+DATA wake-coalesce batch (M1a). Zero after
 	// a server response would indicate the M1a path regressed.
 	M1aBatchFire uint64
+
+	// WUFrameEmit counts the total number of WINDOW_UPDATE frames
+	// the SHM transport serialized to the ring (post-coalesce).
+	// Used by bench/zcprobe to attribute per-op signal-data overhead
+	// to flow-control drip.
+	WUFrameEmit uint64
+
+	// ConnWUForce / ConnWUDrip / StreamWUForce / StreamWUDrip
+	// attribute each WUFrameEmit to its originating policy. Drip =
+	// the standalone wuThreshold-crossing path; Force = the
+	// unconditional emit (sendWindowUpdateForce + conn pre-credit).
+	// Sum of all four ≤ WUFrameEmit (the difference is the piggyback
+	// path which currently bypasses emitWindowUpdateFrame).
+	ConnWUForce   uint64
+	ConnWUDrip    uint64
+	StreamWUForce uint64
+	StreamWUDrip  uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -370,6 +387,13 @@ func LoadShmPathCounters() ShmPathCounters {
 		TrailerDeferredFire:       atomic.LoadUint64(&shmTrailerDeferredFire),
 
 		M1aBatchFire: atomic.LoadUint64(&shmM1aBatchFire),
+
+		WUFrameEmit: shmWUFrameEmit.Load(),
+
+		ConnWUForce:   shmConnWUForce.Load(),
+		ConnWUDrip:    shmConnWUDrip.Load(),
+		StreamWUForce: shmStreamWUForce.Load(),
+		StreamWUDrip:  shmStreamWUDrip.Load(),
 	}
 }
 
@@ -421,5 +445,12 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		TrailerDeferredFire:       a.TrailerDeferredFire - before.TrailerDeferredFire,
 
 		M1aBatchFire: a.M1aBatchFire - before.M1aBatchFire,
+
+		WUFrameEmit: a.WUFrameEmit - before.WUFrameEmit,
+
+		ConnWUForce:   a.ConnWUForce - before.ConnWUForce,
+		ConnWUDrip:    a.ConnWUDrip - before.ConnWUDrip,
+		StreamWUForce: a.StreamWUForce - before.StreamWUForce,
+		StreamWUDrip:  a.StreamWUDrip - before.StreamWUDrip,
 	}
 }

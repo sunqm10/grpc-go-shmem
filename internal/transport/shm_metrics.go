@@ -73,5 +73,27 @@ var (
 	// test that verifies the rollback path is reached under
 	// concurrent connQuota mutation.
 	shmCASRollback atomic.Uint64
+
+	// shmWUFrameEmit counts the total number of WINDOW_UPDATE frames
+	// the SHM transport serialized to the ring (post-coalesce).
+	// Used by bench/zcprobe to attribute per-op signal-data overhead
+	// to flow-control drip. Distinct from shmConnWUCoalesced which
+	// counts the number of coalesce passes; this counts post-coalesce
+	// emit events.
+	shmWUFrameEmit atomic.Uint64
+
+	// shmConnWUForce / shmConnWUDrip / shmStreamWUForce / shmStreamWUDrip
+	// are per-source attribution counters incremented at the standalone
+	// sendConnWindowUpdate / sendStreamWindowUpdate emission sites
+	// (just before they call into emitWindowUpdateFrame). Drip = the
+	// threshold-crossing path; Force = the unconditional-emit path
+	// (sendWindowUpdateForce, fed by onMessageStart's maybeAdjust
+	// pre-credit, and by sendConnWindowUpdate(_, true) for conn pre-
+	// credit). Used by bench/zcprobe to attribute the per-op WU frame
+	// count to its originating policy.
+	shmConnWUForce   atomic.Uint64
+	shmConnWUDrip    atomic.Uint64
+	shmStreamWUForce atomic.Uint64
+	shmStreamWUDrip  atomic.Uint64
 )
 

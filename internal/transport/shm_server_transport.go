@@ -134,6 +134,12 @@ type ShmServerTransport struct {
 	// rationale ("WU Lockless Path").
 	pendingConnWU atomic.Uint32
 
+	// pendingConnWUForceCredit mirrors ShmClientTransport.pendingConnWUForceCredit
+	// (see field doc there). Liveness backstop for the
+	// drainPendingWUForWriter threshold gate so a sub-threshold
+	// force-restored conn-WU cannot be stranded.
+	pendingConnWUForceCredit atomic.Uint32
+
 	// wuDirty is the per-stream restore-WU dirty list — see
 	// ShmClientTransport.wuDirty for the full design rationale
 	// (ping-pong double buffer, lost-WU prevention invariant,
@@ -343,7 +349,12 @@ func (t *ShmServerTransport) sendConnWindowUpdate(delta uint32, force bool) {
 	if v == 0 {
 		return
 	}
-	t.emitWindowUpdateFrame(0, v, nil)
+	if force {
+		shmConnWUForce.Add(1)
+	} else {
+		shmConnWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(0, v, nil, force)
 }
 
 // sendStreamWindowUpdate is the server-side lockless stream WU
@@ -367,7 +378,12 @@ func (t *ShmServerTransport) sendStreamWindowUpdate(s *ServerStream, delta uint3
 	if s.getState() == streamDone {
 		return
 	}
-	t.emitWindowUpdateFrame(s.id, v, s)
+	if force {
+		shmStreamWUForce.Add(1)
+	} else {
+		shmStreamWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(s.id, v, s, false)
 }
 
 // emitWindowUpdateFrame writes a WINDOW_UPDATE frame via the non-
@@ -375,7 +391,8 @@ func (t *ShmServerTransport) sendStreamWindowUpdate(s *ServerStream, delta uint3
 // restored to the appropriate pending accumulator and wuRetryWake is
 // signalled so the writer loop drains pending atomics on its next
 // tick. Pass nil for `s` on conn-level (streamID=0) frames.
-func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ServerStream) {
+func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ServerStream, connForce bool) {
+	shmWUFrameEmit.Add(1)
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, v)
 	err := t.frameWriter.enqueueOrInlineNonBlocking(frameEntry{
@@ -387,9 +404,12 @@ func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		shmWUFramesBackpressured.Add(1)
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
-			// Conn-level: no dirty flag. drainPendingWUForWriter
-			// always Swaps unconditionally — see client mirror for
-			// the design rationale.
+			if connForce {
+				t.pendingConnWUForceCredit.Store(1)
+			}
+			// Conn-level: threshold-gated drain with force-credit
+			// liveness backstop — see client mirror for the design
+			// rationale and pendingConnWUForceCredit field doc.
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
 			// Per-stream dirty enqueue: CAS-dedup. See client mirror
@@ -416,11 +436,20 @@ func (t *ShmServerTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
-	// CONN-LEVEL: unconditional Swap.
-	if v := t.pendingConnWU.Swap(0); v > 0 {
-		binary.BigEndian.PutUint32(t.wuBuf[:], v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+	// CONN-LEVEL: threshold-gated with force-credit liveness backstop.
+	// See client mirror (drainPendingWUForWriter in shm_client_transport.go)
+	// for the full design rationale and pendingConnWUForceCredit ordering proof.
+	forceFlag := t.pendingConnWUForceCredit.Swap(0)
+	thresh := t.wuThreshold.Load()
+	if thresh == 0 {
+		thresh = 1
+	}
+	if forceFlag != 0 || uint32(t.pendingConnWU.Load()) >= thresh {
+		if v := t.pendingConnWU.Swap(0); v > 0 {
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+		}
 	}
 	// PER-STREAM: ping-pong rotate.
 	t.wuDirtyMu.Lock()
