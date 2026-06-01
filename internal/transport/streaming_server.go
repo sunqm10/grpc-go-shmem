@@ -153,15 +153,15 @@ func (s *ShmStreamingServer) startReader() {
 			defer close(s.readerDone)
 			ctx := context.Background()
 
-			log.Printf("StreamingServer: reader goroutine starting")
+			shmDebugf("StreamingServer: reader goroutine starting")
 			for !s.closed.Load() {
 				fh, payload, err := readFrame(ctx, s.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
-						log.Printf("StreamingServer: reader exiting due to closed ring")
+						shmDebugf("StreamingServer: reader exiting due to closed ring")
 						return
 					}
-					log.Printf("StreamingServer: reader error: %v", err)
+					shmDebugf("StreamingServer: reader error: %v", err)
 					continue
 				}
 
@@ -170,7 +170,7 @@ func (s *ShmStreamingServer) startReader() {
 				case FrameTypeHEADERS:
 					hdr, err := decodeHeaders(payload)
 					if err != nil {
-						log.Printf("StreamingServer: failed to decode headers: %v", err)
+						shmDebugf("StreamingServer: failed to decode headers: %v", err)
 						continue
 					}
 					s.handleNewStream(fh.StreamID, hdr)
@@ -186,7 +186,7 @@ func (s *ShmStreamingServer) startReader() {
 					_ = writeFrame(ctx, s.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					s.writeMu.Unlock()
 				default:
-					log.Printf("StreamingServer: unknown frame type %d", fh.Type)
+					shmDebugf("StreamingServer: unknown frame type %d", fh.Type)
 				}
 			}
 		}()
@@ -199,7 +199,7 @@ func (s *ShmStreamingServer) handleNewStream(streamID uint32, hdr HeadersV1) {
 	// Check if stream already exists
 	if _, exists := s.streams[streamID]; exists {
 		s.streamsM.Unlock()
-		log.Printf("StreamingServer: stream %d already exists", streamID)
+		shmDebugf("StreamingServer: stream %d already exists", streamID)
 		return
 	}
 
@@ -270,7 +270,7 @@ func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
 				Type:     FrameTypeMESSAGE,
 			}
 			if err := s.writeFrameSafe(stream.ctx, fh, wrapped); err != nil {
-				log.Printf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
+				shmDebugf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
 				stream.closeWithError(err)
 				return
 			}
@@ -291,14 +291,14 @@ func (s *ShmStreamingServer) dispatchMessage(id uint32, p []byte) {
 	stream := s.streams[id]
 	s.streamsM.Unlock()
 	if stream == nil {
-		log.Printf("StreamingServer: no stream found for id %d", id)
+		shmDebugf("StreamingServer: no stream found for id %d", id)
 		return
 	}
 	// Strip the gRPC LPM 5-byte prefix added by the sender. See the
 	// matching stripLPMHeader in streaming_client.go.
 	body, ok := stripLPMHeader(p)
 	if !ok {
-		log.Printf("StreamingServer: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		shmDebugf("StreamingServer: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
 		return
 	}
 	// Make a copy since the payload buffer may be reused

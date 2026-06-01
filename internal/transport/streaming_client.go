@@ -148,15 +148,15 @@ func (c *ShmStreamingClient) startReader() {
 			defer close(c.readerDone)
 			ctx := context.Background()
 
-			log.Printf("StreamingClient: reader goroutine starting")
+			shmDebugf("StreamingClient: reader goroutine starting")
 			for !c.closed.Load() {
 				fh, payload, err := readFrame(ctx, c.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
-						log.Printf("StreamingClient: reader exiting due to closed ring")
+						shmDebugf("StreamingClient: reader exiting due to closed ring")
 						return
 					}
-					log.Printf("StreamingClient: reader error: %v", err)
+					shmDebugf("StreamingClient: reader error: %v", err)
 					continue
 				}
 
@@ -176,12 +176,12 @@ func (c *ShmStreamingClient) startReader() {
 					_ = writeFrame(ctx, c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
-					log.Printf("StreamingClient: received GOAWAY")
+					shmDebugf("StreamingClient: received GOAWAY")
 					// TODO: handle graceful shutdown
 				case FrameTypeCANCEL:
 					c.dispatchCancel(fh.StreamID)
 				default:
-					log.Printf("StreamingClient: unknown frame type %d", fh.Type)
+					shmDebugf("StreamingClient: unknown frame type %d", fh.Type)
 				}
 			}
 		}()
@@ -281,7 +281,7 @@ func (c *ShmStreamingClient) runStreamSender(s *StreamingClientStream) {
 				Type:     FrameTypeMESSAGE,
 			}
 			if err := c.writeFrameSafe(s.ctx, fh, wrapped); err != nil {
-				log.Printf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
+				shmDebugf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
 				s.closeWithError(err)
 				return
 			}
@@ -329,7 +329,7 @@ func (c *ShmStreamingClient) dispatchMessage(id uint32, p []byte) {
 	// present here). If the frame is malformed (too short) drop it.
 	body, ok := stripLPMHeader(p)
 	if !ok {
-		log.Printf("StreamingClient: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		shmDebugf("StreamingClient: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
 		return
 	}
 	// Make a copy since the payload buffer may be reused
