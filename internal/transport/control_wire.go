@@ -215,7 +215,23 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 		return connectResponse{}, fmt.Errorf("unsupported connect response version %d (this peer speaks v%d)", b[0], controlWireVersion)
 	}
 	nameLen := int(binary.LittleEndian.Uint32(b[1:5]))
-	if nameLen < 0 || len(b[5:]) < nameLen {
+	if nameLen <= 0 {
+		// Empty segment name is meaningless on the wire — the dialer
+		// has no segment to open. Reject explicitly so a buggy /
+		// malicious peer cannot trip a generic "OpenSegment empty
+		// name" error path later. Also rejects nameLen<0 which
+		// uint32 conversion to int would normally hide as a huge
+		// positive value (but len(b[5:]) >= nameLen would still
+		// catch oversize).
+		return connectResponse{}, errors.New("connect response name length must be > 0")
+	}
+	if nameLen > maxSegmentNameLen {
+		// Defence-in-depth: the segment-name grammar caps at
+		// maxSegmentNameLen. Reject early so we do not allocate a
+		// >200 B string from peer-controlled input.
+		return connectResponse{}, fmt.Errorf("connect response name length %d exceeds max %d", nameLen, maxSegmentNameLen)
+	}
+	if len(b[5:]) < nameLen {
 		return connectResponse{}, errors.New("connect response name missing")
 	}
 	// Selected-wire byte is mandatory; legacy responses without it
@@ -240,8 +256,25 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 	if len(b) < nonceOff+8 {
 		return connectResponse{}, errors.New("connect response missing correlation nonce")
 	}
+	// Exact-length check: anything after the nonce is unexpected
+	// trailing junk. Reject so a malformed peer cannot smuggle
+	// payload past the strict-length contract.
+	if len(b) != nonceOff+8 {
+		return connectResponse{}, fmt.Errorf("connect response has %d trailing byte(s) after nonce", len(b)-(nonceOff+8))
+	}
+	// Validate the segment name against the on-wire grammar BEFORE
+	// returning it. The dialer trusts the result directly as input
+	// to OpenSegment / per-data-segment FD-pass socket name
+	// derivation, so an invalid name would surface as a less-helpful
+	// error from those lower-level paths and (worst case) admit
+	// reserved suffixes such as ".lock" / ".fds.sock" that the
+	// transport reserves for its own siblings.
+	segName := string(b[5 : 5+nameLen])
+	if err := validateSegmentName(segName); err != nil {
+		return connectResponse{}, fmt.Errorf("connect response: %w", err)
+	}
 	return connectResponse{
-		segmentName: string(b[5 : 5+nameLen]),
+		segmentName: segName,
 		nonce:       binary.LittleEndian.Uint64(b[nonceOff : nonceOff+8]),
 	}, nil
 }
