@@ -2805,6 +2805,69 @@ func writeProtoToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint3
 	return res.Commit(total)
 }
 
+// writeProtoBytesToRingH2Blocking is the bytes-based async variant
+// of writeProtoToRingH2Blocking: the caller supplies the
+// PRE-MARSHALLED proto body (no LPM length prefix, no H2 frame
+// header). The function reserves a ring slot, lays out the 9-byte
+// H2 DATA frame header + 5-byte gRPC LPM header, and copies the
+// body bytes into the reservation. Used by the writer goroutine
+// when processProtoEntry / retryDeferredProto drains an entry that
+// the WriteProto async fallback path pre-marshalled on the SendMsg
+// caller's goroutine (closes a SendMsg-returns-then-user-mutates
+// race that the prior protoMsg-deferred path was exposed to).
+func writeProtoBytesToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint32, protoBytes []byte, flags uint8) error {
+	pSize := len(protoBytes)
+	total := h2FrameHeaderSize + 5 + pSize
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	// Build the 14-byte preamble (H2 frame header + gRPC LPM header)
+	// on the stack so neither path allocates here.
+	var hdr14 [h2FrameHeaderSize + 5]byte
+	var h2flags byte
+	if flags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var h2hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&h2hdr, H2FrameHeader{
+		Length:   uint32(5 + pSize),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	copy(hdr14[0:h2FrameHeaderSize], h2hdr[:])
+	hdr14[h2FrameHeaderSize] = 0 // gRPC LPM compressed flag = 0
+	binary.BigEndian.PutUint32(hdr14[h2FrameHeaderSize+1:h2FrameHeaderSize+5], uint32(pSize))
+
+	if len(res.Second) == 0 {
+		// Contiguous fast path: header + body copied straight in.
+		copy(res.First[0:h2FrameHeaderSize+5], hdr14[:])
+		copy(res.First[h2FrameHeaderSize+5:], protoBytes)
+	} else {
+		// Wrap path: split the 14-byte preamble and the body across
+		// res.First / res.Second exactly at the reservation boundary.
+		preamble := hdr14[:]
+		if len(res.First) >= len(preamble) {
+			// Preamble fits entirely in res.First.
+			copy(res.First[0:len(preamble)], preamble)
+			remFirst := res.First[len(preamble):]
+			copy(remFirst, protoBytes[:len(remFirst)])
+			copy(res.Second, protoBytes[len(remFirst):])
+		} else {
+			// Preamble straddles the wrap: split it.
+			firstN := len(res.First)
+			copy(res.First, preamble[:firstN])
+			copy(res.Second[:len(preamble)-firstN], preamble[firstN:])
+			copy(res.Second[len(preamble)-firstN:], protoBytes)
+		}
+	}
+
+	atomic.AddUint64(&shmZCWriteFire, 1)
+	return res.Commit(total)
+}
+
 // writeProtoToRingH2Core is the shared body of writeProtoToRingH2 and
 // writeProtoToRingH2Blocking: reserve, lay out H2 header + gRPC LPM
 // header, marshal the proto body directly into the ring slice,

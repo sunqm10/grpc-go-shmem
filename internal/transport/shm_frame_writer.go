@@ -297,21 +297,29 @@ type frameEntry struct {
 
 	// ZC marshal in writeLoop.
 	//
-	// When `protoMsg != nil`, this entry carries an UNMARSHALLED
-	// proto.Message that writeLoop should marshal DIRECTLY into a
-	// ring reservation (via writeProtoToRingH2Blocking), bypassing
-	// the upper-layer codec.Marshal allocation. Used as the queued
-	// fallback when (*ShmClientTransport|ShmServerTransport).writeProto's
-	// inlineMu.TryLock fails — even bailed senders still get ZC
-	// marshal via the writer goroutine instead of the
-	// tightBufferPool + chunked-write-vec copy path.
+	// `protoBytes` carries a PRE-MARSHALLED gRPC body (the
+	// `protobuf.Marshal(msg)` output, without the 5-byte LPM length
+	// prefix and without the H2 frame header). The writer copies
+	// these bytes directly into a ring reservation via
+	// writeProtoBytesToRingH2Blocking, prepending the H2 frame
+	// header and 5-byte LPM length. This is the SAFE async fallback
+	// path used by (*ShmClientTransport|ShmServerTransport).writeProto
+	// when the inline TryLock fails: the caller marshals on its own
+	// goroutine BEFORE returning to gRPC core, so a SendMsg caller
+	// is free to mutate the user-visible proto.Message immediately
+	// after writeProto returns — matching stock gRPC's semantics.
 	//
-	// Caller MUST pre-validate single-frame size bounds AND must
-	// have already acquired send quota for (5 + protoSize) bytes
-	// before pushing — writeLoop cannot soft-reject these from its
-	// drain context. fh.Flags carries MessageFlagEndStream / MORE.
-	protoMsg  proto.Message
-	protoSize int
+	// `protoMsg` is the legacy unmarshalled-message variant kept
+	// for compatibility with any caller that opts out of eager
+	// marshal. WriteProto callers always populate protoBytes; the
+	// processProtoEntry / retryDeferredProto paths prefer protoBytes
+	// when both are non-nil.
+	//
+	// Caller MUST pre-validate single-frame size bounds. fh.Flags
+	// carries MessageFlagEndStream / MORE.
+	protoBytes []byte
+	protoMsg   proto.Message
+	protoSize  int
 }
 
 const (
@@ -690,12 +698,14 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 		w.processWholeMessage(entry)
 		return
 	}
-	// ZC marshal entries: marshal the proto.Message DIRECTLY into a
-	// ring reservation here (under inlineMu), bypassing the upper-
-	// layer codec.Marshal + tightBufferPool allocation that the
-	// sender would otherwise pay. See enqueueProtoAndWait for the
-	// caller-side contract.
-	if entry.protoMsg != nil {
+	// ZC marshal entries: write a proto body directly into a ring
+	// reservation here (under inlineMu), bypassing the upper-layer
+	// codec.Marshal + tightBufferPool allocation that the sender
+	// would otherwise pay. protoBytes is the safe, eagerly-marshalled
+	// async fallback; protoMsg is the legacy deferred-marshal path
+	// retained for any caller that opts out of eager marshal. See
+	// enqueueProtoBytesAsync for the caller-side contract.
+	if entry.protoBytes != nil || entry.protoMsg != nil {
 		w.processProtoEntry(entry)
 		return
 	}
@@ -839,8 +849,20 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		w.deferredProto[sid] = []frameEntry{entry}
 		return
 	}
-	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-		entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	// Prefer the bytes path when the SendMsg caller pre-marshalled
+	// (the standard fire-and-forget WriteProto fallback does this so
+	// the caller is free to mutate the proto.Message after writeProto
+	// returns — closes a data race on the user-visible message). The
+	// legacy msg path is retained for any caller that opts out of
+	// eager marshal.
+	var err error
+	if entry.protoBytes != nil {
+		err = writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoBytes, entry.fh.Flags)
+	} else {
+		err = writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	}
 	if err != nil {
 		// Refund the quota we just reserved — these bytes did not
 		// land on the wire. ReserveWrite returns BEFORE Commit on
@@ -1062,8 +1084,11 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 	}
 }
 
-// enqueueProtoAsync pushes a ZC marshal request onto the writer
-// channel fire-and-forget. The sender does NOT block on completion.
+// enqueueProtoBytesAsync pushes a PRE-MARSHALLED proto body onto the
+// writer channel fire-and-forget. The sender does NOT block on
+// completion. The writer goroutine takes ownership of the bytes
+// until the entry is fully drained (success or stream/transport
+// close).
 //
 // Used by (*ShmClientTransport|ShmServerTransport).writeProto when
 // either the inline TryLock fails OR the inline lock-free CAS for
@@ -1075,12 +1100,35 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 // message path, eliminating the parallel slow-path machinery that
 // previously parked ~10% of senders at fair-default 1000/4K.
 //
+// The eager-marshal contract (caller marshals before pushing the
+// entry, rather than queueing the live proto.Message for the
+// writer to marshal later) closes a data race against gRPC's
+// SendMsg semantics: a SendMsg caller is allowed to mutate the
+// message immediately after the call returns, and the prior
+// deferred-marshal path stored the live pointer in the writer
+// queue, racing the caller's mutation against the wire
+// serialisation. The trade-off is that the SendMsg caller pays
+// the marshal cost instead of the writer goroutine; that's
+// acceptable because async fallback is the cold path (TryLock
+// fail OR CAS fail). The inline fast path, which is hit at
+// steady-state low contention, still marshals directly into the
+// ring under inlineMu (zero-copy).
+//
 // Pre-conditions (caller MUST satisfy):
-//   - Single-frame size bounds pre-validated.
-//   - opts.Last → stream state already CAS'd to streamWriteDone
-//     (semantic transition happens-before the upper-layer return).
-//   - NO send-quota pre-reserved. The writer's processProtoEntry
-//     does the CAS reservation under its own context.
+//   - protoBytes is the exact output of protobuf.Marshal(msg) for
+//     the message the caller wants on the wire — the writer will NOT
+//     re-marshal. len(protoBytes) is the gRPC LPM length the
+//     receiver's flow-control accounting expects.
+//   - Single-frame size bounds pre-validated; the caller is
+//     responsible for falling back to the chunked whole-message
+//     path for oversize messages.
+//   - opts.Last → stream state already CAS'd to streamWriteDone.
+//   - NO send-quota pre-reserved (writer's processProtoEntry does
+//     the CAS reservation under its own ownership).
+//
+// On success the protoBytes slice is owned by the writer until the
+// entry is fully drained; the caller MUST NOT mutate or pool-
+// release it. On ErrConnClosing the caller owns the slice again.
 //
 // Errors: returns ErrConnClosing if the chan is full or the writer
 // is closed. The frameWriterQueueSize=2048 buffer makes "full"
@@ -1090,13 +1138,13 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 // guaranteed to be processed (or silently dropped on stream/
 // transport close, both of which the upper layer observes via the
 // stream state machine).
-func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+func (w *shmFrameWriter) enqueueProtoBytesAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, protoBytes []byte) error {
 	entry := frameEntry{
-		ctx:       ctx,
-		fh:        fh,
-		streamPtr: streamPtr,
-		protoMsg:  msg,
-		protoSize: pSize,
+		ctx:        ctx,
+		fh:         fh,
+		streamPtr:  streamPtr,
+		protoBytes: protoBytes,
+		protoSize:  len(protoBytes),
 	}
 	if !w.trySend(entry) {
 		return ErrConnClosing
@@ -1458,8 +1506,17 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 			// revisit on the next wuRetryWake.
 			break
 		}
-		err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		// Prefer the bytes path when the entry was pre-marshalled
+		// (the standard async fallback path). See processProtoEntry
+		// for the full rationale.
+		var err error
+		if entry.protoBytes != nil {
+			err = writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+				entry.protoBytes, entry.fh.Flags)
+		} else {
+			err = writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+				entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		}
 		if err != nil {
 			// Refund and tear down; subsequent senders see
 			// ErrConnClosing via t.closed.Load(). Break out: a

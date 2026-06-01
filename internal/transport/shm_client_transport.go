@@ -2438,7 +2438,26 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// count and also routes through async, preserving FIFO. The
 	// writer decrements after the entry is fully resolved.
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	// Eagerly marshal on the SendMsg caller's goroutine. This closes
+	// a data race that the previous protoMsg-deferred path was
+	// exposed to: gRPC's SendMsg contract lets callers mutate the
+	// proto.Message as soon as the call returns, but the deferred
+	// path stored the live pointer in the writer queue and only
+	// marshalled it later on the writer goroutine — racing the
+	// caller's mutation against the wire serialisation.
+	//
+	// Marshal cost paid on the SendMsg goroutine instead of the
+	// writer goroutine: acceptable because async fallback is the
+	// cold path (TryLock fail OR CAS fail). The inline fast path,
+	// which is hit at steady-state low contention, still marshals
+	// directly into the ring under inlineMu (zero-copy).
+	protoBytes := make([]byte, 0, pSize)
+	protoBytes, err := protoMarshalAppend(protoBytes, pm)
+	if err != nil {
+		s.protoInFlight.Add(-1)
+		return true, err
+	}
+	if err := t.frameWriter.enqueueProtoBytesAsync(s.ctx, &s.Stream, fh, protoBytes); err != nil {
 		s.protoInFlight.Add(-1)
 		return true, err
 	}

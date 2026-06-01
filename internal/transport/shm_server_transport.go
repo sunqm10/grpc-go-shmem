@@ -2038,7 +2038,17 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		Flags:    0,
 	}
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	// Eagerly marshal on the SendMsg caller's goroutine — closes a
+	// data race against the user mutating the proto.Message after
+	// SendMsg returns. See ShmClientTransport.writeProto for the
+	// full rationale and cost analysis.
+	protoBytes := make([]byte, 0, pSize)
+	protoBytes, err := protoMarshalAppend(protoBytes, pm)
+	if err != nil {
+		s.protoInFlight.Add(-1)
+		return true, err
+	}
+	if err := t.frameWriter.enqueueProtoBytesAsync(s.ctx, &s.Stream, fh, protoBytes); err != nil {
 		s.protoInFlight.Add(-1)
 		return true, err
 	}
