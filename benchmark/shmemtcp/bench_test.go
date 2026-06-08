@@ -205,7 +205,7 @@ func sweepStaleShmSegments() {
 // reading the harness source.
 var logBenchEnvOnceOnce sync.Once
 
-func logBenchEnvOnce(b *testing.B) {
+func logBenchEnvOnce(b testing.TB) {
 	logBenchEnvOnceOnce.Do(func() {
 		prof := loadBenchProfile()
 		spin := os.Getenv("SHM_SPIN_ITERS")
@@ -589,7 +589,7 @@ func newUnixEnv(b *testing.B) *grpcBenchEnv {
 
 // warmUpGRPC makes one unary call to ensure the gRPC connection is fully established
 // before benchmark timing begins.
-func warmUpGRPC(b *testing.B, client testgrpc.BenchmarkServiceClient) {
+func warmUpGRPC(b testing.TB, client testgrpc.BenchmarkServiceClient) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req := &testpb.SimpleRequest{

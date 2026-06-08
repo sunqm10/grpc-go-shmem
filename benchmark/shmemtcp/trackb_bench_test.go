@@ -81,6 +81,11 @@ type trackBListener struct {
 	reqCh  chan *trackBReq
 	addr   net.Addr
 	closed chan struct{}
+	// wrap, when non-nil, decorates every accepted/dialed ShmConn before
+	// it is handed to grpc-go. isServer distinguishes the two ends. The
+	// floor harness leaves this nil (no behaviour change); the write-probe
+	// variant uses it to count Write sizes at the ring boundary.
+	wrap func(c net.Conn, isServer bool) net.Conn
 }
 
 func newTrackBListener(name string) *trackBListener {
@@ -102,7 +107,10 @@ func (l *trackBListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		seg.H.SetServerReady(true)
-		conn := transport.NewServerConn(seg) // registers rings before client opens
+		var conn net.Conn = transport.NewServerConn(seg) // registers rings before client opens
+		if l.wrap != nil {
+			conn = l.wrap(conn, true)
+		}
 		req.ready <- nil
 		return conn, nil
 	case <-l.closed:
@@ -148,7 +156,11 @@ func (l *trackBListener) dial(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return transport.NewClientConn(seg), nil
+	var conn net.Conn = transport.NewClientConn(seg)
+	if l.wrap != nil {
+		conn = l.wrap(conn, false)
+	}
+	return conn, nil
 }
 
 // newTrackBEnv builds a stock gRPC server+client pair whose only
@@ -156,9 +168,16 @@ func (l *trackBListener) dial(ctx context.Context) (net.Conn, error) {
 // readBuf < 0 means "use grpc-go defaults"; 0 means disable the staging
 // buffer (the cheap-win configuration from the design analysis).
 func newTrackBEnv(b *testing.B, writeBuf, readBuf int) *grpcBenchEnv {
+	return newTrackBEnvWrap(b, writeBuf, readBuf, nil)
+}
+
+// newTrackBEnvWrap is newTrackBEnv with an optional ShmConn decorator
+// (used by the write-probe variant to instrument the ring boundary).
+func newTrackBEnvWrap(b testing.TB, writeBuf, readBuf int, wrap func(c net.Conn, isServer bool) net.Conn) *grpcBenchEnv {
 	logBenchEnvOnce(b)
 	name := fmt.Sprintf("grpc_shm_trackb_ctl_%d", time.Now().UnixNano())
 	lis := newTrackBListener(name)
+	lis.wrap = wrap
 
 	srvOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(benchMaxMsg),
