@@ -105,6 +105,18 @@ type ShmRing struct {
 	// the eventfd waker is disabled.
 	dataSegWaker *shmDataSegWaker
 
+	// maxFrameBody is the per-connection outbound HTTP/2 DATA-frame body
+	// ceiling, in bytes. Zero means "use the package-global
+	// shmMaxFrameSize" (the production / GoPrivateV1 default). The
+	// CrossLangV1 conformance profile sets this to 16384 so the producer
+	// chunks DATA at the HTTP/2 spec default a foreign peer expects.
+	// Read on every outbound chunk decision via effectiveMaxFrameBody;
+	// stored atomically because it is set from the transport constructor
+	// goroutine while the writer goroutine reads it. Affects the TX path
+	// only — the RX validation ceiling deliberately stays at the generous
+	// global so a one-sided profile flip never hard-rejects valid frames.
+	maxFrameBody atomic.Int32
+
 	// Adaptive spin state for minimizing latency on fast paths.
 	// These are process-local and help tune spin duration based on workload.
 	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
@@ -678,6 +690,30 @@ func (r *ShmRing) dataPtr() unsafe.Pointer {
 // Capacity returns the ring capacity
 func (r *ShmRing) Capacity() uint64 {
 	return r.capacity
+}
+
+// effectiveMaxFrameBody returns the outbound HTTP/2 DATA-frame body
+// ceiling for this ring: the per-connection override (set by the
+// CrossLangV1 profile) when non-zero, otherwise the package-global
+// shmMaxFrameSize default. Read on the producer hot path for every
+// chunking decision.
+func (r *ShmRing) effectiveMaxFrameBody() int {
+	if v := r.maxFrameBody.Load(); v > 0 {
+		return int(v)
+	}
+	return shmMaxFrameSize
+}
+
+// SetMaxFrameBody sets the per-connection outbound DATA-frame body
+// ceiling (CrossLangV1 = 16384). A value <= 0 clears the override and
+// reverts to the package-global default. Called once from the transport
+// constructor before the writer goroutine emits any DATA frame.
+func (r *ShmRing) SetMaxFrameBody(n int) {
+	if n <= 0 {
+		r.maxFrameBody.Store(0)
+		return
+	}
+	r.maxFrameBody.Store(int32(n))
 }
 
 // DebugState returns a snapshot of the current ring state for debugging and diagnostics.

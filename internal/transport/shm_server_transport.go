@@ -1856,7 +1856,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	// of the chunking knob, so a fair-mode 64 KiB response would emit
 	// a 65549 B frame that triggers the receiver's stream-level
 	// fc.onData violation before onMessageStart's pre-credit can fire.
-	if quotaSize > shmMaxFrameSize {
+	if quotaSize > t.serverToClient.effectiveMaxFrameBody() {
 		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
 		if err := t.maybeWriteHeader(s); err != nil {
 			return false, err

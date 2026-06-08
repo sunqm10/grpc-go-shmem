@@ -1884,7 +1884,7 @@ func (w *shmFrameWriter) tryInlineWrite(
 		atomic.AddUint64(&shmInlineWriteBailZeroLen, 1)
 		return false, nil
 	}
-	if payloadLen > shmMaxFrameSize {
+	if payloadLen > w.tx.effectiveMaxFrameBody() {
 		atomic.AddUint64(&shmInlineWriteBailFrameSize, 1)
 		return false, nil
 	}

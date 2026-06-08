@@ -2286,7 +2286,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// codec runs the accumulator path that fires onMessageStart on
 	// the first chunk and pre-credits the full LPM via
 	// sendWindowUpdateForce.
-	if quotaSize > shmMaxFrameSize {
+	if quotaSize > t.clientToServer.effectiveMaxFrameBody() {
 		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
 		return false, nil
 	}

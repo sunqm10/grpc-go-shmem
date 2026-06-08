@@ -2150,7 +2150,7 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 	//      well-formed and must be transported incrementally. The
 	//      reader's lpmAccumulator reassembles the chunks.
 	if fh.Type == FrameTypeMESSAGE &&
-		(len(h2payload) > shmMaxFrameSize ||
+		(len(h2payload) > tx.effectiveMaxFrameBody() ||
 			uint64(h2FrameHeaderSize+len(h2payload)) > tx.Capacity()) {
 		return writeFrameH2DataChunked(ctx, tx, fh.StreamID, h2payload, h2f)
 	}
@@ -2218,7 +2218,7 @@ func writeH2Single(ctx context.Context, tx *ShmRing, h2t H2FrameType, h2f byte, 
 // avoiding stall under back-pressure.
 func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, body []byte, baseFlags byte) error {
 	atomic.AddUint64(&shmChunkedWriteFire, 1)
-	maxChunk := shmMaxFrameSize
+	maxChunk := tx.effectiveMaxFrameBody()
 	if maxChunk > h2MaxFramePayload {
 		maxChunk = h2MaxFramePayload
 	}
@@ -2377,7 +2377,7 @@ func emitH2DataFromCursor(
 ) (int, error) {
 	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
 
-	maxChunk := shmMaxFrameSize
+	maxChunk := tx.effectiveMaxFrameBody()
 	if maxChunk > h2MaxFramePayload {
 		maxChunk = h2MaxFramePayload
 	}

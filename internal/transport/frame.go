@@ -436,8 +436,9 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	// callers / tests) would fall back to the legacy materialise +
 	// chunked path and bypass the producer-ZC optimisation.
 	if fh.Type == FrameTypeMESSAGE {
+		maxFrameBody := tx.effectiveMaxFrameBody()
 		bodyLen := len(hdr) + dataLen
-		if bodyLen <= shmMaxFrameSize && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
+		if bodyLen <= maxFrameBody && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
 			return writeFrameH2Message(ctx, tx, fh.StreamID, fh.Flags, hdr, payload)
 		}
 		// Multi-frame MESSAGE (e.g. LargeUnary 16 MB under
@@ -448,7 +449,7 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 		// (writeFrameH2DataChunked) is still used by writeFrame
 		// callers that already pass a single []byte (HEADERS,
 		// TRAILERS, plus tests).
-		if uint64(h2FrameHeaderSize+shmMaxFrameSize) <= tx.Capacity() {
+		if uint64(h2FrameHeaderSize+maxFrameBody) <= tx.Capacity() {
 			_, h2f := translateCustomToH2(fh)
 			return writeFrameH2DataChunkedVec(ctx, tx, fh.StreamID, hdr, payload, h2f)
 		}
