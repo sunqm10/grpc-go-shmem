@@ -298,11 +298,17 @@ type RingHeader struct {
 	spaceWaiters  uint32 // 0x2C: number of writers waiting on space
 	contigWaiters uint32 // 0x30: number of writers waiting on contiguity
 	dataWaiters   uint32 // 0x34: number of readers waiting for data
-	// speculativeReserved is the number of bytes speculatively committed by
-	// the reader (readIdx advanced) but still referenced by zero-copy buffers.
-	// Writers deduct this from available space so they cannot overwrite ring
-	// memory still in use by the reader. Accessed atomically.
-	speculativeReserved int64 // 0x38-0x3F
+	// reservedZero is a reserved 8-byte field that MUST be 0. It was formerly
+	// speculativeReserved, a writer-deducted zero-copy reservation counter,
+	// but the zero-copy reader now uses the process-local deferred-readIdx
+	// protocol (it freezes the shared readIdx while a ZC buffer is held), so
+	// the writer's plain available-space formula is already correct and never
+	// needs to consult this field. Keeping it reserved-zero preserves the v1
+	// segment ABI offset map and is the cross-language interop contract: a
+	// non-Go peer that reads available space as capacity-(widx-ridx) is
+	// automatically correct. Accessed atomically only for the conformance
+	// assertion.
+	reservedZero int64 // 0x38-0x3F: reserved, MUST be 0
 	// data area starts at offset 0x40
 }
 
@@ -435,14 +441,11 @@ func (r *RingHeader) DataWaiters() uint32 {
 	return atomic.LoadUint32(&r.dataWaiters)
 }
 
-// SpeculativeReserved returns the bytes speculatively reserved by the reader.
-func (r *RingHeader) SpeculativeReserved() int64 {
-	return atomic.LoadInt64(&r.speculativeReserved)
-}
-
-// AddSpeculativeReserved atomically adds n to speculativeReserved.
-func (r *RingHeader) AddSpeculativeReserved(n int64) {
-	atomic.AddInt64(&r.speculativeReserved, n)
+// ReservedZero returns the value of the reserved-zero field at offset 0x38.
+// It MUST be 0; a non-zero value means a peer is using a non-conformant
+// reserve-based protocol and the connection should be rejected.
+func (r *RingHeader) ReservedZero() int64 {
+	return atomic.LoadInt64(&r.reservedZero)
 }
 
 // DataArea returns a pointer to the ring's data area

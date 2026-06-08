@@ -102,7 +102,7 @@ func TestRingHeaderFieldOffsets(t *testing.T) {
 		{"spaceWaiters", unsafe.Offsetof(r.spaceWaiters), 0x2C},
 		{"contigWaiters", unsafe.Offsetof(r.contigWaiters), 0x30},
 		{"dataWaiters", unsafe.Offsetof(r.dataWaiters), 0x34},
-		{"speculativeReserved", unsafe.Offsetof(r.speculativeReserved), 0x38},
+		{"reservedZero", unsafe.Offsetof(r.reservedZero), 0x38},
 	}
 
 	for _, tt := range tests {

@@ -858,19 +858,12 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space, deducting speculative reserved bytes
-		// so the writer cannot overwrite ring memory still held by zero-copy
-		// read buffers.
+		// Calculate available space. The zero-copy reader uses the
+		// deferred-readIdx protocol (it freezes the shared readIdx while a
+		// ZC buffer is held), so capacity-(widx-ridx) already excludes bytes
+		// still referenced by the reader; no extra deduction is needed.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
-		specReserved := hdr.SpeculativeReserved()
-		if specReserved > 0 {
-			sr := uint64(specReserved)
-			if sr > available {
-				sr = available
-			}
-			available -= sr
-		}
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write
@@ -1223,41 +1216,22 @@ func (r *ShmRing) HasPendingData() bool {
 	return hdr.WriteIndex() > atomic.LoadUint64(&r.pendingReadIdx)
 }
 
-// effectiveAvailable returns the bytes available for writing, deducting
-// speculativeReserved so the writer cannot overwrite ring memory still
-// referenced by zero-copy reader buffers.
+// effectiveAvailable returns the bytes available for writing. The zero-copy
+// reader uses the deferred-readIdx protocol (the shared readIdx stays frozen
+// while a ZC buffer is held), so capacity-(widx-ridx) already excludes bytes
+// the reader still references.
 func (r *ShmRing) effectiveAvailable() uint64 {
 	hdr := r.header()
 	writeIdx := hdr.WriteIndex()
 	readIdx := hdr.ReadIndex()
 	used := writeIdx - readIdx
-	raw := r.capacity - used
-
-	specReserved := hdr.SpeculativeReserved()
-	if specReserved <= 0 {
-		return raw
-	}
-	sr := uint64(specReserved)
-	if sr > raw {
-		sr = raw
-	}
-	return raw - sr
+	return r.capacity - used
 }
 
-// effectiveSpace returns the writable space given current indices,
-// deducting bytes speculatively reserved by zero-copy readers.
+// effectiveSpace returns the writable space given current indices. See
+// effectiveAvailable for why no zero-copy deduction is required.
 func (r *ShmRing) effectiveSpace(writeIdx, readIdx uint64) uint64 {
-	raw := r.capacity - (writeIdx - readIdx)
-	hdr := r.header()
-	specReserved := hdr.SpeculativeReserved()
-	if specReserved <= 0 {
-		return raw
-	}
-	sr := uint64(specReserved)
-	if sr > raw {
-		sr = raw
-	}
-	return raw - sr
+	return r.capacity - (writeIdx - readIdx)
 }
 
 // ContiguousWriteSpace returns the number of contiguous bytes available for
@@ -1273,16 +1247,6 @@ func (r *ShmRing) ContiguousWriteSpace() uint64 {
 	readIdx := hdr.ReadIndex()
 	used := writeIdx - readIdx
 	available := r.capacity - used
-
-	// Deduct speculative reserved bytes (zero-copy reads still in use).
-	specReserved := hdr.SpeculativeReserved()
-	if specReserved > 0 {
-		sr := uint64(specReserved)
-		if sr > available {
-			sr = available
-		}
-		available -= sr
-	}
 
 	writePos := writeIdx & r.capMask
 	toEnd := r.capacity - writePos
@@ -1357,18 +1321,11 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space using indices, deducting bytes
-		// speculatively reserved by zero-copy readers.
+		// Calculate available space using indices. The deferred-readIdx ZC
+		// protocol keeps the shared readIdx frozen while a reader holds a
+		// zero-copy buffer, so no extra deduction is required here.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
-		specReserved := hdr.SpeculativeReserved()
-		if specReserved > 0 {
-			sr := uint64(specReserved)
-			if sr > available {
-				sr = available
-			}
-			available -= sr
-		}
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write (same as original WriteBlocking)
@@ -1798,17 +1755,11 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space, deducting speculative reserved bytes.
+		// Calculate available space. The deferred-readIdx ZC protocol keeps
+		// the shared readIdx frozen while a reader holds a zero-copy buffer,
+		// so capacity-(widx-ridx) is already the correct writable space.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
-		specReserved := hdr.SpeculativeReserved()
-		if specReserved > 0 {
-			sr := uint64(specReserved)
-			if sr > available {
-				sr = available
-			}
-			available -= sr
-		}
 
 		if uint64(n) <= available {
 			// Space available - create reservation
@@ -1855,14 +1806,6 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
 			avail := r.capacity - (writeIdx - readIdx)
-			sr := hdr.SpeculativeReserved()
-			if sr > 0 {
-				sru := uint64(sr)
-				if sru > avail {
-					sru = avail
-				}
-				avail -= sru
-			}
 			if avail >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward
