@@ -25,7 +25,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"sync"
 	"sync/atomic"
 )
