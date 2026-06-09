@@ -624,6 +624,107 @@ override alone stalls on over-window messages. That confirms, empirically,
 that **window negotiation belongs in SETTINGS** — the per-connection profile
 is finished by landing the SETTINGS step, not bolted on before it.
 
+### 3.6 What the "conformance cost" actually is — frame vs window, and why it is a floor not a tax
+
+A blunt 41–65 % "cost" hides the mechanism. A 2×2 sweep at 64 KB streaming
+(toggling frame size and window independently via the global knobs) decomposes
+it (relative trend; the absolute values here are from a faster smoke run, but
+the *ratios* are the point):
+
+| 64 KB | jumbo frame (16 MiB) | standard frame (16 KiB) |
+|---|---|---|
+| **jumbo window (32 MiB)** | A — pure SHM (baseline) | B — **+28 %** vs A |
+| **standard window (64 KiB)** | C — *structurally fails*¹ | D — strict (+36 % vs A) |
+
+¹ A 16 MiB frame with a 64 KiB window is incompatible: a 64 KB message rides
+one big DATA frame but exceeds the 64 KiB window, and the single-frame fast
+path skips the pre-credit that a chunked message gets — so jumbo-frame and
+small-window are *bound together*, they cannot be mixed.
+
+Reading the decomposition:
+
+- **The frame cap is ~80 % of the cost** (A→B is +28 %; the window's marginal
+  contribution B→D is only ~+6 %). The conformance cost is overwhelmingly a
+  *framing* effect, not a flow-control effect.
+- **The frame cap is negotiable.** `SETTINGS_MAX_FRAME_SIZE` is a standard
+  HTTP/2 SETTINGS parameter, and HTTP/2 permits values up to 16 MiB (2²⁴−1).
+  The 16 KiB used in the "strict" column is merely the *default*, not a
+  ceiling. The whole job of the `CrossLangV1` SETTINGS step (§3.4 step 1) is
+  to negotiate the frame size *up* to whatever the peer will accept. So the
+  dominant 80 % of the conformance cost is exactly the part the extension's
+  own negotiation can claw back.
+
+**The honest reframing (important).** The "strict CrossLangV1" column in §3.5
+is not a fixed extension tax — it is the **floor**, the number you get when a
+foreign peer refuses to negotiate anything above HTTP/2 defaults. It is, quite
+literally, *the gRFC SHM transport measured under HTTP/2-default settings*
+(`fair-default` + 16 KiB frames). The extension does not *add* this cost; the
+extension's entire purpose is to **negotiate away as much of it as the peer
+allows**. Stated as a formula:
+
+> real cross-language cost = (pure-SHM jumbo) − (best posture the peer will
+> accept). 16 KiB / 64 KiB is the worst-case **floor** (most conservative
+> peer); a capable peer that accepts a larger `MAX_FRAME_SIZE` moves the
+> result back toward the pure-SHM baseline.
+
+This also answers "did the gRFC transport leave performance on the table?" —
+no. The gRFC engine running at jumbo settings (cell A / GoPrivateV1) is the
+full-speed result and is **2.3× faster than UDS at 64 KB on Linux**
+(89,745 vs 203,767 ns). The strict column is not the engine underperforming;
+it is the same engine deliberately constrained to the settings a
+lowest-common-denominator foreign peer can speak. The ~500-line extension is a
+thin negotiation layer on top of that 23,800-line engine — small precisely
+because the engine already does all the hard work; and the negotiation it adds
+is what recovers the frame-size cost that dominates the floor.
+
+### 3.7 Cost of the extension itself — code size and API surface
+
+Two numbers a reviewer will ask for: how much code, and how much public API.
+
+**Code size.** The gRFC SHM transport is ~23,800 lines across 52 files (ring
+SPSC sync, eventfd/futex wake, HPACK codec, HTTP/2 framing, flow control, the
+ZC fast path + multi-anchor FIFO, security handshake, segment lifecycle,
+Linux + Windows). The `CrossLangV1` extension on top of it is:
+
+- **landed already** (committed): `speculativeReserved@0x38` retirement
+  (net −54, dead-code removal) + per-connection outbound frame-size override
+  (+45 −8) ≈ **~80 lines of new logic** — about **0.3 %** of the engine.
+- **remaining** (estimated): SETTINGS state machine (~100 core / ~300 with
+  ACK + first-frame + ordering), UDS bootstrap handshake (~200–250, reusing
+  the existing per-segment fd-pass UDS), liveness (~120), hardening (~150),
+  cross-language conformance tests (~300). **Core path ≈ 400–600 lines;**
+  full hardened + tested ≈ ~1,300 lines — i.e. **~6 %** of the engine.
+
+The extension is small *because* the gRFC engine already exists; it is a
+negotiation layer, not a second transport. (The genuinely large remaining
+cost of true interop is not in Go at all — it is a *second language's* native
+reimplementation of the same spec; see §2.4.)
+
+**API surface — it converges.** The extension adds **no new public type or
+function**. `experimental/shm` already exposes the stable surface
+(`WithTransport`, `WithTransportAndOptions`, `NewListener`, `DialOptions`,
+`Config`, `ListenerConfig`, discovery interceptors). `CrossLangV1` needs only
+a single boolean on the two existing option structs:
+
+```go
+type DialOptions struct {   // already transport.DialOptions
+    // ...
+    CrossLangV1 bool   // request the cross-language-conformant profile
+}
+type ListenerConfig struct {
+    // ...
+    CrossLangV1 bool
+}
+```
+
+The profile-negotiation bit rides the existing CONNECT/ACCEPT flags byte
+(internal wire, not exposed). Default `false` = `GoPrivateV1`, so existing
+users are byte-for-byte unaffected — fully backward compatible. This is a
+notable contrast with Part 2's tier-(ii) generic hooks
+(`BufferReader`/`BufferWriter`/`WithMaxFrameSize`), which would require *new
+public gRPC-Go interfaces*: the extension (tier iii) needs **two boolean
+fields and no grpc-go core SPI change at all**.
+
 ---
 
 ## Notes
