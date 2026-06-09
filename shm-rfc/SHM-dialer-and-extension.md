@@ -552,46 +552,77 @@ is built, by forcing a Go↔Go pair into `CrossLangV1` over the existing
 handshake with the new knobs flipped:
 
 0. **`speculativeReserved` cleanup** (near-zero risk; confirm no bench delta).
-1. **SETTINGS state machine** (first perf gate).
+   — **done** (committed; behaviour-preserving, no bench delta).
+1. **SETTINGS state machine** (first perf gate). — *next; required to finish a
+   robust per-connection window profile, see §3.5.*
 2. **Profile plumbing** + capability bits (eventfd mandatory for `CrossLangV1`).
-   → **Minimum benchmarkable path = steps 0+1+2**, no UDS yet.
+   The per-connection frame-size override is **done** (committed); the window
+   override is prototyped but needs step 1 to be robust over-window.
+   → **Minimum benchmarkable path = steps 0+1+2**; the strict-posture numbers
+   in §3.5 are already obtainable today via the global flow-control knobs.
 3. **UDS bootstrap** (highest risk; one-time setup cost only).
 4. **Hardening** (incremental HEADERS, UDS-EOF liveness, bounded park).
 5. *(deferred)* memfd segment-fd over UDS (closes the unlink race).
 
-### 3.5 Performance prediction (what the extension costs)
+### 3.5 Performance — measured (what the extension costs)
 
 Because `CrossLangV1` remains a **custom transport**, it keeps the two things
 Track B (Part 1) structurally could not: it reserves header+payload together
-in one contiguous ring slot (write ZC) and emits a single jumbo DATA frame
-when the peer's SETTINGS permit. It is **not** subject to the stock framer's
+in one contiguous ring slot (write ZC) and the receiver parses bytes in place
+*within* each frame. It is **not** subject to the stock framer's
 16 KiB-cap-plus-interleave ceiling that pinned Track B at 22 % retention.
 
-Predicted 64 KB streaming (against the Part 1 floor: full-SHM 89,571 ns;
-Track B 152,350 ns; UDS 169,949 ns):
+The strict-`CrossLangV1` per-RPC cost is **measurable today** via the global
+flow-control knobs (`BENCH_PROFILE=fair-default` = HTTP/2-default 64 KiB
+windows, `SHM_MAX_FRAME_SIZE=16384` = HTTP/2-default frame size) — they impose
+the exact conservative posture the negotiated profile applies. Measured on
+Linux, Intel Xeon Platinum 8370C @ 2.80 GHz, 16 vCPU, Go 1.25, streaming
+ping-pong, `benchtime=3s`, single run:
 
-```
-full-SHM ─ CrossLangV1-generous ────────── CrossLangV1-strict ── TrackB ── UDS
- 89,571        ~90–93K (pred.)                ~140–145K (pred.)  152,350  169,949
-   └─ conformance-as-protocol Δ ≈ 0–2% ─┘    └─ strict-foreign-peer cost ─┘
-```
+| Streaming | GoPrivateV1 (baseline) | **strict CrossLangV1** | UDS | **CrossLangV1 vs UDS** | **retention** |
+|---|---|---|---|---|---|
+| 1 KB | 14,095 ns | **15,076 ns** | 23,101 ns | **1.53× faster** | **89 %** |
+| 64 KB | 89,745 ns | **126,806 ns** | 203,767 ns | **1.61× faster** | **68 %** |
+| 256 KB | 236,548 ns | **391,354 ns** | 689,678 ns | **1.76× faster** | **66 %** |
 
-- **The cost of conformance *as a protocol* is ≈ 0 per RPC for Go↔Go.**
-  Eventfd was already the default (no futex to lose), SETTINGS and the UDS
-  bootstrap are one-time, and `speculativeReserved` was already 0 (its
-  removal is marginally *faster*). So `CrossLangV1` Go↔Go with generously
-  negotiated SETTINGS tracks **full-SHM**, not the Track B floor.
-- **The cost only materializes when a strict foreign peer forces conservative
-  SETTINGS** — 16 KiB frames + 64 KiB window. Then 64 KB streaming lands near
-  the fair-default SHM number (~141,853 ns), **still below Track B and UDS**,
-  because single-copy-into-ring ZC and kernel bypass survive *within* each
-  frame (Track B's `net.Conn` double-copy forfeits both).
+`retention = (UDS − CrossLangV1) / (UDS − GoPrivateV1)` = the fraction of the
+full transport's advantage over UDS that the conservative cross-language
+posture keeps.
 
-The open question for the *real* cross-language number is whether a real
-C-core/.NET/Java peer will accept a large `SETTINGS_MAX_FRAME_SIZE` and
-window. If they cap at 16 KiB / 64 KiB, the "strict" column is the
-real-world cross-language performance — which is still the best any
-cross-language local transport can do.
+Two findings, both stronger than the original prediction:
+
+- **The conformance cost is real but bounded, and CrossLangV1 stays well
+  above UDS at every size.** Even forced into the strictest foreign-peer
+  posture (16 KiB frames + 64 KiB windows), the custom transport is **1.5–1.8×
+  faster than UDS** and retains **66–89 %** of the Go-tuned advantage. The
+  conformance cost (GoPrivateV1 → strict) grows with payload — 1 KB +7 %,
+  64 KB +41 %, 256 KB +65 % — exactly as expected, because the 16 KiB frame
+  cap multiplies the DATA-frame count on larger messages.
+- **strict CrossLangV1 beats the Track B floor.** At 64 KB, strict
+  CrossLangV1 (126,806 ns) is faster than the Track B `net.Conn` dialer
+  (152,350 ns from Part 1), because it remains a custom transport — it keeps
+  single-copy-into-ring ZC *within* each 16 KiB frame and full kernel bypass,
+  both of which Track B's `net.Conn` double-copy forfeits. This is the
+  empirical payoff of the extension over the pure-dialer floor.
+
+The remaining open question for the *real* cross-language number is whether a
+real C-core / .NET / Java peer will accept a larger `SETTINGS_MAX_FRAME_SIZE`
+and window. If it does, the cost shrinks toward the GoPrivateV1 baseline; if
+it caps at 16 KiB / 64 KiB, the "strict" column above **is** the real-world
+cross-language performance — still the best any cross-language local transport
+can do.
+
+**Implementation status of the measured profile.** The numbers above were
+obtained through the process-global flow-control knobs, which impose the
+identical window + frame cadence the negotiated `CrossLangV1` profile applies.
+A per-connection `CrossLangV1` dial/listen option was prototyped and is
+correct for messages within the stream window, but a robust profile that
+holds at messages *larger* than the window requires the SETTINGS state
+machine (§3.3 / §3.4 step 1): without an in-band SETTINGS handshake the two
+ends cannot agree on the WINDOW_UPDATE threshold, so a per-connection window
+override alone stalls on over-window messages. That confirms, empirically,
+that **window negotiation belongs in SETTINGS** — the per-connection profile
+is finished by landing the SETTINGS step, not bolted on before it.
 
 ---
 
