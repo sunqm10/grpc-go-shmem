@@ -3,18 +3,20 @@
 **Purpose.** Answer two questions raised in review about packaging the
 shared-memory (SHM) transport:
 
-- **Part 1 (this is complete).** Could SHM ship as *only* a
+- **Part 1.** Could SHM ship as *only* a
   `grpc.WithContextDialer` / `net.Listener` — a plain `net.Conn` handed to
   stock gRPC-Go, **zero changes to gRPC-Go core** — and still retain the
   benefit? This part measures the empirical floor of that shape and
   attributes exactly what survives the `net.Conn` boundary and what does
   not.
-- **Part 2 (design sketch, pending).** If instead SHM were a first-class
-  *extension point* (a pluggable transport, with a small generic gRPC-Go
-  enhancement), what becomes reachable that the pure dialer cannot reach —
-  and what are the cross-language implications. Part 2 is a design
-  discussion, not a measurement, and is explicit about what is *not*
-  achievable.
+- **Part 2.** The approach we are taking instead: keep the full custom
+  transport and add a per-connection cross-language-conformant *profile*.
+  This part covers the approach, the cross-language feasibility (what can be
+  standardized and what cannot), and a comparison against the pure dialer
+  and the full same-language transport.
+- **Part 3.** How the Go transport is adapted for that profile, the measured
+  cost, and an analysis of where the cost comes from and how much of it is
+  recoverable by negotiation.
 
 The companion note [`SHM-vs-UDS-analysis.md`](SHM-vs-UDS-analysis.md)
 answers the separate question "why can't UDS be optimized to match SHM?".
@@ -205,376 +207,184 @@ gRPC-Go enhancement — which is the subject of Part 2.
 
 ---
 
-## Part 2 — What an Extension / pluggable transport could unlock
+## Part 2 — SHM as an extension: approach, feasibility, and trade-offs
 
-> **Status: design sketch.** Part 1's numbers are measured and final.
-> Part 2 is a design direction. Every retention figure here is flagged as
-> an **estimate** (no Part-2 prototype has been built), and every place a
-> mechanism is genuinely *not* achievable is called out rather than glossed.
+Part 1 shows the pure-dialer packaging has a hard ceiling at the HTTP/2 frame
+size. The alternative we pursue keeps the full custom transport — the gRFC
+SHM engine already in the tree — and makes it **wire- and ABI-compatible with
+other gRPC implementations**, so one engine can serve a Go peer at full speed
+and a C-core / Java / .NET peer in a standards-conformant mode.
 
-The alternative to "just a dialer" (Part 1) and "a full fork-level custom
-transport" is a first-class *extension point*: an out-of-tree transport
-plus a **small, generic** (non-SHM-specific) gRPC-Go enhancement. The
-question is what the smallest such enhancement is, how much of mechanism (b)
-it reclaims, and whether it is plausibly upstreamable.
+### 2.1 The approach: one engine, two negotiated profiles
 
-### 2.0 Where the copies actually live (verified call sites)
+The transport selects one of two profiles during connection setup, via a
+capability bit in the existing CONNECT/ACCEPT handshake. Negotiation is by
+AND: a peer that does not advertise the Go-private capability forces the
+conformant profile, so a foreign peer is handled automatically.
 
-Part 1 proved that under a plain `net.Conn`, mechanism (b) is lost because
-the framer owns buffer allocation on *both* sides and chunks at the 16 KiB
-cap. The exact gRPC-Go functions that own each copy, verified in this tree:
+- **`GoPrivateV1`** (Go ↔ Go) keeps every same-language optimization: futex
+  wake, jumbo (up to 16 MiB) HTTP/2 DATA frames, and a large (32 MiB)
+  flow-control window. This is the current transport, unchanged.
+- **`CrossLangV1`** (Go ↔ any other language) constrains the engine to what a
+  foreign runtime can interoperate with:
+  - **eventfd-only wake.** eventfd is the one wake primitive every target
+    runtime's I/O loop can wait on (§2.2); the Go-only futex fast path is
+    disabled.
+  - **SETTINGS-negotiated framing and flow control.** `MAX_FRAME_SIZE` and
+    the window are negotiated in-band via HTTP/2 SETTINGS rather than using
+    the Go-tuned defaults, so both ends agree on the same values.
+  - **A Unix-domain-socket bootstrap handshake** in place of the
+    shared-memory control segment. The current handshake exchanges
+    CONNECT/ACCEPT over a futex-backed control segment, which a non-Go client
+    cannot wait on. `CrossLangV1` carries the same CONNECT/ACCEPT bytes over a
+    per-listener UDS and passes the segment + two eventfds via `SCM_RIGHTS` in
+    one `sendmsg`. (Fd-passing already uses a per-segment UDS in the current
+    transport; this generalizes it.) The UDS connection stays open, and its
+    EOF is the peer-death signal.
 
-- **Write coalescing + chunking:** `loopyWriter.processData`
-  ([controlbuf.go](../internal/transport/controlbuf.go)) sets
-  `maxSize := http2MaxFrameLen`, then **appends the 9-byte frame header and
-  the payload into one `l.writeBuf`** and hands that to `framer.writeData`.
-  That coalescing is the structural reason a ring slice cannot survive to
-  the wire untouched.
-- **Read into a framer-owned buffer:** the framer reads each DATA frame's
-  payload into a buffer it got from its `mem.BufferPool`
-  (`newFramer` in [http_util.go](../internal/transport/http_util.go)); this
-  is the `conn.Read → framer buffer` copy. Note `parsedDataFrame.data` is a
-  single `mem.Buffer` today, which constrains the read-hook shape (below).
-- **The cap:** `http2MaxFrameLen = 16384`
-  ([http_util.go](../internal/transport/http_util.go)), applied to reads via
-  `SetMaxReadFrameSize` and advertised as `SETTINGS_MAX_FRAME_SIZE`
-  ([http2_server.go](../internal/transport/http2_server.go)). **No public
-  override exists.**
-- **Already-pluggable surface:** `mem.BufferPool` (via
-  `experimental.WithBufferPool`) and `encoding.CodecV2` /
-  `MarshalWithPool` already let an extension control *where bytes are
-  marshaled into*. What is missing is a hook controlling *how bytes cross
-  the `conn` boundary without being re-copied / re-chunked.*
+The data plane in both profiles is **stock HTTP/2 frames + the gRPC
+length-prefixed message** — byte-identical to TCP/UDS on the wire; only the
+byte transport (ring + eventfd instead of a socket) differs.
 
-### 2.1 The minimal generic hooks
+### 2.2 Cross-language feasibility
 
-Three hooks, increasing in intrusiveness. **None names SHM** — each is
-justified as a general improvement that also benefits TCP/UDS.
+The design separates into a **standardizable layer** (a shared specification,
+not shared code) and a **per-runtime layer**.
 
-**Hook A — read-side, conn-supplied buffers.** Let a conn that already has
-bytes in mappable memory hand them up by reference instead of being read
-into a framer-owned buffer:
+**Standardizable as a spec:**
 
-```go
-// Optional. The framer asks the conn for the frame payload as
-// conn-owned, refcounted buffers instead of pool.Get + io.ReadFull.
-type BufferReader interface {
-    ReadBuffers(n int) (mem.BufferSlice, error)
-}
-```
+- *Wire format* — HTTP/2 frames (DATA / HEADERS / WINDOW_UPDATE), HPACK, and
+  the gRPC length-prefix — is already language-neutral. Carrying it over a
+  ring changes the byte source, not the bytes.
+- *Segment memory ABI* — ring header layout (head/tail indices, capacity,
+  wake-word) plus the handshake/capability negotiation. Two processes in
+  different languages can map the same segment and agree on it.
 
-Plugs into the framer's DATA-payload read path. **Generic justification:** a
-TCP/UDS conn could implement this over `readv` into pool buffers;
-mmap'd-file, `io_uring`-registered-buffer, and `MSG_ZEROCOPY` receive paths
-fit the same "let the byte source own the receive buffer" shape — a direct
-generalization of the already-merged `mem.BufferPool` work. **Honest
-caveat:** today `parsedDataFrame.data` is a single `mem.Buffer`, so the
-*minimal* version is `ReadBuffer(n) (mem.Buffer, error)`; the richer
-`BufferSlice` form needs receive-buffer plumbing widened from `mem.Buffer`
-to `mem.BufferSlice`. And with the 16 KiB cap still in force, a 64 KB
-message still arrives as ~4 buffers — Hook A removes the framer-read copy
-but **not** the gather copy inside `proto.Unmarshal` of a multi-buffer
-slice (Go's proto decoder cannot consume a multi-segment input without
-materializing). Single-buffer read ZC needs **Hook C**.
+**Not standardizable as one binary (the hard constraints):**
 
-**Hook B — write-side, vectored write / reservation.** Stop coalescing
-header+payload before the write; either pass a scatter list
-(`net.Buffers`-style) or let the framer reserve destination memory:
+- **Wake primitive — eventfd mandatory, futex Go/C-only.** Each runtime's I/O
+  model forces the choice: Go can wait on a futex or an eventfd; C-core's
+  epoll and a JVM's epoll transport can wait on an **eventfd** but **not on a
+  raw futex** (a futex word is invisible to `epoll_wait`, and the JVM has no
+  `futex(2)` without JNI). eventfd is therefore the only primitive all three
+  can wait on without busy-polling and must be the cross-language baseline.
+  The lower-overhead futex stays available only when both ends are Go/C on
+  Linux — an unavoidable asymmetry, not a defect.
+- **Segment lifecycle is per-language native code.** `memfd_create` /
+  `shm_open` / `mmap` / `SCM_RIGHTS` interact with each runtime's fd-ownership
+  and I/O integration differently. A shared C library is linkable in
+  principle, but Go via cgo would defeat the purpose (cgo calls bypass the
+  netpoller and reintroduce a thread hop). Each language implements the
+  segment layer natively and shares only the spec.
+- **Cross-OS is out of scope.** Windows has no eventfd/futex/SCM_RIGHTS; its
+  wake is a named event/IOCP and its segment a named file-mapping. The
+  segment+wake ABI is necessarily per-OS, so a Linux ↔ Windows shared-memory
+  connection is not a goal a single ABI can serve.
 
-```go
-// Optional. loopyWriter hands [frameHeader, lpmPrefix, payload...] as
-// separate buffers; a ring-backed conn writes only the 14B of framing
-// and detects that the payload buffer is already its own ring memory.
-type BufferWriter interface {
-    WriteBuffers(bufs mem.BufferSlice) (int, error)
-}
-// or, symmetric to ShmRing.ReserveWrite:
-type ReservingWriter interface {
-    ReserveWrite(n int) (WriteReservation, error)
-}
-```
+So interop with a second language is a *native reimplementation of the spec in
+that language* — the wire and the per-OS segment/ring ABI are shared, the
+implementation is not. This is the genuinely large part of "true cross-language
+SHM": not the Go-side change (§3), but the second implementation.
 
-Plugs into `loopyWriter.processData` / `framer.writeData`. **Generic
-justification:** this is **writev** — not coalescing header+payload into a
-staging buffer before the syscall is the single most obvious HTTP/2 write
-win on TCP too, and it matches a stdlib idiom (`net.Buffers`). This is the
-**most upstreamable** of the three. **Honest caveat:** the alias-detection
-(payload already in the conn's ring) is the SHM-specific *consumer*, but
-the hook is generic. And `ReserveWrite`/`WriteBuffers` still only moves
-*already-marshaled* bytes; to marshal proto *directly* into the ring (true
-write ZC, what the full transport's `WriteProto` fast path does in
-[h2_codec.go](../internal/transport/h2_codec.go)) you would need a
-*message-level* hook (e.g. `WriteMessage(msg any) (handled bool, err error)`)
-that exposes codec/message knowledge to the transport. That crosses a much
-stronger layering boundary and is the **least upstreamable** piece.
+### 2.3 Comparison: dialer vs extension vs full transport
 
-**Hook C — public max-frame-size override.**
-
-```go
-func WithMaxFrameSize(n uint32) DialOption // client
-func MaxFrameSize(n uint32) ServerOption   // server
-```
-
-Replaces the hard-coded `http2MaxFrameLen` at its use sites (the
-`processData` chunk size, `SetMaxReadFrameSize`, and the advertised
-`SETTINGS_MAX_FRAME_SIZE`). **Why it's needed:** Hooks A/B make the
-*boundary* zero-copy, but the 16 KiB cap fragments every payload > 16 KiB
-into multiple frames (Part 1 §1.4: 64 KB = 17 writes/RPC). For
-single-buffer read ZC and single-reservation write ZC, the payload must fit
-in one frame. **Generic justification:** a larger `SETTINGS_MAX_FRAME_SIZE`
-(HTTP/2 permits up to 16 MiB) is a standard throughput knob users already
-request for high-bandwidth links. **Honest caveat:** raising the cap has
-real costs on *socket* transports (head-of-line blocking, coarser flow
-control), so upstream would want it opt-in with documented tradeoffs.
-
-**Retention estimate (flagged as estimate — not measured):**
-
-| Configuration | What it recovers | Est. retention @ 64 KB | Confidence |
+| | Pure dialer (Part 1) | **Extension (`CrossLangV1`)** | Full transport (`GoPrivateV1`) |
 |---|---|---|---|
-| Part 1 floor (pure dialer) | — | **22 % (measured)** | — |
-| Hook C only | fewer/larger frames | ~30-40 % | low |
-| C + A (read ZC) | framer-read copy + proto gather | ~50-60 % | medium |
-| C + B (write ZC) | write coalescing copy | ~50-60 % | medium |
-| C + A + B + message-level marshal | both copies → ~0.4 µs (cf. §2.5 jumbo_shm) | **~75-90 %** | medium |
-| Full custom transport | everything | **100 % (measured)** | — |
+| gRPC-Go core change | none | none (two option fields) | none |
+| Packaging | stock gRPC-Go + `net.Conn` | custom transport + conformance profile | custom transport |
+| Kernel-path bypass | ✅ | ✅ | ✅ |
+| In-place user-space ZC | ❌ lost > 16 KiB | ✅ within each frame | ✅ (jumbo frame) |
+| Cross-language interop | n/a — Go only | ✅ eventfd + SETTINGS + UDS | ❌ — Go-only fast paths |
+| 64 KB streaming vs UDS¹ | ~1.1× | **1.61×** | 2.27× |
+| Peer must be | Go | any conformant gRPC impl | Go |
 
-The reason tier-(ii) lands at **~75-90 %, not 100 %**: even with all three
-hooks, the out-of-tree transport still pays the *architectural* costs the
-full transport avoids — the `controlBuf.put` → `loopyWriter` goroutine
-handoff per message, and generic HPACK/flow-control machinery. The full
-transport bypasses the `controlBuf` channel entirely on its inline
-`WriteProto` fast path (see [`SHM-vs-UDS-analysis.md`](SHM-vs-UDS-analysis.md)
-§2.3); the hooks cannot replicate that without *becoming* the full
-transport. **That residual is exactly the gap between tiers (ii) and (iii).**
+¹ Dialer ratio is from the Part 1 run (UDS baseline 169,949 ns); the extension
+and full-transport ratios are from the Part 3 run (UDS baseline 203,767 ns).
+The two runs are not directly comparable — read each as a within-run ratio.
 
-### 2.2 Upstreamability, hook by hook
+The pure dialer is the zero-effort option but cannot keep in-place ZC past the
+16 KiB frame cap. The full transport is fastest but Go-only. The extension is
+the *same engine* as the full transport plus a conformance profile, so a
+foreign peer can interoperate at a cost that is bounded and, as §3.3 shows,
+mostly recoverable by negotiation.
 
-| Hook | Strongest general-purpose framing | Likely reception |
-|---|---|---|
-| **B (writev)** | "loopyWriter should use vectored writes instead of coalescing header+payload" — standalone TCP win, stdlib idiom | **Most likely accepted.** |
-| **C (frame cap)** | "make `SETTINGS_MAX_FRAME_SIZE` configurable" — long-standing HTTP/2 tuning request | **Plausibly accepted**, opt-in. |
-| **A (ReadBuffers)** | "let the byte source own the receive buffer" — generalizes `mem.BufferPool`; benefits readv/io_uring | **Hardest**; strongest if landed *with* a non-SHM (TCP `readv`) consumer. |
-| message-level marshal | (true write ZC) | **Least likely** — crosses codec/transport layering. |
-
-A meta-point to state plainly for the reader: gRPC-Go today has **no public
-pluggable-transport SPI at all** — the only transport is
-HTTP/2-over-`net.Conn`. So "SHM as a first-class extension point" is really
-two asks: (1) these byte-boundary hooks, and (2) willingness to treat the
-transport interface as extensible. The hooks are the smaller, concrete ask;
-a full pluggable-transport SPI is a larger architectural commitment.
-
-### 2.3 The three-tier option space
-
-| | **(i) Pure dialer** | **(ii) Dialer + generic hooks** | **(iii) Full custom transport** |
-|---|---|---|---|
-| gRPC-Go core change | **none** | 2-4 generic interface additions | none to core, but **forks the transport** |
-| Mechanism (a) kernel bypass | ✅ full (~760× proven) | ✅ full | ✅ full |
-| Mechanism (b) user-space ZC | ❌ lost > 16 KB | ⚠️ mostly recovered (est.) | ✅ full |
-| **Retention @ 64 KB** | **22 % (measured)** | **~75-90 % (estimate)** | **100 % (measured)** |
-| Retention @ 1 KB | 49 % (measured) | ~85-95 % (estimate) | 100 % |
-| Maintenance | trivial — rides stock gRPC-Go | low-moderate — tracks hook APIs | **high — fork-level** |
-| Upstream dependency | none | **blocks on maintainers accepting hooks** | none (but owns whole transport) |
-
-**The crisp tradeoff.** Tiers (i) and (iii) are the two stable equilibria:
-zero-coordination / low-ceiling vs. high-coordination / high-ceiling. Tier
-(ii) is strictly better than (i) **only if** the hooks land upstream, and
-its ceiling (~75-90 %) is bounded by the generic `loopyWriter`/`controlBuf`
-architecture it deliberately keeps. Pragmatic sequencing: **ship (i) now;
-pursue B + C upstream (the easy wins) to lift the dialer's ceiling even
-without A; treat (iii) as the escape hatch for workloads that need the last
-10-25 %.**
-
-### 2.4 Cross-language viability
-
-The extension splits into a **standardizable layer** (a shared *spec*, not
-shared code) and a **per-runtime layer** — and the boundary is not where
-one might hope.
-
-**What CAN be standardized (as a spec):**
-
-- **The wire format** — HTTP/2 frames (DATA/HEADERS/WINDOW_UPDATE), HPACK,
-  the 5-byte gRPC length-prefix — is already language-neutral. Carrying it
-  over a ring changes the *byte source*, not the bytes.
-- **The segment memory ABI** — ring layout (head/tail offsets, alignment,
-  control region, in-band framing, wake-word location), capability/handshake
-  negotiation. Two different-language processes can map the same segment and
-  agree on it. A C-core client *could* talk to a Go server over one
-  segment — **iff** they agree on the wake primitive, which is where it
-  breaks.
-
-**What CANNOT be standardized as a single ABI (the honest limits):**
-
-- **The wake primitive is the hard cross-language constraint.** It is forced
-  by each runtime's I/O model, and they do not agree:
-  - **Go** can wait on a futex (runtime park) *or* an eventfd via the
-    netpoller; futex is the lowest-overhead Go-native option (what this
-    transport uses on Linux).
-  - **C-core** (epoll/EventEngine) integrates an **eventfd** naturally but
-    **cannot wait on a raw futex** — a futex word is invisible to
-    `epoll_wait`.
-  - **Java/Netty** can wait on an **eventfd via epoll** (native epoll
-    transport) but **cannot touch a raw futex** without JNI; the JVM exposes
-    no `futex(2)`.
-  - **Therefore eventfd is the only primitive all three I/O models can wait
-    on without busy-polling.** A cross-language standard must mandate
-    **eventfd as the baseline wake**, and treat **futex as a Go/C-only,
-    same-language Linux optimization that is unavailable whenever a JVM
-    endpoint participates.** This is a real, unavoidable performance
-    asymmetry: the lowest-overhead primitive cannot be the interop baseline.
-- **Segment lifecycle cannot be one shared library.**
-  `memfd_create`/`shm_open`/`mmap`/`SCM_RIGHTS` interact with each runtime's
-  fd-ownership model differently. A shared C library is theoretically
-  linkable by all three, but **Go via cgo defeats the purpose** (cgo calls
-  don't integrate the netpoller, reintroduce a thread hop, and break the
-  zero-extra-syscall goal). So **each language needs its own native
-  implementation; they share the spec, not the binary.**
-- **Cross-OS interop is out of scope / not achievable under one ABI.**
-  Windows has no eventfd or futex — the wake becomes a named event / IOCP
-  and the segment a named file-mapping. The segment+wake ABI is necessarily
-  **per-OS**; a Linux client ↔ Windows server over shared memory is not a
-  goal a single ABI can serve.
-- **Pluggable-transport feasibility itself varies:** C-core has a real
-  `grpc_endpoint`/transport abstraction (most favorable); Go has no public
-  transport SPI today (needs the §2.1 hooks); Java has an internal, unstable
-  transport abstraction (possible but tracks internals, plus JNI/Panama for
-  the native memory + wake).
-
-**Cross-language bottom line:** standardize the **wire contract + per-OS
-segment/ring ABI** as a spec with conformance tests (Go↔Go, Go↔C-core,
-Go↔Java, crash/cleanup); do **not** attempt a single cross-language plugin
-binary. Mandate **eventfd** for any cross-language segment and document
-**futex** as a same-language Linux-only optimization. Declare **cross-OS**
-shared-memory interop out of scope. Forcing every runtime through a
-least-common-denominator abstraction would give back much of the
-performance SHM exists to preserve.
-
-### 2.5 Open items (flagged, not papered over)
-
-1. The tier-(ii) retention figures (~75-90 %) are **estimates** extrapolated
-   from §2.5's copy attribution plus the residual `loopy`/`controlBuf`
-   handoff cost — **not measured**. A `BufferWriter`/`BufferReader`
-   prototype against stock gRPC-Go is the natural next experiment if a
-   quantified tier (ii) is wanted.
-2. Hook A's **refcount lifecycle** (who `Free()`s a conn-donated buffer if a
-   stream resets mid-frame) needs a concrete ownership rule; this is the
-   part most likely to surface correctness bugs and the part upstream will
-   scrutinize hardest.
-3. Whether the `proto.Unmarshal` **gather copy** for a multi-buffer slice is
-   truly eliminated by Hook C (single-buffer frames) or merely reduced
-   depends on the proto codec's materialization behavior — verify before
-   claiming single-buffer read ZC.
+(A more academic middle option — adding generic byte-buffer hooks to gRPC-Go's
+own framer so a plain `net.Conn` could approach the custom transport — would
+require *new public gRPC-Go interfaces* and still not reach the full
+transport's inline path. We did not pursue it: the custom transport already
+exists and needs no core-API change.)
 
 ---
 
-## Part 3 — A concrete cross-language-conformant transport (the design we are building)
+## Part 3 — Adapting the Go transport, and measured results
 
-> **Status: design settled, implementation in progress.** Part 2 framed the
-> option space. Part 3 is the concrete plan for the path we chose: keep the
-> full custom transport (tier iii, 100 % of the win) **and** make it
-> wire/ABI-compatible with other languages, so the same Go code can talk to
-> a future C-core / Java / .NET peer. This was settled by two rounds of
-> dual-model design + cross-review grounded in the actual transport source.
+Part 2 described the extension at the design level. Part 3 is the concrete
+Go-side adaptation — what changes in the existing transport — followed by the
+measured cost and its analysis.
 
-### 3.1 Two profiles, negotiated per connection
+### 3.1 Adapting the Go transport
 
-The transport runs in one of two profiles, chosen during connection setup:
+An audit of the current transport shows the gap to a conformant `CrossLangV1`
+is small: the three hardest prerequisites are already satisfied, and the
+remaining work is bounded.
 
-- **`GoPrivateV1`** — Go↔Go. Keeps every same-language optimization: the
-  shared-memory `_ctl` control segment, futex fast-wake fallback, jumbo
-  (16 MiB) DATA frames, the large (32 MiB) flow-control window. Pays nothing
-  for cross-language conformance.
-- **`CrossLangV1`** — Go talking to any other language. Eventfd-only wake,
-  mandatory HTTP/2 SETTINGS, `speculativeReserved == 0`, frame size and
-  window governed by SETTINGS, and a **UDS bootstrap** (below) instead of the
-  futex `_ctl` segment.
+| Item | Current state | Change for `CrossLangV1` | Status |
+|---|---|---|---|
+| `speculativeReserved@0x38` ABI field | `AddSpeculativeReserved` has zero call sites; the reader uses the interop-safe deferred-`readIdx` ZC; the writer's reads always subtract 0 | Retire the field (rename `reservedZero`, assert `== 0`); behaviour-preserving | **done** |
+| Outbound frame size | Hard-wired to the Go-tuned `shmMaxFrameSize` | Per-connection override, set from negotiated `SETTINGS_MAX_FRAME_SIZE` | **done** (override mechanism; SETTINGS feed pending) |
+| eventfd wake | Already the production default; futex is the fallback | Make eventfd mandatory; on setup failure fall back to the UDS bootstrap, never futex | pending |
+| HTTP/2 data wire | Already H2-only (handshake advertises only H2, rejects non-H2 peers) | — | already conformant |
+| SETTINGS | Validated then skipped — no state machine | Real state: send-first (no ACK-wait), ACK on receipt, enforce first H2 frame is SETTINGS, drive frame size + window from the peer's values | pending (next) |
+| Flow control | Large 32 MiB window keeps WINDOW_UPDATE dormant | HTTP/2-default 64 KiB windows unless negotiated larger | pending (with SETTINGS) |
+| `writeH2Single` > ring capacity | Rejects any frame larger than the ring | Incremental write for large HEADERS/CONTINUATION + `ringCap ≥ maxNonDataFrame` guard | pending |
+| Liveness | No prompt `kill -9` detection (eventfd has no EOF) | UDS-EOF is the crash signal; segment `closed` flag is graceful close (drain first); bounded ring-wait | pending |
 
-A capability bit in the CONNECT/ACCEPT handshake selects the profile by
-**AND-negotiation**: the Go dialer advertises "Go extensions"; the acceptor
-echoes it only if it also supports them. A C-core/Java/.NET peer never sets
-the bit, so the Go side auto-degrades to `CrossLangV1`. The negotiated
-profile is stamped on the `Segment` and threaded to each ring at registration
-time; every Go-private optimization gates on `profile == GoPrivateV1`.
+Two implementation notes:
 
-### 3.2 The UDS bootstrap (Option B)
+- **SETTINGS is the keystone.** The window and frame size are useless as
+  per-connection overrides until both ends agree on them in-band; an attempt
+  to set a per-connection 64 KiB window *without* SETTINGS works for messages
+  inside the window but stalls on larger messages, because the two ends never
+  agree on the WINDOW_UPDATE threshold. Window negotiation therefore belongs
+  in the SETTINGS step, not bolted on before it. (This was confirmed
+  empirically — §3.3.)
+- **SETTINGS ordering vs. the security handshake.** The optional security
+  handshake runs on the raw rings *before* the H2 transport starts, so the
+  "first frame must be SETTINGS" rule keys off the first H2 frame *after* that
+  handshake, not byte 0 of the ring.
 
-Today the *entire* handshake runs over shared memory: the server creates a
-futex-backed `_ctl` segment, the client maps it, writes CONNECT on one ring,
-and reads ACCEPT on another — **waiting via futex**. A JVM or C-core client
-cannot wait on a futex, so it cannot even participate in the handshake.
+**Public API.** The adaptation adds **no new public type or function**. The
+existing `experimental/shm` surface (`WithTransport`,
+`WithTransportAndOptions`, `NewListener`, `DialOptions`, `ListenerConfig`)
+gains one boolean on each of the two option structs:
 
-`CrossLangV1` replaces the `_ctl` segment with a **per-listener Unix-domain
-socket** (`<segment-path>.ctl.sock`, mode `0600`, `SO_PEERCRED` same-UID
-check). The handshake becomes one stream exchange any language can speak:
-
+```go
+type DialOptions struct {     // already an alias of transport.DialOptions
+    // ...
+    CrossLangV1 bool   // request the cross-language-conformant profile
+}
+type ListenerConfig struct {
+    // ...
+    CrossLangV1 bool
+}
 ```
-client → server : CONNECT bytes (caps, profile, nonce)           [one write]
-server → client : ACCEPT bytes + SCM_RIGHTS[evfd_c2s, evfd_s2c]   [one sendmsg]
-client          : open segment, build eventfd waker from the 2 fds
-both            : keep the UDS conn open  →  its EOF = peer death (kill -9)
-```
 
-This is not new machinery from scratch: fd-passing **already** uses a
-per-segment UDS + SCM_RIGHTS ([`shm_fdpass_linux.go`](../internal/transport/shm_fdpass_linux.go));
-Option B promotes that socket from "fd-only" to "fd + CONNECT/ACCEPT". It
-also *removes* the `_ctl` segment's futex wait, its `.lock` flock, the
-multi-producer-on-a-shared-ring hazard, and the stale-response nonce loop —
-a point-to-point UDS has none of those races. Honest caveat: it **relocates**
-the named rendezvous (the listening socket still needs a name derived from
-`shm://<addr>`) rather than eliminating it; the segment-fd-over-UDS (memfd)
-variant that would erase the `/dev/shm` unlink race entirely is a later step.
+The profile-negotiation bit travels on the existing CONNECT/ACCEPT flags byte
+(internal wire). Default `false` = `GoPrivateV1`, so existing users are
+byte-for-byte unaffected — fully backward compatible.
 
-### 3.3 What conformance requires (the concrete change-list)
 
-Grounded in an audit of the current transport, the gap to a conformant
-`CrossLangV1` is **smaller than expected** — three of the hardest items are
-already done:
-
-| Item | Current state | Work |
-|---|---|---|
-| `speculativeReserved@0x38` (ABI conflict) | `AddSpeculativeReserved` has **zero call sites**; the reader already uses the interop-safe deferred-`ridx` ZC; the writer's reads always subtract 0 | Behavior-preserving dead-code deletion + rename `reservedZero` + assert `== 0` |
-| Eventfd wake | **Already the production default**; futex is only the fallback | Make eventfd *mandatory* for `CrossLangV1`; on setup failure fall back to the bootstrap channel (never futex) |
-| HTTP/2 wire | **Already H2-only** on the data plane (control_wire advertises only H2, rejects non-H2 peers) | Done |
-| SETTINGS | **Validated then skipped** — no state machine | Add real SETTINGS state: send-first (no ACK-wait), ACK on receipt, enforce first-H2-frame-is-SETTINGS, drive outbound frame size from the peer's `SETTINGS_MAX_FRAME_SIZE` |
-| Flow control | Large 32 MiB window keeps WINDOW_UPDATE dormant | `CrossLangV1` uses HTTP/2-default 64 KiB windows unless negotiated larger; verify WINDOW_UPDATE actually flows |
-| `writeH2Single` > ring-cap | Rejects any frame larger than the ring | Incremental write for large HEADERS/CONTINUATION + a `ringCap ≥ maxNonDataFrame` guard |
-| Liveness | No prompt `kill -9` detection (eventfd has no EOF) | UDS-EOF = authoritative crash signal; segment `closed` flag = graceful (drain first); bounded ring-wait park so death is observed |
-
-One subtlety: the security handshake runs on the raw rings *before* the H2
-transport, so "first frame must be SETTINGS" keys off the **first H2 frame
-after the handshake**, not byte 0 of the ring.
-
-### 3.4 Implementation order (measure performance early)
-
-The per-RPC cost of conformance lives entirely in the SETTINGS / window /
-frame-size machinery — **not** in the UDS bootstrap, which only affects
-one-time connection setup. So the cost can be measured *before* the bootstrap
-is built, by forcing a Go↔Go pair into `CrossLangV1` over the existing
-handshake with the new knobs flipped:
-
-0. **`speculativeReserved` cleanup** (near-zero risk; confirm no bench delta).
-   — **done** (committed; behaviour-preserving, no bench delta).
-1. **SETTINGS state machine** (first perf gate). — *next; required to finish a
-   robust per-connection window profile, see §3.5.*
-2. **Profile plumbing** + capability bits (eventfd mandatory for `CrossLangV1`).
-   The per-connection frame-size override is **done** (committed); the window
-   override is prototyped but needs step 1 to be robust over-window.
-   → **Minimum benchmarkable path = steps 0+1+2**; the strict-posture numbers
-   in §3.5 are already obtainable today via the global flow-control knobs.
-3. **UDS bootstrap** (highest risk; one-time setup cost only).
-4. **Hardening** (incremental HEADERS, UDS-EOF liveness, bounded park).
-5. *(deferred)* memfd segment-fd over UDS (closes the unlink race).
-
-### 3.5 Performance — measured (what the extension costs)
+### 3.2 Measured cost
 
 Because `CrossLangV1` remains a **custom transport**, it keeps the two things
-Track B (Part 1) structurally could not: it reserves header+payload together
-in one contiguous ring slot (write ZC) and the receiver parses bytes in place
-*within* each frame. It is **not** subject to the stock framer's
-16 KiB-cap-plus-interleave ceiling that pinned Track B at 22 % retention.
+the pure dialer (Part 1) structurally could not: it reserves header+payload
+together in one contiguous ring slot (write ZC) and the receiver parses bytes
+in place *within* each frame. It is **not** subject to the stock framer's
+16 KiB-cap-plus-interleave ceiling that pinned the dialer at 22 % retention.
 
 The strict-`CrossLangV1` per-RPC cost is **measurable today** via the global
 flow-control knobs (`BENCH_PROFILE=fair-default` = HTTP/2-default 64 KiB
-windows, `SHM_MAX_FRAME_SIZE=16384` = HTTP/2-default frame size) — they impose
+windows, `SHM_MAX_FRAME_SIZE=16384` = HTTP/2-default frame size), which impose
 the exact conservative posture the negotiated profile applies. Measured on
 Linux, Intel Xeon Platinum 8370C @ 2.80 GHz, 16 vCPU, Go 1.25, streaming
 ping-pong, `benchtime=3s`, single run:
@@ -598,11 +408,11 @@ Two findings, both stronger than the original prediction:
   conformance cost (GoPrivateV1 → strict) grows with payload — 1 KB +7 %,
   64 KB +41 %, 256 KB +65 % — exactly as expected, because the 16 KiB frame
   cap multiplies the DATA-frame count on larger messages.
-- **strict CrossLangV1 beats the Track B floor.** At 64 KB, strict
-  CrossLangV1 (126,806 ns) is faster than the Track B `net.Conn` dialer
+- **strict CrossLangV1 beats the pure-dialer floor.** At 64 KB, strict
+  CrossLangV1 (126,806 ns) is faster than the pure `net.Conn` dialer
   (152,350 ns from Part 1), because it remains a custom transport — it keeps
   single-copy-into-ring ZC *within* each 16 KiB frame and full kernel bypass,
-  both of which Track B's `net.Conn` double-copy forfeits. This is the
+  both of which the dialer's `net.Conn` double-copy forfeits. This is the
   empirical payoff of the extension over the pure-dialer floor.
 
 The remaining open question for the *real* cross-language number is whether a
@@ -612,19 +422,15 @@ it caps at 16 KiB / 64 KiB, the "strict" column above **is** the real-world
 cross-language performance — still the best any cross-language local transport
 can do.
 
-**Implementation status of the measured profile.** The numbers above were
-obtained through the process-global flow-control knobs, which impose the
-identical window + frame cadence the negotiated `CrossLangV1` profile applies.
-A per-connection `CrossLangV1` dial/listen option was prototyped and is
-correct for messages within the stream window, but a robust profile that
-holds at messages *larger* than the window requires the SETTINGS state
-machine (§3.3 / §3.4 step 1): without an in-band SETTINGS handshake the two
-ends cannot agree on the WINDOW_UPDATE threshold, so a per-connection window
-override alone stalls on over-window messages. That confirms, empirically,
-that **window negotiation belongs in SETTINGS** — the per-connection profile
-is finished by landing the SETTINGS step, not bolted on before it.
+The numbers above were obtained through the process-global flow-control knobs,
+which impose the identical window + frame cadence the negotiated `CrossLangV1`
+profile applies (so this measures the steady-state per-RPC cost without yet
+requiring the SETTINGS step). A per-connection `CrossLangV1` option was
+prototyped and is correct for messages within the window, but a robust profile
+for messages *larger* than the window requires the SETTINGS handshake — see
+§3.1.
 
-### 3.6 What the "conformance cost" actually is — frame vs window, and why it is a floor not a tax
+### 3.3 Where the cost comes from — frame vs window, and why it is a floor not a tax
 
 A blunt 41–65 % "cost" hides the mechanism. A 2×2 sweep at 64 KB streaming
 (toggling frame size and window independently via the global knobs) decomposes
@@ -649,12 +455,12 @@ Reading the decomposition:
 - **The frame cap is negotiable.** `SETTINGS_MAX_FRAME_SIZE` is a standard
   HTTP/2 SETTINGS parameter, and HTTP/2 permits values up to 16 MiB (2²⁴−1).
   The 16 KiB used in the "strict" column is merely the *default*, not a
-  ceiling. The whole job of the `CrossLangV1` SETTINGS step (§3.4 step 1) is
+  ceiling. The whole job of the `CrossLangV1` SETTINGS step (§3.1) is
   to negotiate the frame size *up* to whatever the peer will accept. So the
   dominant 80 % of the conformance cost is exactly the part the extension's
   own negotiation can claw back.
 
-**The honest reframing (important).** The "strict CrossLangV1" column in §3.5
+**The honest reframing (important).** The "strict CrossLangV1" column in §3.2
 is not a fixed extension tax — it is the **floor**, the number you get when a
 foreign peer refuses to negotiate anything above HTTP/2 defaults. It is, quite
 literally, *the gRFC SHM transport measured under HTTP/2-default settings*
@@ -677,14 +483,12 @@ thin negotiation layer on top of that 23,800-line engine — small precisely
 because the engine already does all the hard work; and the negotiation it adds
 is what recovers the frame-size cost that dominates the floor.
 
-### 3.7 Cost of the extension itself — code size and API surface
+### 3.4 Engineering cost — code size
 
-Two numbers a reviewer will ask for: how much code, and how much public API.
-
-**Code size.** The gRFC SHM transport is ~23,800 lines across 52 files (ring
-SPSC sync, eventfd/futex wake, HPACK codec, HTTP/2 framing, flow control, the
-ZC fast path + multi-anchor FIFO, security handshake, segment lifecycle,
-Linux + Windows). The `CrossLangV1` extension on top of it is:
+The gRFC SHM transport is ~23,800 lines across 52 files (ring SPSC sync,
+eventfd/futex wake, HPACK codec, HTTP/2 framing, flow control, the ZC fast
+path + multi-anchor FIFO, security handshake, segment lifecycle, Linux +
+Windows). The `CrossLangV1` extension on top of it is:
 
 - **landed already** (committed): `speculativeReserved@0x38` retirement
   (net −54, dead-code removal) + per-connection outbound frame-size override
@@ -696,34 +500,9 @@ Linux + Windows). The `CrossLangV1` extension on top of it is:
   full hardened + tested ≈ ~1,300 lines — i.e. **~6 %** of the engine.
 
 The extension is small *because* the gRFC engine already exists; it is a
-negotiation layer, not a second transport. (The genuinely large remaining
-cost of true interop is not in Go at all — it is a *second language's* native
-reimplementation of the same spec; see §2.4.)
-
-**API surface — it converges.** The extension adds **no new public type or
-function**. `experimental/shm` already exposes the stable surface
-(`WithTransport`, `WithTransportAndOptions`, `NewListener`, `DialOptions`,
-`Config`, `ListenerConfig`, discovery interceptors). `CrossLangV1` needs only
-a single boolean on the two existing option structs:
-
-```go
-type DialOptions struct {   // already transport.DialOptions
-    // ...
-    CrossLangV1 bool   // request the cross-language-conformant profile
-}
-type ListenerConfig struct {
-    // ...
-    CrossLangV1 bool
-}
-```
-
-The profile-negotiation bit rides the existing CONNECT/ACCEPT flags byte
-(internal wire, not exposed). Default `false` = `GoPrivateV1`, so existing
-users are byte-for-byte unaffected — fully backward compatible. This is a
-notable contrast with Part 2's tier-(ii) generic hooks
-(`BufferReader`/`BufferWriter`/`WithMaxFrameSize`), which would require *new
-public gRPC-Go interfaces*: the extension (tier iii) needs **two boolean
-fields and no grpc-go core SPI change at all**.
+negotiation layer, not a second transport, and adds no new public API (§3.1).
+The genuinely large remaining cost of true interop is not in Go at all — it is
+a *second language's* native reimplementation of the same spec (§2.2).
 
 ---
 
