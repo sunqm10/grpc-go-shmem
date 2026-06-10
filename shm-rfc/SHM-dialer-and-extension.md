@@ -189,21 +189,20 @@ platform, so it needs no separate Linux confirmation.)
 A pure Dialer/Listener `net.Conn`-over-SHM plugin, **with zero changes to
 gRPC-Go**, is a real and useful artifact:
 
-- It **preserves mechanism (a)**, the structurally dominant win — proven
+- It **preserves mechanism (a)**, the structurally dominant win —
   ~760× fewer kernel bytes per RPC than UDS. For small messages (≤ the
   HTTP/2 frame size) it keeps roughly half of the full transport's
   advantage (1 KB: 49 %), and it always beats UDS.
 - It **loses mechanism (b)** for messages larger than the 16 KiB frame
   cap, and this loss is **not recoverable through any public gRPC-Go API**
-  — empirically demonstrated, not assumed. Retention falls to ~22 % at
-  64 KB and degrades toward UDS as the payload grows.
+  (measured, §1.4). Retention falls to ~22 % at 64 KB and degrades toward
+  UDS as the payload grows.
 
-So the honest framing for the "just ship a Dialer" option is: it is a
-legitimate, low-friction packaging that captures the kernel-bypass win and
-is strongest for small-message / high-RPC-rate workloads, but it
-**structurally cannot match the full transport at mid/large payloads**.
-Closing that gap requires either a custom transport or a small *generic*
-gRPC-Go enhancement — which is the subject of Part 2.
+The "just ship a Dialer" option is a low-friction packaging that captures the
+kernel-bypass win and is strongest for small-message / high-RPC-rate
+workloads, but it **structurally cannot match the full transport at mid/large
+payloads**. Closing that gap requires a custom transport — the subject of
+Part 2.
 
 ---
 
@@ -281,10 +280,10 @@ not shared code) and a **per-runtime layer**.
   segment+wake ABI is necessarily per-OS, so a Linux ↔ Windows shared-memory
   connection is not a goal a single ABI can serve.
 
-So interop with a second language is a *native reimplementation of the spec in
-that language* — the wire and the per-OS segment/ring ABI are shared, the
-implementation is not. This is the genuinely large part of "true cross-language
-SHM": not the Go-side change (§3), but the second implementation.
+So interop with a second language is a native reimplementation of the spec in
+that language — the wire and the per-OS segment/ring ABI are shared, the
+implementation is not. The largest cost of true cross-language SHM is this
+second implementation, not the Go-side change (§3).
 
 ### 2.3 Comparison: dialer vs extension vs full transport
 
@@ -304,15 +303,15 @@ The two runs are not directly comparable — read each as a within-run ratio.
 
 The pure dialer is the zero-effort option but cannot keep in-place ZC past the
 16 KiB frame cap. The full transport is fastest but Go-only. The extension is
-the *same engine* as the full transport plus a conformance profile, so a
-foreign peer can interoperate at a cost that is bounded and, as §3.3 shows,
-mostly recoverable by negotiation.
+the same engine as the full transport plus a conformance profile, so a foreign
+peer can interoperate at a cost that is bounded and, as §3.3 shows, mostly
+recoverable by negotiation.
 
-(A more academic middle option — adding generic byte-buffer hooks to gRPC-Go's
-own framer so a plain `net.Conn` could approach the custom transport — would
-require *new public gRPC-Go interfaces* and still not reach the full
-transport's inline path. We did not pursue it: the custom transport already
-exists and needs no core-API change.)
+A middle option — adding generic byte-buffer hooks to gRPC-Go's own framer so
+a plain `net.Conn` could approach the custom transport — would require new
+public gRPC-Go interfaces and still would not reach the full transport's
+inline path. The custom transport already exists and needs no core-API change,
+so this option is not pursued here.
 
 ---
 
@@ -342,12 +341,11 @@ remaining work is bounded.
 Two implementation notes:
 
 - **SETTINGS is the keystone.** The window and frame size are useless as
-  per-connection overrides until both ends agree on them in-band; an attempt
-  to set a per-connection 64 KiB window *without* SETTINGS works for messages
+  per-connection overrides until both ends agree on them in-band; a
+  per-connection 64 KiB window set *without* SETTINGS works for messages
   inside the window but stalls on larger messages, because the two ends never
   agree on the WINDOW_UPDATE threshold. Window negotiation therefore belongs
-  in the SETTINGS step, not bolted on before it. (This was confirmed
-  empirically — §3.3.)
+  in the SETTINGS step, not before it (see §3.2).
 - **SETTINGS ordering vs. the security handshake.** The optional security
   handshake runs on the raw rings *before* the H2 transport starts, so the
   "first frame must be SETTINGS" rule keys off the first H2 frame *after* that
@@ -401,22 +399,20 @@ posture keeps.
 
 Two findings, both stronger than the original prediction:
 
-- **The conformance cost is real but bounded, and CrossLangV1 stays well
-  above UDS at every size.** Even forced into the strictest foreign-peer
-  posture (16 KiB frames + 64 KiB windows), the custom transport is **1.5–1.8×
-  faster than UDS** and retains **66–89 %** of the Go-tuned advantage. The
-  conformance cost (GoPrivateV1 → strict) grows with payload — 1 KB +7 %,
-  64 KB +41 %, 256 KB +65 % — exactly as expected, because the 16 KiB frame
-  cap multiplies the DATA-frame count on larger messages.
+- **The conformance cost is bounded, and CrossLangV1 stays well above UDS at
+  every size.** Even in the strictest foreign-peer posture (16 KiB frames +
+  64 KiB windows), the custom transport is **1.5–1.8× faster than UDS** and
+  retains **66–89 %** of the Go-tuned advantage. The cost (GoPrivateV1 →
+  strict) grows with payload — 1 KB +7 %, 64 KB +41 %, 256 KB +65 % — because
+  the 16 KiB frame cap multiplies the DATA-frame count on larger messages.
 - **strict CrossLangV1 beats the pure-dialer floor.** At 64 KB, strict
   CrossLangV1 (126,806 ns) is faster than the pure `net.Conn` dialer
-  (152,350 ns from Part 1), because it remains a custom transport — it keeps
-  single-copy-into-ring ZC *within* each 16 KiB frame and full kernel bypass,
-  both of which the dialer's `net.Conn` double-copy forfeits. This is the
-  empirical payoff of the extension over the pure-dialer floor.
+  (152,350 ns from Part 1): as a custom transport it keeps single-copy-into-ring
+  ZC *within* each 16 KiB frame and full kernel bypass, both of which the
+  dialer's `net.Conn` double-copy forfeits.
 
-The remaining open question for the *real* cross-language number is whether a
-real C-core / .NET / Java peer will accept a larger `SETTINGS_MAX_FRAME_SIZE`
+The open question for the *real* cross-language number is whether a real
+C-core / .NET / Java peer will accept a larger `SETTINGS_MAX_FRAME_SIZE`
 and window. If it does, the cost shrinks toward the GoPrivateV1 baseline; if
 it caps at 16 KiB / 64 KiB, the "strict" column above **is** the real-world
 cross-language performance — still the best any cross-language local transport
@@ -430,79 +426,45 @@ prototyped and is correct for messages within the window, but a robust profile
 for messages *larger* than the window requires the SETTINGS handshake — see
 §3.1.
 
-### 3.3 Where the cost comes from — frame vs window, and why it is a floor not a tax
+### 3.3 Where the cost comes from — frame vs window
 
-A blunt 41–65 % "cost" hides the mechanism. A 2×2 sweep at 64 KB streaming
-(toggling frame size and window independently via the global knobs) decomposes
-it (relative trend; the absolute values here are from a faster smoke run, but
-the *ratios* are the point):
+A 2×2 sweep at 64 KB streaming, toggling frame size and window independently
+via the global knobs, separates the two contributions (the absolute values
+below are from a shorter run; the ratios are the result):
 
 | 64 KB | jumbo frame (16 MiB) | standard frame (16 KiB) |
 |---|---|---|
-| **jumbo window (32 MiB)** | A — pure SHM (baseline) | B — **+28 %** vs A |
-| **standard window (64 KiB)** | C — *structurally fails*¹ | D — strict (+36 % vs A) |
+| **jumbo window (32 MiB)** | A — pure SHM (baseline) | B — +28 % vs A |
+| **standard window (64 KiB)** | C — incompatible¹ | D — strict, +36 % vs A |
 
-¹ A 16 MiB frame with a 64 KiB window is incompatible: a 64 KB message rides
-one big DATA frame but exceeds the 64 KiB window, and the single-frame fast
-path skips the pre-credit that a chunked message gets — so jumbo-frame and
-small-window are *bound together*, they cannot be mixed.
+¹ A 16 MiB frame with a 64 KiB window cannot be combined: a 64 KB message
+rides one DATA frame but exceeds the 64 KiB window, and the single-frame fast
+path skips the pre-credit that a chunked message gets. Jumbo frame and small
+window are therefore bound together.
 
-Reading the decomposition:
+- The frame cap accounts for ~80 % of the cost (A→B is +28 %; the window's
+  marginal contribution B→D is ~+6 %). The conformance cost is primarily a
+  framing effect, not a flow-control effect.
+- The frame cap is negotiable. `SETTINGS_MAX_FRAME_SIZE` is a standard HTTP/2
+  SETTINGS parameter, and HTTP/2 permits values up to 16 MiB (2²⁴−1). The
+  16 KiB in the "strict" column is the default, not a ceiling. The SETTINGS
+  step (§3.1) negotiates the frame size up to whatever the peer accepts, so
+  the dominant 80 % of the cost is recoverable by negotiation.
 
-- **The frame cap is ~80 % of the cost** (A→B is +28 %; the window's marginal
-  contribution B→D is only ~+6 %). The conformance cost is overwhelmingly a
-  *framing* effect, not a flow-control effect.
-- **The frame cap is negotiable.** `SETTINGS_MAX_FRAME_SIZE` is a standard
-  HTTP/2 SETTINGS parameter, and HTTP/2 permits values up to 16 MiB (2²⁴−1).
-  The 16 KiB used in the "strict" column is merely the *default*, not a
-  ceiling. The whole job of the `CrossLangV1` SETTINGS step (§3.1) is
-  to negotiate the frame size *up* to whatever the peer will accept. So the
-  dominant 80 % of the conformance cost is exactly the part the extension's
-  own negotiation can claw back.
+The "strict CrossLangV1" column in §3.2 is the floor — the result when a
+foreign peer accepts nothing above HTTP/2 defaults. It is the gRFC SHM
+transport running under HTTP/2-default settings (`fair-default` + 16 KiB
+frames); the extension does not add this cost, it negotiates as much of it
+away as the peer allows:
 
-**The honest reframing (important).** The "strict CrossLangV1" column in §3.2
-is not a fixed extension tax — it is the **floor**, the number you get when a
-foreign peer refuses to negotiate anything above HTTP/2 defaults. It is, quite
-literally, *the gRFC SHM transport measured under HTTP/2-default settings*
-(`fair-default` + 16 KiB frames). The extension does not *add* this cost; the
-extension's entire purpose is to **negotiate away as much of it as the peer
-allows**. Stated as a formula:
+> cross-language cost = (pure-SHM jumbo) − (best posture the peer accepts).
+> 16 KiB / 64 KiB is the worst case; a peer that accepts a larger
+> `MAX_FRAME_SIZE` moves the result toward the pure-SHM baseline.
 
-> real cross-language cost = (pure-SHM jumbo) − (best posture the peer will
-> accept). 16 KiB / 64 KiB is the worst-case **floor** (most conservative
-> peer); a capable peer that accepts a larger `MAX_FRAME_SIZE` moves the
-> result back toward the pure-SHM baseline.
-
-This also answers "did the gRFC transport leave performance on the table?" —
-no. The gRFC engine running at jumbo settings (cell A / GoPrivateV1) is the
-full-speed result and is **2.3× faster than UDS at 64 KB on Linux**
-(89,745 vs 203,767 ns). The strict column is not the engine underperforming;
-it is the same engine deliberately constrained to the settings a
-lowest-common-denominator foreign peer can speak. The ~500-line extension is a
-thin negotiation layer on top of that 23,800-line engine — small precisely
-because the engine already does all the hard work; and the negotiation it adds
-is what recovers the frame-size cost that dominates the floor.
-
-### 3.4 Engineering cost — code size
-
-The gRFC SHM transport is ~23,800 lines across 52 files (ring SPSC sync,
-eventfd/futex wake, HPACK codec, HTTP/2 framing, flow control, the ZC fast
-path + multi-anchor FIFO, security handshake, segment lifecycle, Linux +
-Windows). The `CrossLangV1` extension on top of it is:
-
-- **landed already** (committed): `speculativeReserved@0x38` retirement
-  (net −54, dead-code removal) + per-connection outbound frame-size override
-  (+45 −8) ≈ **~80 lines of new logic** — about **0.3 %** of the engine.
-- **remaining** (estimated): SETTINGS state machine (~100 core / ~300 with
-  ACK + first-frame + ordering), UDS bootstrap handshake (~200–250, reusing
-  the existing per-segment fd-pass UDS), liveness (~120), hardening (~150),
-  cross-language conformance tests (~300). **Core path ≈ 400–600 lines;**
-  full hardened + tested ≈ ~1,300 lines — i.e. **~6 %** of the engine.
-
-The extension is small *because* the gRFC engine already exists; it is a
-negotiation layer, not a second transport, and adds no new public API (§3.1).
-The genuinely large remaining cost of true interop is not in Go at all — it is
-a *second language's* native reimplementation of the same spec (§2.2).
+The gRFC engine at jumbo settings (cell A / GoPrivateV1) is the full-speed
+result, 2.3× faster than UDS at 64 KB on Linux (89,745 vs 203,767 ns). The
+strict column is the same engine constrained to the settings a
+lowest-common-denominator foreign peer can use, not a slower engine.
 
 ---
 
