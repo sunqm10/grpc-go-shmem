@@ -2260,6 +2260,14 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, errStreamDone
 	}
 
+	// Standard-flow-only extension profile: skip the inline zero-copy
+	// fast path entirely. The caller falls back to write(), which hands
+	// the whole message to the writer goroutine — the posture a
+	// conservative cross-language peer (no inline coordination) exhibits.
+	if shmStdFlowOnly() {
+		return false, nil
+	}
+
 	pSize := protoSize(pm)
 	ringSize := h2FrameHeaderSize + 5 + pSize // total bytes in ring (H2 header + gRPC LPM + proto)
 	quotaSize := 5 + pSize                    // flow-control size (matches receiver WINDOW_UPDATE accounting)

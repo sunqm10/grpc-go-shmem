@@ -18,7 +18,11 @@
 
 package transport
 
-import "os"
+import (
+	"os"
+	"strconv"
+	"sync/atomic"
+)
 
 // This file is the single source of truth for runtime tunables that the
 // shared-memory transport reads from process environment variables.
@@ -101,3 +105,43 @@ func readShmEnv() shmEnv {
 		crossProcessChild: os.Getenv("GRPC_CROSS_PROCESS_CHILD") != "",
 	}
 }
+
+// shmStdFlowOnlyAtomic gates the "standard-flow-only" profile (the
+// cross-language–conformant extension posture). When set, the
+// transport disables the two Go-private inline data-plane fast paths:
+//
+//   - writeProto's inline zero-copy direct-marshal-into-ring path
+//     (client + server), and
+//   - the frame writer's tryInlineWrite inline-under-inlineMu path.
+//
+// All message sends are instead routed through the writer goroutine's
+// async queue, exactly as a conservative cross-language peer that does
+// not implement the inline-coordination optimisation would observe.
+// Reader-side WINDOW_UPDATE emission (enqueueOrInlineNonBlocking) is a
+// cross-process-safe control-frame mechanism and is NOT affected. The
+// negotiable jumbo frame size and large window are likewise unaffected —
+// those are SETTINGS-expressible and remain available to the extension.
+//
+// Initialised once from GRPC_SHM_STD_FLOW at init; tests/benchmarks
+// toggle it via ConfigureShmStdFlowOnlyForBench. Default OFF
+// (production Go↔Go uses the inline fast paths). The env var is parsed
+// with strconv.ParseBool, so GRPC_SHM_STD_FLOW=0 / false correctly
+// leaves the mode disabled (a non-empty check would treat "0" as ON).
+var shmStdFlowOnlyAtomic atomic.Bool
+
+func init() {
+	if v := os.Getenv("GRPC_SHM_STD_FLOW"); v != "" {
+		if on, err := strconv.ParseBool(v); err == nil {
+			shmStdFlowOnlyAtomic.Store(on)
+		}
+	}
+}
+
+// shmStdFlowOnly reports whether the standard-flow-only extension
+// profile is active.
+func shmStdFlowOnly() bool { return shmStdFlowOnlyAtomic.Load() }
+
+// ConfigureShmStdFlowOnlyForBench toggles the standard-flow-only
+// extension profile. Intended for benchmarks and tests that measure the
+// cross-language extension posture against the Go-private fast paths.
+func ConfigureShmStdFlowOnlyForBench(on bool) { shmStdFlowOnlyAtomic.Store(on) }

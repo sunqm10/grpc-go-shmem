@@ -1859,6 +1859,12 @@ func (w *shmFrameWriter) tryInlineWrite(
 	data mem.BufferSlice,
 	isLast bool,
 ) (handled bool, err error) {
+	// Standard-flow-only extension profile: never take the inline
+	// path. Returning not-handled routes the send through the writer
+	// goroutine's async queue.
+	if shmStdFlowOnly() {
+		return false, nil
+	}
 	// Cheapest gate FIRST: at high stream concurrency (N=1000) the
 	// channel is almost never empty, so this single non-atomic chan
 	// length check bails ~100 % of calls without touching any

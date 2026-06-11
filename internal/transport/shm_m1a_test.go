@@ -60,6 +60,10 @@ import (
 // too loose (delta <= 4 also satisfied by an unfused HEADERS+DATA
 // at 4).
 func TestShmM1aBatchFiresOnFirstResponse(t *testing.T) {
+	if shmStdFlowOnly() {
+		t.Skip("M1a is a Go-private inline fast path; the std-flow-only " +
+			"extension profile disables it, so the BeginBatch counter never fires")
+	}
 	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
 	defer cleanup()
 
@@ -208,6 +212,10 @@ func TestShmM1aHeaderDedupAcrossExplicitSendHeader(t *testing.T) {
 // sent yet). Subsequent messages must take the emitHeader=false
 // path (no batch).
 func TestShmM1aOnlyOnFirstMessageInStream(t *testing.T) {
+	if shmStdFlowOnly() {
+		t.Skip("M1a is a Go-private inline fast path; the std-flow-only " +
+			"extension profile disables it, so the BeginBatch counter never fires")
+	}
 	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
 	defer cleanup()
 
@@ -280,4 +288,80 @@ func binaryBE32(b []byte, v uint32) {
 	b[1] = byte(v >> 16)
 	b[2] = byte(v >> 8)
 	b[3] = byte(v)
+}
+
+// TestShmStdFlowOnlyDisablesInline verifies the standard-flow-only
+// extension profile: with the switch ON, a unary proto RPC still
+// completes end-to-end (the async writer-goroutine fallback path is
+// functionally correct) AND the server inline batch-coalesce counter
+// (shmM1aBatchFire, which only increments inside the inline writeProto
+// branch) does NOT fire — proving the inline data-plane fast path was
+// actually bypassed. This guards the honesty of the extension benchmark:
+// the knob must genuinely disable the Go-private inline shortcut, not
+// merely appear to.
+func TestShmStdFlowOnlyDisablesInline(t *testing.T) {
+	prev := shmStdFlowOnly()
+	ConfigureShmStdFlowOnlyForBench(true)
+	defer ConfigureShmStdFlowOnlyForBench(prev)
+
+	ct, st, _, cleanup := setupShmTransportPair(t, 256*1024)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(ctx, func(s *ServerStream) {
+			if _, err := s.Read(1024); err != nil && err != io.EOF {
+				return
+			}
+			// WriteProto routes through ShmServerTransport.writeProto,
+			// whose inline M1a branch the std-flow gate must bypass.
+			resp := &wrapperspb.BytesValue{Value: []byte("STDFLOW-OK")}
+			if _, err := s.WriteProto(resp, &WriteOptions{}); err != nil {
+				return
+			}
+			_ = s.WriteStatus(status.New(codes.OK, ""))
+		})
+	}()
+
+	callHdr := &CallHdr{Host: "localhost", Method: "/test/StdFlow"}
+	cs, err := ct.NewStream(ctx, callHdr, nil)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	beforeBatch := atomic.LoadUint64(&shmM1aBatchFire)
+
+	req := make([]byte, 16)
+	reqHdr := make([]byte, 5)
+	binaryBE32(reqHdr[1:5], uint32(len(req)))
+	if err := cs.Write(reqHdr, mem.BufferSlice{mem.SliceBuffer(req)}, &WriteOptions{Last: true}); err != nil && err != io.EOF {
+		t.Fatalf("cs.Write request: %v", err)
+	}
+
+	if _, err := cs.Read(1024); err != nil && err != io.EOF {
+		t.Fatalf("cs.Read response: %v", err)
+	}
+	select {
+	case <-cs.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("stream Done timed out")
+	}
+
+	// RPC completed correctly via the async fallback path.
+	if st := cs.Status(); st.Code() != codes.OK {
+		t.Errorf("stream status = %s, want OK", st.Code())
+	}
+	// Inline fast path was bypassed: the M1a counter must not have moved.
+	if delta := atomic.LoadUint64(&shmM1aBatchFire) - beforeBatch; delta != 0 {
+		t.Errorf("M1a BeginBatch fired %d times under std-flow-only, want 0 "+
+			"(the inline data-plane fast path was NOT disabled)", delta)
+	}
+
+	ct.Close(nil)
+	st.Close(nil)
+	<-serverDone
 }

@@ -1836,6 +1836,18 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		return false, errStreamDone
 	}
 
+	// Standard-flow-only extension profile: skip the inline zero-copy
+	// fast path. Mirror the existing ZC-skip branches by first ensuring
+	// the response HEADERS are emitted (maybeWriteHeader is idempotent),
+	// then fall back to the chunked write() path driven by the writer
+	// goroutine.
+	if shmStdFlowOnly() {
+		if err := t.maybeWriteHeader(s); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
 	pSize := protoSize(pm)
 	ringSize := h2FrameHeaderSize + 5 + pSize // total bytes in ring (H2 header + gRPC LPM + proto)
 	quotaSize := 5 + pSize                    // flow-control size (matches receiver accounting)
