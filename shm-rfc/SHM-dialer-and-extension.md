@@ -120,9 +120,8 @@ wake primitive) is only 4.4 %. So the lost retention at 64 KB+ is mechanism
 (b) — the user-space ring↔framer copy that the full transport's ZC fast
 path avoids.
 
-**(iii) The copy cannot be removed through any public gRPC-Go API.** This
-is the key Part-1 finding, and it was verified by building the optimization
-and proving it cannot fire, rather than asserting it.
+**(iii) The copy cannot be removed through any public gRPC-Go API** — shown
+in §1.4 by building the optimization and observing it cannot fire.
 
 ### 1.4 The write-ZC probe — the best public-API optimization, and why it fails
 
@@ -397,7 +396,7 @@ ping-pong, `benchtime=3s`, single run:
 full transport's advantage over UDS that the conservative cross-language
 posture keeps.
 
-Two findings, both stronger than the original prediction:
+Two findings:
 
 - **The conformance cost is bounded, and CrossLangV1 stays well above UDS at
   every size.** Even in the strictest foreign-peer posture (16 KiB frames +
