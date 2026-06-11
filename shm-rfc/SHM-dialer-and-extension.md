@@ -77,18 +77,18 @@ is invariant to the profile choice.)
 
 | Cell | full SHM transport | **TrackB dialer (best of default/ZeroBuf)** | UDS | **retention** |
 |---|---|---|---|---|
-| Stream 1 KB | 13,961 | **20,000** (default) | 25,705 | **49 %** |
-| Stream 64 KB | 89,571 | **152,350** (ZeroBuf) | 169,949 | **22 %** |
-| Stream 256 KB | 234,452 | **396,553** (ZeroBuf) | 455,392 | **27 %** |
+| Stream 1 KB | 13,595 | **19,918** (default) | 24,550 | **42 %** |
+| Stream 64 KB | 89,622 | **150,676** (ZeroBuf) | 166,352 | **20 %** |
+| Stream 256 KB | 232,358 | **393,408** (ZeroBuf) | 447,138 | **25 %** |
 
 `retention = (UDS − TrackB) / (UDS − fullSHM)` = the fraction of the full
 transport's advantage over UDS that the zero-core-change dialer keeps.
 
 A note on ZeroBuf: it helps at 64 KB / 256 KB (removes one staging copy)
-but *hurts* at 1 KB (20,000 → 24,374), because disabling the write buffer
+but *hurts* at 1 KB (19,918 → 22,496), because disabling the write buffer
 also disables gRPC-Go's HEADERS+DATA batching, producing more ring wakes
 per small RPC. So the best dialer configuration is payload-dependent, and
-even at its best the floor is **22-49 %** retention — not the ~70 % a naive
+even at its best the floor is **20-42 %** retention — not the ~70 % a naive
 "keeps kernel bypass" estimate would suggest.
 
 ### 1.3 Why it lands there — three aligned pieces of evidence
@@ -179,7 +179,7 @@ the stock framer's write ordering structurally cannot express.
 
 **Conclusion of the probe:** the write-ZC optimization does not merely give
 marginal upside through a `net.Conn` — it *cannot fire at all*. The
-22-49 % floor in §1.2 is the real floor; no public-API trick lifts it.
+20-42 % floor in §1.2 is the real floor; no public-API trick lifts it.
 (This is a structural property of the gRPC-Go framer, independent of
 platform, so it needs no separate Linux confirmation.)
 
@@ -191,10 +191,10 @@ gRPC-Go**, is a real and useful artifact:
 - It **preserves mechanism (a)**, the structurally dominant win —
   ~760× fewer kernel bytes per RPC than UDS. For small messages (≤ the
   HTTP/2 frame size) it keeps roughly half of the full transport's
-  advantage (1 KB: 49 %), and it always beats UDS.
+  advantage (1 KB: 42 %), and it always beats UDS.
 - It **loses mechanism (b)** for messages larger than the 16 KiB frame
   cap, and this loss is **not recoverable through any public gRPC-Go API**
-  (measured, §1.4). Retention falls to ~22 % at 64 KB and degrades toward
+  (measured, §1.4). Retention falls to ~20 % at 64 KB and degrades toward
   UDS as the payload grows.
 
 The "just ship a Dialer" option is a low-friction packaging that captures the
@@ -293,12 +293,11 @@ second implementation, not the Go-side change (§3).
 | Kernel-path bypass | ✅ | ✅ | ✅ |
 | In-place user-space ZC | ❌ lost > 16 KiB | ✅ within each frame | ✅ (jumbo frame) |
 | Cross-language interop | n/a — Go only | ✅ eventfd + SETTINGS + UDS | ❌ — Go-only fast paths |
-| 64 KB streaming vs UDS¹ | ~1.1× | **1.61×** | 2.27× |
+| 64 KB streaming vs UDS | 1.10× | **1.34×** | 1.86× |
 | Peer must be | Go | any conformant gRPC impl | Go |
 
-¹ Dialer ratio is from the Part 1 run (UDS baseline 169,949 ns); the extension
-and full-transport ratios are from the Part 3 run (UDS baseline 203,767 ns).
-The two runs are not directly comparable — read each as a within-run ratio.
+All three "vs UDS" ratios use the same run and UDS baseline (64 KB stream:
+UDS 166,352 ns; dialer 150,676; extension 124,534; full 89,622 ns).
 
 The pure dialer is the zero-effort option but cannot keep in-place ZC past the
 16 KiB frame cap. The full transport is fastest but Go-only. The extension is
@@ -384,13 +383,13 @@ flow-control knobs (`BENCH_PROFILE=fair-default` = HTTP/2-default 64 KiB
 windows, `SHM_MAX_FRAME_SIZE=16384` = HTTP/2-default frame size), which impose
 the exact conservative posture the negotiated profile applies. Measured on
 Linux, Intel Xeon Platinum 8370C @ 2.80 GHz, 16 vCPU, Go 1.25, streaming
-ping-pong, `benchtime=3s`, single run:
+ping-pong, `benchtime=3s`, 3-run median:
 
 | Streaming | GoPrivateV1 (baseline) | **strict CrossLangV1** | UDS | **CrossLangV1 vs UDS** | **retention** |
 |---|---|---|---|---|---|
-| 1 KB | 14,095 ns | **15,076 ns** | 23,101 ns | **1.53× faster** | **89 %** |
-| 64 KB | 89,745 ns | **126,806 ns** | 203,767 ns | **1.61× faster** | **68 %** |
-| 256 KB | 236,548 ns | **391,354 ns** | 689,678 ns | **1.76× faster** | **66 %** |
+| 1 KB | 13,595 ns | **13,846 ns** | 24,550 ns | **1.77× faster** | **98 %** |
+| 64 KB | 89,622 ns | **124,534 ns** | 166,352 ns | **1.34× faster** | **54 %** |
+| 256 KB | 232,358 ns | **390,251 ns** | 447,138 ns | **1.15× faster** | **26 %** |
 
 `retention = (UDS − CrossLangV1) / (UDS − GoPrivateV1)` = the fraction of the
 full transport's advantage over UDS that the conservative cross-language
@@ -398,17 +397,20 @@ posture keeps.
 
 Two findings:
 
-- **The conformance cost is bounded, and CrossLangV1 stays well above UDS at
-  every size.** Even in the strictest foreign-peer posture (16 KiB frames +
-  64 KiB windows), the custom transport is **1.5–1.8× faster than UDS** and
-  retains **66–89 %** of the Go-tuned advantage. The cost (GoPrivateV1 →
-  strict) grows with payload — 1 KB +7 %, 64 KB +41 %, 256 KB +65 % — because
-  the 16 KiB frame cap multiplies the DATA-frame count on larger messages.
-- **strict CrossLangV1 beats the pure-dialer floor.** At 64 KB, strict
-  CrossLangV1 (126,806 ns) is faster than the pure `net.Conn` dialer
-  (152,350 ns from Part 1): as a custom transport it keeps single-copy-into-ring
-  ZC *within* each 16 KiB frame and full kernel bypass, both of which the
-  dialer's `net.Conn` double-copy forfeits.
+- **CrossLangV1 stays faster than UDS at every size, but the margin narrows
+  as the payload grows.** The conformance cost (GoPrivateV1 → strict) is
+  +1.8 % at 1 KB, +39 % at 64 KB, +68 % at 256 KB — it grows with payload
+  because the 16 KiB frame cap multiplies the DATA-frame count. At 256 KB the
+  16-frame chunking has eroded most of the advantage (1.15× over UDS, 26 %
+  retention); at 1 KB the message fits in one frame and the conformant posture
+  is essentially free (98 % retention).
+- **strict CrossLangV1 beats the pure-dialer floor at mid sizes.** At 64 KB,
+  strict CrossLangV1 (124,534 ns) is faster than the pure `net.Conn` dialer
+  (150,676 ns): as a custom transport it keeps single-copy-into-ring ZC
+  *within* each 16 KiB frame and full kernel bypass, both of which the
+  dialer's `net.Conn` double-copy forfeits. At 256 KB the two converge
+  (390,251 vs 393,408 ns) — once the message is chunked into 16 frames the
+  per-frame ZC advantage is swamped by copy bandwidth.
 
 The open question for the *real* cross-language number is whether a real
 C-core / .NET / Java peer will accept a larger `SETTINGS_MAX_FRAME_SIZE`
@@ -428,27 +430,28 @@ for messages *larger* than the window requires the SETTINGS handshake — see
 ### 3.3 Where the cost comes from — frame vs window
 
 A 2×2 sweep at 64 KB streaming, toggling frame size and window independently
-via the global knobs, separates the two contributions (the absolute values
-below are from a shorter run; the ratios are the result):
+via the global knobs, separates the two contributions (Linux Xeon 8370C,
+3-run median ns; same run as §3.2):
 
 | 64 KB | jumbo frame (16 MiB) | standard frame (16 KiB) |
 |---|---|---|
-| **jumbo window (32 MiB)** | A — pure SHM (baseline) | B — +28 % vs A |
-| **standard window (64 KiB)** | C — incompatible¹ | D — strict, +36 % vs A |
+| **jumbo window (32 MiB)** | A — 89,622 (pure SHM) | B — 120,377 (+34 % vs A) |
+| **standard window (64 KiB)** | C — incompatible¹ | D — 124,534 (strict, +39 % vs A) |
 
 ¹ A 16 MiB frame with a 64 KiB window cannot be combined: a 64 KB message
 rides one DATA frame but exceeds the 64 KiB window, and the single-frame fast
-path skips the pre-credit that a chunked message gets. Jumbo frame and small
-window are therefore bound together.
+path skips the pre-credit that a chunked message gets. The run fails with
+`received 65549-bytes data exceeding the limit 65535 bytes`. Jumbo frame and
+small window are therefore bound together.
 
-- The frame cap accounts for ~80 % of the cost (A→B is +28 %; the window's
-  marginal contribution B→D is ~+6 %). The conformance cost is primarily a
+- The frame cap accounts for ~87 % of the cost (A→B is +34 %; the window's
+  marginal contribution B→D is +4.6 %). The conformance cost is primarily a
   framing effect, not a flow-control effect.
 - The frame cap is negotiable. `SETTINGS_MAX_FRAME_SIZE` is a standard HTTP/2
   SETTINGS parameter, and HTTP/2 permits values up to 16 MiB (2²⁴−1). The
   16 KiB in the "strict" column is the default, not a ceiling. The SETTINGS
   step (§3.1) negotiates the frame size up to whatever the peer accepts, so
-  the dominant 80 % of the cost is recoverable by negotiation.
+  the dominant ~87 % of the cost is recoverable by negotiation.
 
 The "strict CrossLangV1" column in §3.2 is the floor — the result when a
 foreign peer accepts nothing above HTTP/2 defaults. It is the gRFC SHM
@@ -461,7 +464,7 @@ away as the peer allows:
 > `MAX_FRAME_SIZE` moves the result toward the pure-SHM baseline.
 
 The gRFC engine at jumbo settings (cell A / GoPrivateV1) is the full-speed
-result, 2.3× faster than UDS at 64 KB on Linux (89,745 vs 203,767 ns). The
+result, 1.86× faster than UDS at 64 KB on Linux (89,622 vs 166,352 ns). The
 strict column is the same engine constrained to the settings a
 lowest-common-denominator foreign peer can use, not a slower engine.
 
@@ -469,11 +472,10 @@ lowest-common-denominator foreign peer can use, not a slower engine.
 
 ## Notes
 
-- Part 1 floor numbers: `shm-tuned` bench profile, Linux Xeon 8370C, Go
-  1.25, 3-run median. Retention is computed within-profile and is invariant
-  to profile choice. A `fair-default` re-run (to align byte-for-byte with
-  `SHM-vs-UDS-analysis.md`'s absolute numbers) is a pending optional follow-up;
-  it does not change the retention conclusion.
+- All Part 1 and Part 3 numbers are from one Linux run (Xeon 8370C, Go 1.25,
+  `benchtime=3s`, 3-run median) sharing a single UDS baseline, so the tables
+  are directly comparable. Part 1 uses the `shm-tuned` profile; the strict
+  CrossLangV1 column uses `fair-default` + 16 KiB frames.
 - Harness caveat: the floor harness uses the ring's default wait/signal
   (futex on Linux) rather than the per-segment eventfd waker the full SHM
   bench enables. The copy question Part 1 answers is independent of the wake
