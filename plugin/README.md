@@ -29,7 +29,7 @@ contract.
  │    • Write(hdr, data)          pre-framed bytes out           │
  │    • ReadMessageHeader + Read  ring-backed bytes in (read ZC) │
  │    • headers / status / flow-control / lifecycle              │
- │    • NO WriteProto             (byte-only boundary, see below) │
+ │    • WriteProto        OPTIONAL (ProtoWriteStream, see below) │
  └───────────────────────────────┬──────────────────────────────┘
                                  │ implemented by
                                  ▼
@@ -51,14 +51,21 @@ contract.
   the only edits to `internal/transport/shm_*` are the `NewStream` / `HandleStreams` signatures, widened
   to the new interface types.
 
-**Byte-only boundary.** The contract is purely byte-based and shaped to be a cross-language standard:
-`Write(hdr, data)` carries already-framed bytes out; `ReadMessageHeader` + `Read` carry ring-backed
-bytes in (so read-side zero-copy survives). It deliberately has **no** message-typed
-`WriteProto(any)`: marshalling an application message is a codec concern that is not portable across
-languages, so that fast path (`INLINE_TX`) stays a first-party-only optimization. Core still uses it
-for the built-in transport via an **optional interface assertion** (`writeproto_fastpath.go`); the
-plugin's stream wrapper exposes only the byte interface, so the assertion fails and the portable
-`Write` path is used (pinned by [`plugin/shm/positionA_test.go`](shm/positionA_test.go)).
+**Byte contract + optional WriteProto capability.** The *mandatory* contract is purely byte-based and
+shaped to be a cross-language standard: `Write(hdr, data)` carries already-framed bytes out;
+`ReadMessageHeader` + `Read` carry ring-backed bytes in (so read-side zero-copy survives). On top of
+that mandatory boundary, message-typed `WriteProto(msg, opts) (handled bool, err error)` is an
+**optional, exported capability** (`transport/client.ProtoWriteStream` /
+`transport/server.ProtoWriteStream`): a transport MAY implement it to marshal the application message
+straight into the ring (the `INLINE_TX` fast path). grpc-go core detects it by interface assertion
+(`writeproto_fastpath.go`) and falls back to the portable `Write` path when it is absent. Because
+marshalling is a codec concern that is not portable across languages, it stays optional rather than
+part of the mandatory boundary — a byte-only runtime interoperates unchanged. The SHM plugin's bridge
+returns the engine `*ClientStream` / `*ServerStream` **directly** (they already implement both the
+byte contract and `WriteProto`), so the assertion **succeeds** and the plugin keeps `INLINE_TX` — the
+same fast path the monolithic transport uses (pinned by
+[`plugin/shm/positionA_test.go`](shm/positionA_test.go), `TestEngineStreamsExposeOptionalWriteProto`);
+the plugin-vs-monolithic benchmark quantifying the resulting parity is pending (see [DESIGN.md](DESIGN.md) §8).
 
 **Usage**
 
@@ -81,18 +88,21 @@ go s.Serve(lis)
 |---|---|---|
 | Selection registry | exported `transport/{client,server}` | same |
 | Byte-based stream contract | core drives streams through it | same |
-| Plugin implements the contract | `plugin/shm` via an adapter | same, from a **separate repo** |
+| Plugin implements the contract | `plugin/shm` via a thin bridge returning the engine streams directly | same, from a **separate repo** |
 | SHM engine location | `internal/transport` (reused; only `NewStream`/`HandleStreams` signatures widened) | relocated to the plugin module / its own repo |
 | Plugin's grpc imports | still imports `internal/transport` to **construct** the engine (`NewShmClient`, `NewServerTransport`, `NewShmListener`) | **only** the exported `transport/{client,server}` API — no `internal/*` |
 | Exported option types | `transport/{client,server}/types.go` **alias internal** option structs (POC scaffold) | purpose-built, minimal `BuildOptions` |
 | Selection field | ad-hoc `resolver.Address.TransportType` | reconciled with L37 "Go Custom Transports" (grpc/proposal#103) |
 
 **What the POC proves today:** grpc-go core can select *and* drive a transport purely through the
-exported byte contract, and a plugin can capability-restrict it (drop `INLINE_TX`) without touching
-core — with the SHM engine reused unchanged. **What remains for a truly external plugin:** relocate
-the engine out of `internal/` and replace the alias option types with designed ones, so a third party
-can implement `transport/client.ClientStream` / `transport/server.ServerStream` from scratch with no
-`internal/*` import.
+exported byte contract, and a plugin can additionally **opt into** the optional `WriteProto`
+(`INLINE_TX`) capability by forwarding it — taking the same `INLINE_TX` fast path as the monolithic
+transport (rather than the byte-only baseline) — all without touching core, with the SHM engine
+reused unchanged. (A byte-only plugin that omits
+`WriteProto` still interoperates; it simply uses the portable `Write` path.) **What remains for a
+truly external plugin:** relocate the engine out of `internal/` and replace the alias option types
+with designed ones, so a third party can implement `transport/client.ClientStream` /
+`transport/server.ServerStream` from scratch with no `internal/*` import.
 
 ## Status
 

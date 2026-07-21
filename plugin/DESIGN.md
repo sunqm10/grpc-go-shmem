@@ -4,9 +4,14 @@ Status: **implemented (in-module POC)**. Implementation base: grpc-go-shmem **`o
 (monolithic SHM). The branch `feat/shm-plugin-poc` is cut from `origin/master`. The §4 "core
 changes" (registry selection + stream-interface promotion + the optional-WriteProto capability) are
 **done and green on Linux** (build/vet/e2e/SHM tests); the plugin reuses the engine via an in-module
-adapter. What remains: the three-arm benchmark numbers and relocating the engine out of `internal/`
-for a truly external split. Decision on the message-typed boundary is settled: **Position A** —
-byte-based interface, `INLINE_TX` excluded as a first-party-only optimization (see §4, §6, §9).
+bridge that returns the engine streams directly. What remains: producing the plugin-vs-monolithic
+benchmark numbers (canonical low-noise VM runs), and relocating the engine out of `internal/` for a
+truly external split. Decision on the message-typed boundary is settled: a
+**byte-based mandatory interface plus an OPTIONAL exported `WriteProto` (`INLINE_TX`) capability**
+(`ProtoWriteStream`) that a capable transport MAY implement. The SHM plugin implements it, so it
+keeps `INLINE_TX` — the same fast path as the monolithic transport (the plugin-vs-monolithic
+benchmark quantifying parity is pending, §8); a byte-only plugin interoperates without it (see §4,
+§6, §9).
 
 ## 1. Goal
 
@@ -57,8 +62,10 @@ This is **not** a pure add-on; grpc-go core stream plumbing changes. Three chang
    `transport.ClientStream`; `HandleStreams`'s callback takes an interface `transport.ServerStream`.
    The interfaces expose the contract core already uses — the `parser` recv pair, the window hook,
    the write path, plus the retry / header / compression methods core calls — so `recv` / `parser`
-   and the byte write path route through them. `WriteProto` (INLINE_TX) is deliberately left OUT of
-   the interface and kept as an optional first-party capability (Position A, see §9).
+   and the byte write path route through them. `WriteProto` (INLINE_TX) is NOT part of the mandatory
+   interface; it is an OPTIONAL exported capability (`ProtoWriteStream`) a transport MAY additionally
+   implement. The SHM engine streams do, so the plugin keeps INLINE_TX — the same fast path as
+   monolithic (see §9).
    This touches grpc-go core hot paths (`stream.go` `recv`/`csAttempt`, `server.go` `handleStream`),
    not just the HTTP/2 transport.
 3. **Server builder via `HandleStreams` (push).** Register a `ServerTransportBuilder` whose product
@@ -86,8 +93,9 @@ type ClientTransport interface {
     GetGoAwayReason() (GoAwayReason, string); Peer() *peer.Peer
 }
 type ClientStream interface {
-    // write — byte-based ONLY. No WriteProto: INLINE_TX is an optional first-party
-    // capability detected by assertion (writeproto_fastpath.go), not part of the contract.
+    // write — byte-based (mandatory). WriteProto (INLINE_TX) is NOT here; it is the
+    // optional exported capability transport/client.ProtoWriteStream, detected by
+    // assertion (writeproto_fastpath.go). A capable transport MAY implement it.
     Write(hdr []byte, data mem.BufferSlice, opts *transport.WriteOptions) error
     // recv (the parser contract core already uses)
     ReadMessageHeader(h []byte) error
@@ -119,7 +127,8 @@ type ServerTransport interface {
     Peer() *peer.Peer
 }
 type ServerStream interface {
-    // write — byte-based ONLY (no WriteProto; see the client note above)
+    // write — byte-based (mandatory); WriteProto is the optional ProtoWriteStream
+    // capability (see the client note above)
     Write(hdr []byte, data mem.BufferSlice, opts *transport.WriteOptions) error
     WriteStatus(st *status.Status) error
     SendHeader(md metadata.MD) error
@@ -203,8 +212,8 @@ the adapter boundary named above — not a zero-diff move.
 |---|---|---|---|
 | P0 | branch off `origin/master` | monolithic SHM builds + benches green (baseline) | done |
 | P1 | grpc-go branch | registry + `TransportType`; concrete streams promoted to **byte-based** interfaces (recv / window / retry methods); `WriteProto` made an **optional capability** (assertion), NOT part of the interface; HTTP/2 + SHM rerouted through the interface | **done** |
-| P2 | `plugin/` | `plugin/shm` implements the seam via an in-module adapter that hides `WriteProto` (Position A); registers `"shm"`. Engine **not yet relocated** out of `internal/` | partial (adapter done; relocation pending) |
-| P3 | both | three-arm benchmark (INLINE value / adapter overhead / Position-A cost) | pending |
+| P2 | `plugin/` | `plugin/shm` implements the seam via a thin in-module bridge that returns the engine streams directly, so it **forwards** the optional `WriteProto` (`INLINE_TX`) capability; registers `"shm"`. Engine **not yet relocated** out of `internal/` | partial (bridge done; relocation pending) |
+| P3 | both | plugin-vs-monolithic benchmark (interface/bridge overhead; optional-`WriteProto` value) | pending |
 | P4 | `plugin/` | README + results | README done; results pending |
 
 POC scope: unary + streaming, Linux, one capability set. `IsShmEnabled` is kept (additive) so the
