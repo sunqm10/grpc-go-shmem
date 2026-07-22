@@ -35,6 +35,11 @@ var ErrIllegalHeaderWrite = status.Error(codes.Internal, "transport: SendHeader 
 // codes.Unknown (see the error-normalization guardrail).
 var ErrConnClosing = status.Error(codes.Unavailable, "transport is closing")
 
+// errStreamDrain indicates that the stream is rejected because the connection
+// is draining (GOAWAY or balancer removing the address). Unavailable so grpc-go
+// treats the failed attempt as retriable.
+var errStreamDrain = status.Error(codes.Unavailable, "the connection is draining")
+
 // ContextErr converts an error from the context package into a gRPC status
 // error.
 //

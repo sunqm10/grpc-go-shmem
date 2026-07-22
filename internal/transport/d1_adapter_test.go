@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	expclient "google.golang.org/grpc/experimental/transport/client"
 	expserver "google.golang.org/grpc/experimental/transport/server"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -125,6 +126,31 @@ func TestD1SplitAcceptedCompressors(t *testing.T) {
 	got := splitAcceptedCompressors(&val)
 	if len(got) != 2 || got[0] != "gzip" || got[1] != "snappy" {
 		t.Errorf("comma-joined override mis-split: got %v", got)
+	}
+}
+
+func TestD1ResolveAcceptedCompressors(t *testing.T) {
+	// Explicit overrides pass through unchanged (nil-vs-empty preserved).
+	empty := ""
+	if got := resolveAcceptedCompressors(&empty); got == nil || len(got) != 0 {
+		t.Errorf("explicit empty must be non-nil empty slice, got %v (nil=%v)", got, got == nil)
+	}
+	val := "gzip,snappy"
+	if got := resolveAcceptedCompressors(&val); len(got) != 2 || got[0] != "gzip" {
+		t.Errorf("explicit override mis-split: got %v", got)
+	}
+
+	// A nil override resolves the process-wide compressor registry on the core
+	// side, so the self-contained transport receives an explicit list.
+	saved := grpcutil.RegisteredCompressorNames
+	defer func() { grpcutil.RegisteredCompressorNames = saved }()
+	grpcutil.RegisteredCompressorNames = []string{"gzip", "deflate"}
+	if got := resolveAcceptedCompressors(nil); len(got) != 2 || got[0] != "gzip" || got[1] != "deflate" {
+		t.Errorf("nil override must resolve registry, got %v", got)
+	}
+	grpcutil.RegisteredCompressorNames = nil
+	if got := resolveAcceptedCompressors(nil); got != nil {
+		t.Errorf("nil override with empty registry must be nil, got %v", got)
 	}
 }
 

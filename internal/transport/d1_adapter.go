@@ -38,6 +38,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	expclient "google.golang.org/grpc/experimental/transport/client"
 	expserver "google.golang.org/grpc/experimental/transport/server"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -99,7 +100,7 @@ func (t *d1ClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, _ s
 		Authority:           authority,
 		ContentSubtype:      callHdr.ContentSubtype,
 		SendCompress:        callHdr.SendCompress,
-		AcceptedCompressors: splitAcceptedCompressors(callHdr.AcceptedCompressors),
+		AcceptedCompressors: resolveAcceptedCompressors(callHdr.AcceptedCompressors),
 		CallCredentials:     callHdr.Creds,
 		PreviousAttempts:    callHdr.PreviousAttempts,
 		DoneFunc:            callHdr.DoneFunc,
@@ -299,6 +300,24 @@ func toD1ServerWriteOptions(opts *WriteOptions) expserver.WriteOptions {
 // override).
 func splitAcceptedCompressors(v *string) []string {
 	if v == nil {
+		return nil
+	}
+	if *v == "" {
+		return []string{}
+	}
+	return strings.Split(*v, ",")
+}
+
+// resolveAcceptedCompressors produces the D1 grpc-accept-encoding list from the
+// internal override. A nil override means "use the process-wide compressor
+// registry" (the D1 CallHdr contract); the adapter resolves that here, on the
+// core side, via grpcutil so the self-contained transport never needs the
+// registry. An explicit override (including empty) is preserved verbatim.
+func resolveAcceptedCompressors(v *string) []string {
+	if v == nil {
+		if rc := grpcutil.RegisteredCompressors(); rc != "" {
+			return strings.Split(rc, ",")
+		}
 		return nil
 	}
 	if *v == "" {
