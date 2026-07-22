@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	server "google.golang.org/grpc/experimental/transport/server"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
@@ -1435,6 +1436,17 @@ func (t *shmServerTransport) Close(err error) {
 // Peer returns the peer of the server transport.
 func (t *shmServerTransport) Peer() *peer.Peer {
 	return t.peer
+}
+
+// SetAuthInfo installs the authenticated peer information produced by the
+// security handshake. It must be called before HandleStreams begins serving
+// (no stream is registered yet, so mutating the stored peer is race-free). Once
+// set, Peer().AuthInfo reports the negotiated identity.
+func (t *shmServerTransport) SetAuthInfo(authInfo credentials.AuthInfo) {
+	if t.peer == nil {
+		t.peer = &peer.Peer{}
+	}
+	t.peer.AuthInfo = authInfo
 }
 
 // Drain notifies the client this ServerTransport stops accepting new RPCs.

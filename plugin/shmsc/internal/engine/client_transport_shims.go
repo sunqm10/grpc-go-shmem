@@ -24,7 +24,12 @@ import (
 	"strings"
 
 	"golang.org/x/net/http2"
+	"google.golang.org/grpc/grpclog"
 )
+
+// logger is the engine's grpclog component, mirroring the internal transport
+// package's logger so ported bootstrap code that logs stays self-contained.
+var logger = grpclog.Component("shmsc")
 
 // GoAwayReason contains the reason for the GoAway frame received.
 type GoAwayReason uint8
