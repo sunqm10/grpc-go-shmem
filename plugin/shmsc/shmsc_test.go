@@ -28,12 +28,18 @@ import (
 )
 
 // TestNoInternalImports enforces the self-containment invariant that defines
-// this module: NO source file may import a google.golang.org/grpc/internal/*
-// package (nor any other module's internal package). This is what makes the
-// plugin upstreamable and splittable into its own repository. The guard walks
-// every .go file (including sub-packages under this module) and fails on any
-// forbidden import.
+// this module: no source file may import ANOTHER module's internal package
+// (in particular none of google.golang.org/grpc/internal/*). This is what makes
+// the plugin upstreamable and splittable into its own repository. This module's
+// OWN internal packages (google.golang.org/grpc/plugin/shmsc/internal/...) are
+// allowed.
+//
+// This is a DIRECT-import guard: it parses import statements only. It does not
+// (and cannot via the AST) detect hidden linkage such as go:linkname; the engine
+// intentionally uses go:linkname against the Go runtime (not any gRPC internal
+// package), which is fine.
 func TestNoInternalImports(t *testing.T) {
+	const ownModulePrefix = "google.golang.org/grpc/plugin/shmsc/"
 	fset := token.NewFileSet()
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -48,8 +54,10 @@ func TestNoInternalImports(t *testing.T) {
 		}
 		for _, imp := range f.Imports {
 			p := strings.Trim(imp.Path.Value, `"`)
-			// Forbid any ".../internal" or ".../internal/..." import path.
-			if p == "internal" || strings.HasSuffix(p, "/internal") || strings.Contains(p, "/internal/") {
+			// A ".../internal" or ".../internal/..." path belonging to ANOTHER
+			// module is forbidden; this module's own internal packages are fine.
+			isInternal := p == "internal" || strings.HasSuffix(p, "/internal") || strings.Contains(p, "/internal/")
+			if isInternal && !strings.HasPrefix(p, ownModulePrefix) {
 				t.Errorf("%s imports forbidden internal package %q: this module must be self-contained", path, p)
 			}
 		}

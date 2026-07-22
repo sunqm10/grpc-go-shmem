@@ -29,6 +29,13 @@
 // It coexists with the in-tree full-featured SHM transport (which is untouched):
 // this plugin registers under the distinct transport type Name ("shmsc").
 //
+// # Platform scope
+//
+// Like shared memory itself, this transport targets Linux and Windows only
+// (same-host IPC). The engine's ring/segment/wake primitives are built only for
+// those OSes; the module is not expected to build for other platforms (e.g.
+// darwin), matching the in-tree SHM transport.
+//
 // STATUS: work in progress. The module boundary + experimental-API wiring are
 // established; the SHM engine is being ported in from the monolith with its own
 // (non-shared) stream types. Not yet functional end to end.
