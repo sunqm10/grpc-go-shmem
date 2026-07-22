@@ -1034,6 +1034,18 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 	// connection names a registered transport type, build it via the exported
 	// registry, symmetric to client-side selection by resolver.Address.TransportType.
 	if tn, ok := c.(interface{ TransportType() string }); ok {
+		// Experimental self-contained (D1) server transport first (additive); a
+		// false "found" falls through to the POC registry / HTTP/2 below.
+		if d1st, found, d1err := transport.BuildD1ServerByType(c, tn.TransportType(), config); found {
+			if d1err != nil {
+				s.mu.Lock()
+				s.errorf("experimental D1 transport Build(%q) failed: %v", c.RemoteAddr(), d1err)
+				s.mu.Unlock()
+				c.Close()
+				return nil
+			}
+			return d1st
+		}
 		if b := transportserver.Get(tn.TransportType()); b != nil {
 			st, err := b.Build(c, transportserver.BuildOptions{Config: config})
 			if err != nil {

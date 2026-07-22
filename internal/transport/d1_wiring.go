@@ -31,9 +31,11 @@ package transport
 
 import (
 	"context"
+	"net"
 
 	"google.golang.org/grpc/credentials"
 	expclient "google.golang.org/grpc/experimental/transport/client"
+	expserver "google.golang.org/grpc/experimental/transport/server"
 	"google.golang.org/grpc/resolver"
 )
 
@@ -109,4 +111,41 @@ func BuildD1ClientByType(connectCtx, ctx context.Context, transportType, authori
 		return nil, true, err
 	}
 	return newD1ClientTransport(d1), true, nil
+}
+
+// toD1ServerBuildOptions maps an internal ServerConfig to the public D1 server
+// BuildOptions, dropping above-the-seam concerns (tap, stats, socket buffers,
+// shared write buffer, channelz, static-window policy).
+func toD1ServerBuildOptions(config *ServerConfig) expserver.BuildOptions {
+	if config == nil {
+		return expserver.BuildOptions{}
+	}
+	return expserver.BuildOptions{
+		Credentials:           config.Credentials,
+		ConnectionTimeout:     config.ConnectionTimeout,
+		MaxConcurrentStreams:  config.MaxStreams,
+		Keepalive:             config.KeepaliveParams,
+		KeepalivePolicy:       config.KeepalivePolicy,
+		InitialWindowSize:     normalizeWindow(config.InitialWindowSize),
+		InitialConnWindowSize: normalizeWindow(config.InitialConnWindowSize),
+		MaxHeaderListSize:     config.MaxHeaderListSize,
+		HeaderTableSize:       config.HeaderTableSize,
+		BufferPool:            config.BufferPool,
+	}
+}
+
+// BuildD1ServerByType looks up an experimental D1 server transport builder for
+// transportType and, if found, builds and wraps it as an internal
+// ServerTransport. The bool reports whether an experimental builder was found,
+// so the caller can fall through to the POC registry / HTTP/2 when false.
+func BuildD1ServerByType(conn net.Conn, transportType string, config *ServerConfig) (ServerTransport, bool, error) {
+	b := expserver.Get(transportType)
+	if b == nil {
+		return nil, false, nil
+	}
+	st, err := b.Build(conn, toD1ServerBuildOptions(config))
+	if err != nil {
+		return nil, true, err
+	}
+	return newD1ServerTransport(st), true, nil
 }

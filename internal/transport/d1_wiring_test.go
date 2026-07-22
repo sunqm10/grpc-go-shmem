@@ -21,12 +21,17 @@ package transport
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	expclient "google.golang.org/grpc/experimental/transport/client"
+	expserver "google.golang.org/grpc/experimental/transport/server"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/resolver"
 )
 
@@ -157,5 +162,83 @@ func TestBuildD1ClientByType(t *testing.T) {
 	tr3, found3, err3 := BuildD1ClientByType(context.Background(), context.Background(), "test-d1-err", "", resolver.Address{}, ConnectOptions{}, nil)
 	if !found3 || err3 == nil || tr3 != nil {
 		t.Errorf("failing builder: found=%v err=%v tr=%v, want found=true/err!=nil/tr=nil", found3, err3, tr3)
+	}
+}
+
+func TestToD1ServerBuildOptions(t *testing.T) {
+	if got := toD1ServerBuildOptions(nil); got.MaxConcurrentStreams != 0 || got.InitialWindowSize != 0 {
+		t.Errorf("nil config must yield zero options, got %+v", got)
+	}
+	mhl := uint32(2048)
+	hts := uint32(4096)
+	tc := insecure.NewCredentials()
+	pool := mem.DefaultBufferPool()
+	got := toD1ServerBuildOptions(&ServerConfig{
+		MaxStreams:            100,
+		ConnectionTimeout:     5 * time.Second,
+		Credentials:           tc,
+		KeepaliveParams:       keepalive.ServerParameters{MaxConnectionIdle: 7 * time.Second},
+		KeepalivePolicy:       keepalive.EnforcementPolicy{MinTime: 3 * time.Second},
+		InitialWindowSize:     1024, // sub-default -> 0
+		InitialConnWindowSize: 1048576,
+		MaxHeaderListSize:     &mhl,
+		HeaderTableSize:       &hts,
+		BufferPool:            pool,
+	})
+	if got.MaxConcurrentStreams != 100 {
+		t.Errorf("MaxStreams->MaxConcurrentStreams: got %d", got.MaxConcurrentStreams)
+	}
+	if got.ConnectionTimeout != 5*time.Second {
+		t.Errorf("ConnectionTimeout: got %v", got.ConnectionTimeout)
+	}
+	if got.Credentials != tc {
+		t.Errorf("Credentials not passed through")
+	}
+	if got.Keepalive.MaxConnectionIdle != 7*time.Second {
+		t.Errorf("Keepalive: got %+v", got.Keepalive)
+	}
+	if got.KeepalivePolicy.MinTime != 3*time.Second {
+		t.Errorf("KeepalivePolicy: got %+v", got.KeepalivePolicy)
+	}
+	if got.InitialWindowSize != 0 {
+		t.Errorf("sub-default window must normalize to 0, got %d", got.InitialWindowSize)
+	}
+	if got.InitialConnWindowSize != 1048576 {
+		t.Errorf("conn window: got %d", got.InitialConnWindowSize)
+	}
+	if got.MaxHeaderListSize != &mhl {
+		t.Errorf("MaxHeaderListSize pointer not passed through")
+	}
+	if got.HeaderTableSize != &hts {
+		t.Errorf("HeaderTableSize pointer not passed through")
+	}
+	if got.BufferPool == nil {
+		t.Errorf("BufferPool not passed through")
+	}
+}
+
+var d1ServerRegisterOnce sync.Once
+
+type fakeD1ServerBuilder struct{}
+
+func (fakeD1ServerBuilder) Build(conn net.Conn, opts expserver.BuildOptions) (expserver.ServerTransport, error) {
+	return fakeD1ServerTransport{}, nil
+}
+
+func TestBuildD1ServerByType(t *testing.T) {
+	// Unregistered: not found, no error -> caller falls through.
+	if _, found, err := BuildD1ServerByType(nil, "nope-srv-unregistered", nil); found || err != nil {
+		t.Errorf("unregistered server type: found=%v err=%v", found, err)
+	}
+	d1ServerRegisterOnce.Do(func() { expserver.Register("test-d1-srv", fakeD1ServerBuilder{}) })
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	st, found2, err2 := BuildD1ServerByType(c1, "test-d1-srv", &ServerConfig{})
+	if !found2 || err2 != nil {
+		t.Fatalf("registered server type: found=%v err=%v", found2, err2)
+	}
+	if _, ok := st.(*d1ServerTransport); !ok {
+		t.Errorf("expected wrapped *d1ServerTransport, got %T", st)
 	}
 }

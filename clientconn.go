@@ -1530,14 +1530,26 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 	var newTr transport.ClientTransport
 	var err error
 
+	// Experimental self-contained (D1) pluggable transport: consult the
+	// experimental registry first. It only handles types registered there; when
+	// it does not (found==false), selection falls through to the existing POC
+	// registry / attribute-based SHM / HTTP/2 paths below, keeping this additive.
+	if addr.TransportType != "" {
+		if d1tr, found, d1err := transport.BuildD1ClientByType(connectCtx, ac.cc.ctx, addr.TransportType, ac.cc.authority, addr, copts, onClose); found {
+			newTr, err = d1tr, d1err
+		}
+	}
+
 	// Pluggable transport selection (L37-style): if the resolved address names a
 	// registered transport type, build it via the registry; otherwise fall back
 	// to attribute-based shm selection / default HTTP/2.
 	var pluggable transportclient.Builder
-	if addr.TransportType != "" {
+	if addr.TransportType != "" && newTr == nil && err == nil {
 		pluggable = transportclient.Get(addr.TransportType)
 	}
-	if pluggable != nil {
+	if newTr != nil || err != nil {
+		// Already handled by the experimental D1 transport above.
+	} else if pluggable != nil {
 		newTr, err = pluggable.Build(connectCtx, ac.cc.ctx, addr, transportclient.BuildOptions{ConnectOptions: copts, OnClose: onClose})
 	} else if transport.IsShmEnabled(addr) {
 		// Try shm transport first

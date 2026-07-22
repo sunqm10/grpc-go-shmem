@@ -47,10 +47,12 @@ func Register(name string, b Builder) {
 
 // Get returns the Builder registered under name, or nil if none is registered.
 //
-// Note: the grpc-go SELECTION layer (not Get itself) treats a non-empty
-// resolver.Address.TransportType with NO registered Builder as a hard
-// connection error (fail closed), never a silent fallback to the default
-// transport.
+// Note: during the experimental coexistence phase, a non-empty
+// resolver.Address.TransportType not found here falls through to the other
+// selection paths (the in-tree POC registry, attribute-based SHM, or the default
+// HTTP/2 transport). The intended end state, once this registry is the sole
+// selector, is fail-closed: an unknown non-empty type becomes a hard connection
+// error rather than a silent fallback.
 func Get(name string) Builder {
 	registryMu.RLock()
 	defer registryMu.RUnlock()
