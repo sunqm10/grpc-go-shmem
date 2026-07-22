@@ -67,6 +67,17 @@ func NewListener(inner net.Listener) *Listener {
 	return &Listener{Listener: inner}
 }
 
+// Listen creates a shared-memory listener for the given segment name and wraps
+// it so grpc-go's server dispatch routes accepted connections to this plugin's
+// server Builder. Pass the result to grpc.Server.Serve.
+func Listen(name string) (net.Listener, error) {
+	lis, err := engine.NewShmListener(&engine.ShmAddr{Name: name}, engine.DefaultSegmentSize, engine.DefaultRingASize, engine.DefaultRingBSize)
+	if err != nil {
+		return nil, err
+	}
+	return NewListener(lis), nil
+}
+
 // Accept accepts the next connection and tags it with the shmsc transport type.
 func (l *Listener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()

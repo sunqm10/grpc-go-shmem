@@ -51,12 +51,15 @@ func DialClient(connectCtx context.Context, addr string, opts client.BuildOption
 	if opts.InitialConnWindowSize > 0 && opts.InitialConnWindowSize <= maxWindowSize {
 		dopts.InitialConnWindowSize = int32(opts.InitialConnWindowSize)
 	}
-	// A non-nil TransportCredentials selects the SHM security handshake. The
-	// handshake installs the ShmAuthInfo the client transport reports via
-	// SecurityInfo/Peer. A nil credential leaves the connection insecure.
-	if opts.TransportCredentials != nil {
-		dopts.Handshaker = DefaultShmHandshaker()
-	}
+	// NOTE: the SHM nonce security handshake is a V1 opt-in that must be enabled
+	// SYMMETRICALLY on the dialer (DialOptions.Handshaker) and the listener
+	// (ShmListener.SetHandshaker). It is deliberately NOT keyed off
+	// TransportCredentials: grpc-go passes a non-nil insecure credential for an
+	// insecure channel, and triggering a client-only handshake the server never
+	// answers would deadlock the dial. Wiring real transport security through the
+	// D1 credentials is a follow-up; for now an insecure channel performs no
+	// handshake and SecurityInfo reports InvalidSecurityLevel (fail-closed).
+	_ = opts.TransportCredentials
 	t, err := DialShm(connectCtx, addr, dopts)
 	if err != nil {
 		return nil, err
