@@ -31,6 +31,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -105,9 +106,22 @@ func (t *d1ClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, _ s
 	}
 	s, err := t.inner.NewStream(ctx, d1hdr)
 	if err != nil {
-		return nil, err
+		return nil, translateNewStreamErr(err)
 	}
 	return &d1ClientStream{inner: s}, nil
+}
+
+// translateNewStreamErr maps a public experimental client.NewStreamError (the
+// D1 transparent-retry signal) to the internal *NewStreamError that grpc-go's
+// retry logic asserts on (stream.go). Other errors pass through unchanged. This
+// is the ONLY place the transparent-retry bit crosses from the D1 boundary into
+// core: a self-contained D1 transport cannot construct the internal type.
+func translateNewStreamErr(err error) error {
+	var nse *expclient.NewStreamError
+	if errors.As(err, &nse) {
+		return &NewStreamError{Err: nse.Err, AllowTransparentRetry: nse.AllowTransparentRetry}
+	}
+	return err
 }
 
 // resolveAuthority mirrors the HTTP/2 client's authority handling: an explicit

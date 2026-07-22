@@ -79,6 +79,30 @@ import (
 // clean-teardown guarantee holds.
 var ErrNotApplicable = errors.New("grpc: transport not applicable for this address")
 
+// NewStreamError is an OPTIONAL structured error a ClientTransport MAY return
+// from NewStream to signal whether the failed stream attempt is eligible for
+// TRANSPARENT retry — i.e. the RPC provably never left the client, so grpc-go
+// may safely re-attempt it (on another transport) without violating at-most-once
+// semantics. grpc-go unwraps Err for status classification and honors
+// AllowTransparentRetry.
+//
+// A transport that returns a plain error (not this type) is treated as NOT
+// transparently retryable.
+type NewStreamError struct {
+	// Err is the underlying failure. It SHOULD be a gRPC status error so grpc-go
+	// can classify it; a connection-level failure (closed/draining/GOAWAY)
+	// SHOULD be codes.Unavailable, a context failure codes.Canceled /
+	// codes.DeadlineExceeded.
+	Err error
+	// AllowTransparentRetry reports whether the attempt may be transparently
+	// retried. Set true ONLY when the RPC provably did not reach the server.
+	AllowTransparentRetry bool
+}
+
+func (e *NewStreamError) Error() string { return e.Err.Error() }
+
+func (e *NewStreamError) Unwrap() error { return e.Err }
+
 // GoAwayReason describes why a client transport received a drain (GOAWAY)
 // signal.
 type GoAwayReason int

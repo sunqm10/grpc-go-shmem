@@ -20,6 +20,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -54,6 +55,43 @@ func unavailable(t *testing.T, err error) {
 	}
 	if status.Code(nse.Err) != codes.Unavailable {
 		t.Fatalf("expected UNAVAILABLE, got %v", nse.Err)
+	}
+}
+
+func TestD1TranslateNewStreamErr(t *testing.T) {
+	inner := status.Error(codes.Unavailable, "boom")
+
+	// Public retryable NewStreamError -> internal *NewStreamError, bit preserved.
+	got := translateNewStreamErr(&expclient.NewStreamError{Err: inner, AllowTransparentRetry: true})
+	nse, ok := got.(*NewStreamError)
+	if !ok {
+		t.Fatalf("expected *NewStreamError, got %T", got)
+	}
+	if !nse.AllowTransparentRetry || nse.Err != inner {
+		t.Errorf("translation lost fields: retry=%v err=%v", nse.AllowTransparentRetry, nse.Err)
+	}
+
+	// Non-retryable preserved as false.
+	if nse2, ok := translateNewStreamErr(&expclient.NewStreamError{Err: inner}).(*NewStreamError); !ok || nse2.AllowTransparentRetry {
+		t.Errorf("non-retry translation wrong")
+	}
+
+	// Wrapped: errors.As must still find and translate it.
+	wrapped := fmt.Errorf("ctx: %w", &expclient.NewStreamError{Err: inner, AllowTransparentRetry: true})
+	if nse3, ok := translateNewStreamErr(wrapped).(*NewStreamError); !ok || !nse3.AllowTransparentRetry {
+		t.Errorf("wrapped translation failed")
+	}
+
+	// Plain error passes through unchanged.
+	plain := errors.New("plain")
+	if translateNewStreamErr(plain) != plain {
+		t.Errorf("plain error must pass through unchanged")
+	}
+
+	// Public error Error()/Unwrap() behavior.
+	pub := &expclient.NewStreamError{Err: inner, AllowTransparentRetry: true}
+	if pub.Error() != inner.Error() || !errors.Is(pub, inner) {
+		t.Errorf("NewStreamError Error()/Unwrap() broken: %q is=%v", pub.Error(), errors.Is(pub, inner))
 	}
 }
 
