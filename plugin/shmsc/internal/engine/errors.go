@@ -25,6 +25,16 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// ErrIllegalHeaderWrite indicates that setting header is illegal because of the
+// stream's state (headers already sent, or the stream is done).
+var ErrIllegalHeaderWrite = status.Error(codes.Internal, "transport: SendHeader called multiple times")
+
+// ErrConnClosing indicates that the transport is closing. It is a
+// codes.Unavailable status error so that, when surfaced across the D1 boundary,
+// grpc-go classifies the failed RPC as a retriable Unavailable rather than
+// codes.Unknown (see the error-normalization guardrail).
+var ErrConnClosing = status.Error(codes.Unavailable, "transport is closing")
+
 // ContextErr converts an error from the context package into a gRPC status
 // error.
 //
