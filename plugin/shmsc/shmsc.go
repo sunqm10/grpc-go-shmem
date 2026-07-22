@@ -37,25 +37,13 @@
 // darwin), matching the in-tree SHM transport.
 //
 // STATUS: work in progress. The module boundary + experimental-API wiring are
-// established; the SHM engine is being ported in from the monolith with its own
-// (non-shared) stream types. Not yet functional end to end.
+// established; the SHM engine is ported in from the monolith with its own
+// (non-shared) stream types. The client and server D1 transport builders are
+// registered under Name in builders.go.
 package shmsc
-
-import (
-	transportclient "google.golang.org/grpc/experimental/transport/client"
-	transportserver "google.golang.org/grpc/experimental/transport/server"
-)
 
 // Name is the resolver.Address.TransportType (and server-side accepted-conn
 // transport type) under which this self-contained SHM transport registers. It is
 // deliberately distinct from the in-tree "shm" bridge so both can coexist during
 // development.
 const Name = "shmsc"
-
-// Compile-time proof that the exported, experimental D1 transport API is
-// reachable from this standalone module WITHOUT any internal/* import. The real
-// client + server builders are registered in a later step.
-var (
-	_ = transportclient.Get
-	_ = transportserver.Get
-)
