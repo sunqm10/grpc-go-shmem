@@ -52,9 +52,15 @@ func (f fakeTC) Clone() credentials.TransportCredentials { return f }
 func (f fakeTC) OverrideServerName(string) error        { return nil }
 
 // fakePerRPC is a minimal per-RPC credential that requires transport security.
-type fakePerRPC struct{ requireSec bool }
+type fakePerRPC struct {
+	requireSec bool
+	err        error
+}
 
 func (f fakePerRPC) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
 	return map[string]string{"authorization": "bearer x"}, nil
 }
 func (f fakePerRPC) RequireTransportSecurity() bool { return f.requireSec }
@@ -91,6 +97,26 @@ func TestApplyPerRPCCreds(t *testing.T) {
 	// No credentials: nil, nil.
 	if data, err := (&shmClientTransport{}).applyPerRPCCreds(context.Background(), &client.CallHdr{Method: "/s/m"}); err != nil || data != nil {
 		t.Errorf("no creds should return (nil, nil); got (%v, %v)", data, err)
+	}
+
+	// gRFC A54: a restricted control-plane code from a credential is normalized to Internal.
+	trR := &shmClientTransport{perRPCCreds: []credentials.PerRPCCredentials{fakePerRPC{err: status.Error(codes.FailedPrecondition, "no")}}}
+	if _, err := trR.applyPerRPCCreds(context.Background(), callHdr); status.Code(err) != codes.Internal {
+		t.Errorf("restricted control-plane code should normalize to Internal, got %v", status.Code(err))
+	}
+	// An allowed status code (e.g. Unavailable) passes through unchanged.
+	trA := &shmClientTransport{perRPCCreds: []credentials.PerRPCCredentials{fakePerRPC{err: status.Error(codes.Unavailable, "retry")}}}
+	if _, err := trA.applyPerRPCCreds(context.Background(), callHdr); status.Code(err) != codes.Unavailable {
+		t.Errorf("allowed status code should pass through, got %v", status.Code(err))
+	}
+	// Channel-level plain error -> Unauthenticated; per-call plain error -> Internal.
+	trU := &shmClientTransport{perRPCCreds: []credentials.PerRPCCredentials{fakePerRPC{err: errors.New("boom")}}}
+	if _, err := trU.applyPerRPCCreds(context.Background(), callHdr); status.Code(err) != codes.Unauthenticated {
+		t.Errorf("channel-level plain error should be Unauthenticated, got %v", status.Code(err))
+	}
+	callHdrErr := &client.CallHdr{Method: "/svc/Method", Authority: "authority", CallCredentials: fakePerRPC{err: errors.New("boom")}}
+	if _, err := (&shmClientTransport{}).applyPerRPCCreds(context.Background(), callHdrErr); status.Code(err) != codes.Internal {
+		t.Errorf("per-call plain error should be Internal, got %v", status.Code(err))
 	}
 }
 

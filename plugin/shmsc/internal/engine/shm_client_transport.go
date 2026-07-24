@@ -889,7 +889,16 @@ func (t *shmClientTransport) SetPerRPCCredentials(creds []credentials.PerRPCCred
 // security (t.authInfo != nil => the SHM security handshake ran, yielding
 // PrivacyAndIntegrity). Mirrors the stock HTTP/2 client's getTrAuthData /
 // getCallAuthData so a credential requiring transport security is refused on an
-// insecure channel and non-secure credentials (e.g. bearer tokens) are applied.
+// insecure channel and non-secure credentials (e.g. bearer tokens) are applied,
+// including gRFC A54 restricted-code normalization and the channel-vs-per-call
+// error-code distinction.
+//
+// LIMITATION: credentials.RequestInfo is NOT injected into ctx before
+// GetRequestMetadata. The stock transport uses internal/credentials to attach
+// RequestInfo{Method, AuthInfo}; the D1 API exposes no self-contained way to do
+// so. Credentials that read credentials.RequestInfoFromContext (rather than the
+// audience argument) will not observe the method/AuthInfo. This is a documented
+// consequence of the self-contained boundary.
 func (t *shmClientTransport) applyPerRPCCreds(ctx context.Context, callHdr *client.CallHdr) (map[string]string, error) {
 	if len(t.perRPCCreds) == 0 && callHdr.CallCredentials == nil {
 		return nil, nil
@@ -897,7 +906,7 @@ func (t *shmClientTransport) applyPerRPCCreds(ctx context.Context, callHdr *clie
 	secure := t.authInfo != nil
 	audience := createAudience(callHdr)
 	authData := map[string]string{}
-	apply := func(c credentials.PerRPCCredentials) error {
+	apply := func(c credentials.PerRPCCredentials, perCall bool) error {
 		if c == nil {
 			return nil
 		}
@@ -906,8 +915,18 @@ func (t *shmClientTransport) applyPerRPCCreds(ctx context.Context, callHdr *clie
 		}
 		data, err := c.GetRequestMetadata(ctx, audience)
 		if err != nil {
-			if _, ok := status.FromError(err); ok {
+			if st, ok := status.FromError(err); ok {
+				// gRFC A54: a credential plugin may not use control-plane status
+				// codes; normalize a disallowed code to Internal.
+				if isRestrictedControlPlaneCode(st.Code()) {
+					return status.Errorf(codes.Internal, "shmsc: per-RPC creds returned a disallowed status: %v", err)
+				}
 				return err
+			}
+			// Non-status error: per-call credentials fail Internal, channel-level
+			// credentials fail Unauthenticated (matching the stock HTTP/2 client).
+			if perCall {
+				return status.Errorf(codes.Internal, "shmsc: per-call creds failed: %v", err)
 			}
 			return status.Errorf(codes.Unauthenticated, "shmsc: per-RPC creds failed: %v", err)
 		}
@@ -917,14 +936,26 @@ func (t *shmClientTransport) applyPerRPCCreds(ctx context.Context, callHdr *clie
 		return nil
 	}
 	for _, c := range t.perRPCCreds {
-		if err := apply(c); err != nil {
+		if err := apply(c, false); err != nil {
 			return nil, err
 		}
 	}
-	if err := apply(callHdr.CallCredentials); err != nil {
+	if err := apply(callHdr.CallCredentials, true); err != nil {
 		return nil, err
 	}
 	return authData, nil
+}
+
+// isRestrictedControlPlaneCode reports whether a status code is one a per-RPC
+// credential plugin may not use, per gRFC A54. Such codes are normalized to
+// Internal so a credential cannot inject a control-plane code into the RPC.
+func isRestrictedControlPlaneCode(c codes.Code) bool {
+	switch c {
+	case codes.InvalidArgument, codes.NotFound, codes.AlreadyExists,
+		codes.FailedPrecondition, codes.Aborted, codes.OutOfRange, codes.DataLoss:
+		return true
+	}
+	return false
 }
 
 // createAudience builds the audience URI a per-RPC credential is scoped to,
@@ -1258,7 +1289,14 @@ func (t *shmClientTransport) processIncomingData(ctx context.Context) {
 				if db := trailerMap["grpc-status-details-bin"]; len(db) > 0 {
 					var sp spb.Status
 					if uerr := proto.Unmarshal([]byte(db[0]), &sp); uerr == nil {
-						st = status.FromProto(&sp)
+						// The details proto's code MUST agree with the explicit
+						// grpc-status code; a mismatch is a protocol error (stock
+						// gRPC returns Internal) and the untrusted details are dropped.
+						if uint32(sp.GetCode()) == tr.GRPCStatusCode {
+							st = status.FromProto(&sp)
+						} else {
+							st = status.New(codes.Internal, "shmsc: server returned status details with a code that does not match the grpc-status")
+						}
 					}
 				}
 				if st == nil {
