@@ -69,6 +69,12 @@ type shmServerTransport struct {
 	remoteAddr net.Addr
 	peer       *peer.Peer
 
+	// onClose, if set (by the server Builder), is invoked once at the end of
+	// Close to release the accepted connection's listener-owned resources
+	// (active-segments entry, event refs, segment unlink). grpc-go closes only
+	// the transport after serving, so without this the connection would leak.
+	onClose func()
+
 	// Lifecycle management
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1430,6 +1436,13 @@ func (t *shmServerTransport) Close(err error) {
 
 		// Signal closure
 		close(t.errCh)
+
+		// Release the accepted connection's listener-owned resources (the
+		// server Builder wires this to the shmConn cleanup). Runs once via
+		// closeOnce; the callback is itself idempotent.
+		if t.onClose != nil {
+			t.onClose()
+		}
 	})
 }
 

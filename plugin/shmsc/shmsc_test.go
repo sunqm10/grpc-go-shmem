@@ -30,9 +30,9 @@ import (
 	"testing"
 )
 
-// linknameRe matches a //go:linkname directive and captures its target symbol
-// (the second argument, when present).
-var linknameRe = regexp.MustCompile(`(?m)^//go:linkname\s+\S+\s+(\S+)`)
+// linknameRe matches a //go:linkname directive, capturing the local name and
+// the optional target symbol (absent in the one-argument push form).
+var linknameRe = regexp.MustCompile(`(?m)^//go:linkname\s+(\S+)(?:\s+(\S+))?`)
 
 // TestNoInternalImports enforces the self-containment invariant that defines
 // this module: no source file may import ANOTHER module's internal package
@@ -76,12 +76,18 @@ func TestNoInternalImports(t *testing.T) {
 				t.Errorf("%s imports forbidden internal package %q: this module must be self-contained", path, p)
 			}
 		}
-		// //go:linkname may only target the Go runtime. A directive that links to
-		// any other package (e.g. a grpc internal symbol) is hidden linkage the
-		// import check above cannot detect, and would break self-containment.
+		// //go:linkname may only target the Go runtime with an EXPLICIT two-argument
+		// runtime.* target. Any other form is hidden linkage the import check above
+		// cannot see: the one-argument push form exposes a local symbol for another
+		// package to link by name, and a two-argument non-runtime target links
+		// directly into another package — both would break self-containment.
 		for _, m := range linknameRe.FindAllStringSubmatch(string(src), -1) {
-			target := m[1]
-			if strings.Contains(target, ".") && !strings.HasPrefix(target, "runtime.") {
+			target := m[2]
+			if target == "" {
+				t.Errorf("%s: one-argument //go:linkname %q is not allowed; only an explicit runtime.* target is permitted", path, m[1])
+				continue
+			}
+			if !strings.HasPrefix(target, "runtime.") {
 				t.Errorf("%s: //go:linkname targets non-runtime symbol %q; only the Go runtime may be linked", path, target)
 			}
 		}

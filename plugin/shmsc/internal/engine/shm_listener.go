@@ -109,6 +109,7 @@ type shmConn struct {
 	established      atomic.Bool
 	closed           atomic.Bool
 	closeOnce        sync.Once
+	cleanupOnce      sync.Once
 	singleStreamMode bool
 
 	// Security handshake result
@@ -543,15 +544,37 @@ func (c *shmConn) Write(_ []byte) (n int, err error) {
 	return 0, fmt.Errorf("shmConn.Write: %w (use the embedded shmServerTransport instead)", io.ErrClosedPipe)
 }
 
-// Close closes the connection
+// Close closes the connection: it shuts down the server transport (which, via
+// the onClose hook the server Builder registers, also runs cleanup) and then
+// runs cleanup directly as a fallback. Both steps are idempotent.
 func (c *shmConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closed.Store(true)
-
-		// Close transport first (graceful shutdown)
+		// Close transport first (graceful shutdown). The transport's Close
+		// invokes the registered onClose == c.cleanup at its end.
 		if c.transport != nil {
 			c.transport.Close(errors.New("connection closed"))
 		}
+		// Fallback in case no transport / onClose was wired (idempotent).
+		c.cleanup()
+	})
+	return nil
+}
+
+// cleanup releases the listener-owned, per-connection resources: the
+// active-segments map entry, the listener-owned ring event refs, and the named
+// data segment (unmap + unlink) plus its handshake events. It is idempotent and
+// MUST NOT call transport.Close — it is invoked FROM the server transport's
+// Close (via the onClose hook the server Builder registers), so re-entering
+// transport.Close would recurse.
+//
+// Wiring cleanup to the transport's Close is what prevents a per-connection
+// segment / event-handle / map-entry leak: grpc-go's server tears down only the
+// transport (st.Close) after serving a connection and never calls the raw
+// conn's Close, so without this hook every completed connection would be
+// retained until the entire listener closed.
+func (c *shmConn) cleanup() {
+	c.cleanupOnce.Do(func() {
+		c.closed.Store(true)
 
 		// Remove from listener's active segments
 		if c.listener != nil && c.segmentName != "" {
@@ -560,15 +583,9 @@ func (c *shmConn) Close() error {
 			c.listener.mu.Unlock()
 		}
 
-		// Release the listener-owned ring event refs. These were
-		// taken in ShmListener.Accept (one ref each from
-		// CreateRingEvents). The server transport holds its own,
-		// independent ref pair via newShmServerTransport and
-		// releases them in (*shmServerTransport).Close above. On
-		// Linux these are no-op nil events; on Windows skipping
-		// this leaks named-event handles and registry entries per
-		// accepted connection. See shm_event_windows.go for the
-		// refcount contract.
+		// Release the listener-owned ring event refs (taken in Accept). On
+		// Linux these are no-op nil events; on Windows skipping this leaks
+		// named-event handles and registry entries per accepted connection.
 		if c.readEvents != nil {
 			_ = c.readEvents.Close()
 			c.readEvents = nil
@@ -578,7 +595,7 @@ func (c *shmConn) Close() error {
 			c.writeEvents = nil
 		}
 
-		// Then close and clean up the segment
+		// Close (idempotent) and unlink the segment.
 		if c.segment != nil {
 			c.segment.Close()
 		}
@@ -587,7 +604,6 @@ func (c *shmConn) Close() error {
 			_ = RemoveSegment(c.segmentName)
 		}
 	})
-	return nil
 }
 
 // LocalAddr returns the local network address

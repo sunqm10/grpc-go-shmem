@@ -231,6 +231,11 @@ type shmClientTransport struct {
 
 	// authInfo stores the authentication information from security handshake.
 	authInfo credentials.AuthInfo
+
+	// perRPCCreds are the channel-level per-RPC credentials (from D1
+	// BuildOptions.PerRPCCredentials), applied to every outgoing RPC's request
+	// metadata in addition to any per-call credential on the CallHdr.
+	perRPCCreds []credentials.PerRPCCredentials
 }
 
 func (t *shmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -871,6 +876,68 @@ func (t *shmClientTransport) GetAuthInfo() credentials.AuthInfo {
 	return t.authInfo
 }
 
+// SetPerRPCCredentials installs the channel-level per-RPC credentials applied to
+// every outgoing RPC. Set once at construction (before any stream), so no lock.
+func (t *shmClientTransport) SetPerRPCCredentials(creds []credentials.PerRPCCredentials) {
+	t.perRPCCreds = creds
+}
+
+// applyPerRPCCreds gathers the outgoing request metadata contributed by the
+// channel-level per-RPC credentials and any per-call credential on callHdr,
+// enforcing RequireTransportSecurity fail-closed against the connection's actual
+// security (t.authInfo != nil => the SHM security handshake ran, yielding
+// PrivacyAndIntegrity). Mirrors the stock HTTP/2 client's getTrAuthData /
+// getCallAuthData so a credential requiring transport security is refused on an
+// insecure channel and non-secure credentials (e.g. bearer tokens) are applied.
+func (t *shmClientTransport) applyPerRPCCreds(ctx context.Context, callHdr *client.CallHdr) (map[string]string, error) {
+	if len(t.perRPCCreds) == 0 && callHdr.CallCredentials == nil {
+		return nil, nil
+	}
+	secure := t.authInfo != nil
+	audience := createAudience(callHdr)
+	authData := map[string]string{}
+	apply := func(c credentials.PerRPCCredentials) error {
+		if c == nil {
+			return nil
+		}
+		if c.RequireTransportSecurity() && !secure {
+			return status.Error(codes.Unauthenticated, "shmsc: per-RPC credentials require transport security, which the insecure shared-memory connection cannot provide")
+		}
+		data, err := c.GetRequestMetadata(ctx, audience)
+		if err != nil {
+			if _, ok := status.FromError(err); ok {
+				return err
+			}
+			return status.Errorf(codes.Unauthenticated, "shmsc: per-RPC creds failed: %v", err)
+		}
+		for k, v := range data {
+			authData[strings.ToLower(k)] = v // capital header names are illegal in HTTP/2
+		}
+		return nil
+	}
+	for _, c := range t.perRPCCreds {
+		if err := apply(c); err != nil {
+			return nil, err
+		}
+	}
+	if err := apply(callHdr.CallCredentials); err != nil {
+		return nil, err
+	}
+	return authData, nil
+}
+
+// createAudience builds the audience URI a per-RPC credential is scoped to,
+// matching the stock HTTP/2 client: "https://" + authority + the method path
+// without its trailing method name.
+func createAudience(callHdr *client.CallHdr) string {
+	host := strings.TrimSuffix(callHdr.Authority, ":443")
+	pos := strings.LastIndex(callHdr.Method, "/")
+	if pos == -1 {
+		pos = len(callHdr.Method)
+	}
+	return "https://" + host + callHdr.Method[:pos]
+}
+
 // processIncomingData reads data from the server->client ring and processes gRPC frames
 func (t *shmClientTransport) processIncomingData(ctx context.Context) {
 	if shmDebugEnabled {
@@ -1384,12 +1451,13 @@ func (t *shmClientTransport) NewStream(ctx context.Context, callHdr *client.Call
 	if t.closed.Load() || t.draining.Load() {
 		return nil, &client.NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
-	// Fail-closed on a per-call credential that requires transport security when
-	// the connection is not secure (t.authInfo == nil => SecurityInfo reports
-	// InvalidSecurityLevel). Silently proceeding would let authorization
-	// metadata ride an unsecured channel, violating the D1 SecurityInfo contract.
-	if cc := callHdr.CallCredentials; cc != nil && cc.RequireTransportSecurity() && t.authInfo == nil {
-		return nil, &client.NewStreamError{Err: status.Error(codes.Unauthenticated, "shmsc: call credentials require transport security, which the insecure shared-memory connection cannot provide")}
+	// Apply per-RPC credentials (channel-level + per-call) to the outgoing
+	// request metadata, enforcing RequireTransportSecurity fail-closed. Computed
+	// before the stream is created so a credential failure aborts cleanly, before
+	// any stream state or quota is taken.
+	authData, credErr := t.applyPerRPCCreds(ctx, callHdr)
+	if credErr != nil {
+		return nil, &client.NewStreamError{Err: credErr}
 	}
 
 	firstTry := true
@@ -1558,6 +1626,12 @@ func (t *shmClientTransport) NewStream(ctx context.Context, callHdr *client.Call
 			kvs = append(kvs, KV{Key: k, Values: byteVals})
 		}
 	}
+	// Per-RPC credential metadata (computed above, before stream creation).
+	for k, v := range authData {
+		if !hasKey(k) {
+			kvs = append(kvs, KV{Key: k, Values: [][]byte{[]byte(v)}})
+		}
+	}
 	// Add gRPC-required/expected metadata fields if not already present.
 	if !hasKey("content-type") {
 		kvs = append(kvs, KV{Key: "content-type", Values: [][]byte{[]byte(grpcContentType(callHdr.ContentSubtype))}})
@@ -1592,12 +1666,9 @@ func (t *shmClientTransport) NewStream(ctx context.Context, callHdr *client.Call
 	if callHdr.PreviousAttempts > 0 && !hasKey("grpc-previous-rpc-attempts") {
 		kvs = append(kvs, KV{Key: "grpc-previous-rpc-attempts", Values: [][]byte{[]byte(strconv.Itoa(callHdr.PreviousAttempts))}})
 	}
-	// TODO(step7): apply callHdr.CallCredentials (in addition to
-	// BuildOptions.PerRPCCredentials) when forming outgoing request metadata,
-	// rejecting a credential whose RequireTransportSecurity is true unless
-	// SecurityInfo reports a secure connection. Deferred to the security
-	// bootstrap step; this transport is not activated via the plugin builder
-	// until then.
+	// Per-RPC credential metadata (both channel-level BuildOptions.
+	// PerRPCCredentials and per-call callHdr.CallCredentials) was applied above
+	// via applyPerRPCCreds and merged into kvs before this point.
 	hdr := HeadersV1{
 		Version:          1,
 		HdrType:          0, // client-initial

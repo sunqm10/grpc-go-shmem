@@ -62,18 +62,14 @@ func DialClient(connectCtx context.Context, addr string, opts client.BuildOption
 	if tc := opts.TransportCredentials; tc != nil && tc.Info().SecurityProtocol != "insecure" {
 		return nil, fmt.Errorf("shmsc: transport security %q is not supported; the shared-memory transport supports only an insecure channel in this version", tc.Info().SecurityProtocol)
 	}
-	// Per-RPC credentials that require transport security cannot be satisfied on
-	// the insecure SHM channel; reject them fail-closed (D1 SecurityInfo contract)
-	// rather than silently dropping the authorization metadata.
-	for _, prc := range opts.PerRPCCredentials {
-		if prc != nil && prc.RequireTransportSecurity() {
-			return nil, fmt.Errorf("shmsc: a per-RPC credential requires transport security, which the insecure shared-memory channel cannot provide")
-		}
-	}
 	t, err := DialShm(connectCtx, addr, dopts)
 	if err != nil {
 		return nil, err
 	}
+	// Channel-level per-RPC credentials are applied per outgoing RPC in
+	// NewStream, which enforces RequireTransportSecurity fail-closed against the
+	// connection's actual security level and forms their request metadata.
+	t.SetPerRPCCredentials(opts.PerRPCCredentials)
 	if opts.OnClose != nil {
 		oc := opts.OnClose
 		t.SetOnClose(func(gi GoAwayInfo) { oc(client.CloseInfo{Err: gi.Err}) })
@@ -99,6 +95,11 @@ func BuildServer(conn net.Conn, opts server.BuildOptions) (server.ServerTranspor
 	if t == nil {
 		return nil, fmt.Errorf("shmsc: shared-memory connection has no server transport")
 	}
+	// Wire the connection cleanup to transport close: grpc-go closes only the
+	// server transport (not the raw conn) after serving, so the accepted
+	// connection's segment/events/map-entry would otherwise leak until the
+	// listener closes.
+	t.onClose = sc.cleanup
 	t.ApplyServerBuildOptions(opts)
 	return t, nil
 }
