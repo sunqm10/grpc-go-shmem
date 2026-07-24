@@ -44,6 +44,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -938,6 +939,16 @@ func createAudience(callHdr *client.CallHdr) string {
 	return "https://" + host + callHdr.Method[:pos]
 }
 
+// normalizeStatusCode maps a wire gRPC status code to a valid codes.Code,
+// mapping any value outside the defined range (0..16) to codes.Unknown so a
+// malformed peer cannot surface an arbitrary enum value to the application.
+func normalizeStatusCode(c uint32) codes.Code {
+	if c > uint32(codes.Unauthenticated) {
+		return codes.Unknown
+	}
+	return codes.Code(c)
+}
+
 // processIncomingData reads data from the server->client ring and processes gRPC frames
 func (t *shmClientTransport) processIncomingData(ctx context.Context) {
 	if shmDebugEnabled {
@@ -1239,14 +1250,24 @@ func (t *shmClientTransport) processIncomingData(ctx context.Context) {
 					}
 				}
 
-				// Convert status
+				// Reconstruct status: prefer the rich google.rpc.Status carried in
+				// grpc-status-details-bin (preserving status.WithDetails); else
+				// build from the code+message. An out-of-range wire code is
+				// normalized to Unknown rather than surfaced as an arbitrary value.
 				var st *status.Status
-				if tr.GRPCStatusCode != 0 {
-					st = status.New(codes.Code(tr.GRPCStatusCode), tr.GRPCStatusMsg)
-					err = st.Err()
-				} else {
-					st = status.New(codes.OK, "")
+				if db := trailerMap["grpc-status-details-bin"]; len(db) > 0 {
+					var sp spb.Status
+					if uerr := proto.Unmarshal([]byte(db[0]), &sp); uerr == nil {
+						st = status.FromProto(&sp)
+					}
+				}
+				if st == nil {
+					st = status.New(normalizeStatusCode(tr.GRPCStatusCode), tr.GRPCStatusMsg)
+				}
+				if st.Code() == codes.OK {
 					err = io.EOF
+				} else {
+					err = st.Err()
 				}
 
 				// Close the stream with trailers

@@ -1784,11 +1784,23 @@ func (t *shmServerTransport) writeStatus(s *shmServerStream, st *status.Status) 
 
 	var kvs []KV
 	for k, vals := range trMD {
+		if k == "grpc-status-details-bin" {
+			continue // replaced by the authoritative status proto below
+		}
 		var byteVals [][]byte
 		for _, v := range vals {
 			byteVals = append(byteVals, []byte(v))
 		}
 		kvs = append(kvs, KV{Key: k, Values: byteVals})
+	}
+	// grpc-status-details-bin: carry rich status.WithDetails as the marshaled
+	// google.rpc.Status so it survives to the client (the D1 adapter forwards the
+	// status unchanged, so the transport owns this). It replaces any user-supplied
+	// value (stock HTTP/2 behavior) and is emitted only when details are present.
+	if p := st.Proto(); p != nil && len(p.GetDetails()) > 0 {
+		if b, mErr := proto.Marshal(p); mErr == nil {
+			kvs = append(kvs, KV{Key: "grpc-status-details-bin", Values: [][]byte{b}})
+		}
 	}
 
 	// Create trailers frame
