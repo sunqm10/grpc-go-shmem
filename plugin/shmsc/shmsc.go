@@ -36,10 +36,42 @@
 // those OSes; the module is not expected to build for other platforms (e.g.
 // darwin), matching the in-tree SHM transport.
 //
-// STATUS: work in progress. The module boundary + experimental-API wiring are
-// established; the SHM engine is ported in from the monolith with its own
-// (non-shared) stream types. The client and server D1 transport builders are
-// registered under Name in builders.go.
+// STATUS: functional. A gRPC client and server can select this transport end to
+// end through the exported D1 registries (client via
+// resolver.Address.TransportType == Name, server via the tagged Listener), and
+// exchange unary + streaming RPCs — including metadata, trailers, rich status
+// (status.WithDetails), flow control, deadlines/cancellation, GOAWAY/graceful
+// close, keepalive, and per-RPC credentials — with the module importing NO
+// google.golang.org/grpc/internal/* package (enforced by the guard test).
+//
+// # Known limitations
+//
+// This is a first, experimental, insecure-focused transport. The following are
+// deliberate, documented gaps rather than bugs:
+//
+//   - Transport security: only an insecure channel is supported. A non-insecure
+//     TransportCredentials is REJECTED fail-closed by the builder (it is never
+//     silently downgraded). Per-RPC credentials are applied, and one that
+//     requires transport security is rejected on the insecure channel. The
+//     built-in SHM nonce handshake is a separate, symmetric opt-in.
+//   - credentials.RequestInfo is not injected into the context before a per-RPC
+//     credential's GetRequestMetadata (the stock transport uses
+//     internal/credentials for this; the D1 API exposes no self-contained way).
+//     Credentials that read RequestInfoFromContext instead of the audience
+//     argument will not observe the method/AuthInfo.
+//   - Transport-level stats events (OutHeader/InHeader/InTrailer) are not
+//     forwarded; grpc-go's payload and lifecycle stats still fire.
+//   - These D1 BuildOptions are not honored: UserAgent, Dialer, BufferPool,
+//     MaxHeaderListSize, server HeaderTableSize (the SHM framing does not use
+//     HPACK), server ConnectionTimeout, and server Keepalive/KeepalivePolicy
+//     from BuildOptions (server keepalive uses the listener configuration).
+//   - Malformed inbound frames surface a stream error but do not force
+//     connection-level termination; this transport assumes a trusted, same-host
+//     peer (both endpoints share the segment).
+//   - The engine uses one //go:linkname against the Go runtime
+//     (runtime.procyield), on the spin path which is disabled by default.
+//   - go.mod uses a development replace directive for grpc-go; independent
+//     publication requires a released grpc-go version that exports the D1 API.
 package shmsc
 
 // Name is the resolver.Address.TransportType (and server-side accepted-conn
