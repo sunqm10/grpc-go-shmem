@@ -1384,6 +1384,13 @@ func (t *shmClientTransport) NewStream(ctx context.Context, callHdr *client.Call
 	if t.closed.Load() || t.draining.Load() {
 		return nil, &client.NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
+	// Fail-closed on a per-call credential that requires transport security when
+	// the connection is not secure (t.authInfo == nil => SecurityInfo reports
+	// InvalidSecurityLevel). Silently proceeding would let authorization
+	// metadata ride an unsecured channel, violating the D1 SecurityInfo contract.
+	if cc := callHdr.CallCredentials; cc != nil && cc.RequireTransportSecurity() && t.authInfo == nil {
+		return nil, &client.NewStreamError{Err: status.Error(codes.Unauthenticated, "shmsc: call credentials require transport security, which the insecure shared-memory connection cannot provide")}
+	}
 
 	firstTry := true
 	var ch chan struct{}

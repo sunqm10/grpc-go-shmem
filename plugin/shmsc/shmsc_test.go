@@ -22,10 +22,17 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// linknameRe matches a //go:linkname directive and captures its target symbol
+// (the second argument, when present).
+var linknameRe = regexp.MustCompile(`(?m)^//go:linkname\s+\S+\s+(\S+)`)
 
 // TestNoInternalImports enforces the self-containment invariant that defines
 // this module: no source file may import ANOTHER module's internal package
@@ -34,10 +41,10 @@ import (
 // OWN internal packages (google.golang.org/grpc/plugin/shmsc/internal/...) are
 // allowed.
 //
-// This is a DIRECT-import guard: it parses import statements only. It does not
-// (and cannot via the AST) detect hidden linkage such as go:linkname; the engine
-// intentionally uses go:linkname against the Go runtime (not any gRPC internal
-// package), which is fine.
+// It also enforces that the only hidden linkage (//go:linkname) targets the Go
+// runtime, never another module's package — the one thing the AST import check
+// cannot see. It parses every checked-in .go file regardless of build tags, so a
+// platform-specific file cannot smuggle in a forbidden dependency.
 func TestNoInternalImports(t *testing.T) {
 	const ownModulePrefix = "google.golang.org/grpc/plugin/shmsc/"
 	fset := token.NewFileSet()
@@ -48,17 +55,34 @@ func TestNoInternalImports(t *testing.T) {
 		if d.IsDir() || !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		f, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		src, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		f, perr := parser.ParseFile(fset, path, src, parser.ImportsOnly)
 		if perr != nil {
 			return perr
 		}
 		for _, imp := range f.Imports {
-			p := strings.Trim(imp.Path.Value, `"`)
+			p, uerr := strconv.Unquote(imp.Path.Value)
+			if uerr != nil {
+				t.Errorf("%s: unparseable import literal %s", path, imp.Path.Value)
+				continue
+			}
 			// A ".../internal" or ".../internal/..." path belonging to ANOTHER
 			// module is forbidden; this module's own internal packages are fine.
 			isInternal := p == "internal" || strings.HasSuffix(p, "/internal") || strings.Contains(p, "/internal/")
 			if isInternal && !strings.HasPrefix(p, ownModulePrefix) {
 				t.Errorf("%s imports forbidden internal package %q: this module must be self-contained", path, p)
+			}
+		}
+		// //go:linkname may only target the Go runtime. A directive that links to
+		// any other package (e.g. a grpc internal symbol) is hidden linkage the
+		// import check above cannot detect, and would break self-containment.
+		for _, m := range linknameRe.FindAllStringSubmatch(string(src), -1) {
+			target := m[1]
+			if strings.Contains(target, ".") && !strings.HasPrefix(target, "runtime.") {
+				t.Errorf("%s: //go:linkname targets non-runtime symbol %q; only the Go runtime may be linked", path, target)
 			}
 		}
 		return nil

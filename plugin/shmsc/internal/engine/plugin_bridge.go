@@ -51,15 +51,25 @@ func DialClient(connectCtx context.Context, addr string, opts client.BuildOption
 	if opts.InitialConnWindowSize > 0 && opts.InitialConnWindowSize <= maxWindowSize {
 		dopts.InitialConnWindowSize = int32(opts.InitialConnWindowSize)
 	}
-	// NOTE: the SHM nonce security handshake is a V1 opt-in that must be enabled
-	// SYMMETRICALLY on the dialer (DialOptions.Handshaker) and the listener
-	// (ShmListener.SetHandshaker). It is deliberately NOT keyed off
-	// TransportCredentials: grpc-go passes a non-nil insecure credential for an
-	// insecure channel, and triggering a client-only handshake the server never
-	// answers would deadlock the dial. Wiring real transport security through the
-	// D1 credentials is a follow-up; for now an insecure channel performs no
-	// handshake and SecurityInfo reports InvalidSecurityLevel (fail-closed).
-	_ = opts.TransportCredentials
+	// Security is FAIL-CLOSED. grpc-go passes a non-nil insecure credential for an
+	// insecure channel; a real (non-insecure) transport credential means the
+	// application configured transport security that this version of the SHM
+	// transport cannot provide. Refuse the dial rather than silently downgrade to
+	// an insecure connection that grpc-go would treat as secure (which would let
+	// RequireTransportSecurity per-RPC credentials ride an unsecured channel). The
+	// SHM nonce handshake remains a separate symmetric opt-in (DialOptions.
+	// Handshaker + ShmListener.SetHandshaker), not keyed off these credentials.
+	if tc := opts.TransportCredentials; tc != nil && tc.Info().SecurityProtocol != "insecure" {
+		return nil, fmt.Errorf("shmsc: transport security %q is not supported; the shared-memory transport supports only an insecure channel in this version", tc.Info().SecurityProtocol)
+	}
+	// Per-RPC credentials that require transport security cannot be satisfied on
+	// the insecure SHM channel; reject them fail-closed (D1 SecurityInfo contract)
+	// rather than silently dropping the authorization metadata.
+	for _, prc := range opts.PerRPCCredentials {
+		if prc != nil && prc.RequireTransportSecurity() {
+			return nil, fmt.Errorf("shmsc: a per-RPC credential requires transport security, which the insecure shared-memory channel cannot provide")
+		}
+	}
 	t, err := DialShm(connectCtx, addr, dopts)
 	if err != nil {
 		return nil, err
@@ -75,6 +85,12 @@ func DialClient(connectCtx context.Context, addr string, opts client.BuildOption
 // connection carries and applies the D1 server BuildOptions before it begins
 // serving. It is the entry point the plugin's server Builder calls.
 func BuildServer(conn net.Conn, opts server.BuildOptions) (server.ServerTransport, error) {
+	// Fail-closed on transport security the SHM transport cannot provide, matching
+	// the client side. A non-nil, non-insecure server credential means the
+	// application expects a secure server; refuse rather than serve insecurely.
+	if c := opts.Credentials; c != nil && c.Info().SecurityProtocol != "insecure" {
+		return nil, fmt.Errorf("shmsc: server transport security %q is not supported; the shared-memory transport supports only an insecure server in this version", c.Info().SecurityProtocol)
+	}
 	sc := asShmConn(conn)
 	if sc == nil {
 		return nil, fmt.Errorf("shmsc: connection %T is not a shared-memory connection", conn)
