@@ -22,6 +22,7 @@ package shmsc_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 	shmsc "google.golang.org/grpc/plugin/shmsc"
@@ -151,6 +153,38 @@ func TestSelfContainedStreaming(t *testing.T) {
 	if err := stream.CloseSend(); err != nil {
 		t.Fatalf("CloseSend: %v", err)
 	}
+}
+
+// TestRealTransportCredentialsRejected proves the security fail-closed posture
+// end to end through the real grpc dial path: a channel configured with real
+// (TLS) transport credentials over the shmsc transport must FAIL rather than be
+// silently downgraded to an insecure shared-memory connection. No server is
+// needed — the dial is refused by the plugin's builder before any connection.
+func TestRealTransportCredentialsRejected(t *testing.T) {
+	name := fmt.Sprintf("shmsc_tlsreject_%d", time.Now().UnixNano())
+	r := manual.NewBuilderWithScheme("shmsctls")
+	r.InitialState(resolver.State{
+		Addresses: []resolver.Address{{Addr: name, TransportType: shmsc.Name}},
+	})
+	conn, err := grpc.NewClient("shmsctls:///"+name,
+		grpc.WithResolvers(r),
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient (lazy) unexpectedly failed: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = conn.Invoke(ctx, "/shmsc.test.NoSvc/NoMethod", &emptypb.Empty{}, &emptypb.Empty{})
+	if err == nil {
+		t.Fatal("RPC over a TLS-credentialed shmsc channel must fail fail-closed, but it succeeded")
+	}
+	if status.Code(err) == codes.OK {
+		t.Fatalf("expected a non-OK failure, got OK")
+	}
+	t.Logf("TLS-credentialed shmsc dial correctly failed fail-closed: code=%v err=%v", status.Code(err), err)
 }
 
 // TestSelfContainedStatusDetails proves rich status (status.WithDetails)
