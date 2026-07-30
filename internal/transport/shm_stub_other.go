@@ -55,6 +55,14 @@ const (
 	DefaultRingBSize = 64 * 1024 * 1024
 )
 
+// deferredMessage is a placeholder for the SHM writer's deferred-message
+// state embedded by value in Stream (transport.go). The real struct lives
+// in shm_frame_writer.go behind the platform tag; every member access is
+// in tagged SHM files, so an empty struct keeps the shared Stream layout
+// compiling (zero-valued and unused on these platforms, exactly as the
+// field doc states for TCP/UDS transports).
+type deferredMessage struct{}
+
 // Segment is a placeholder type so non-linux/windows builds can declare
 // SHM-related methods (handshake_stub.go defines WaitForClient and
 // WaitForServer on it). The real Segment is defined in shm_segment.go

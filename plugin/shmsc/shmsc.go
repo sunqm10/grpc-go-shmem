@@ -31,10 +31,14 @@
 //
 // # Platform scope
 //
-// Like shared memory itself, this transport targets Linux and Windows only
-// (same-host IPC). The engine's ring/segment/wake primitives are built only for
-// those OSes; the module is not expected to build for other platforms (e.g.
-// darwin), matching the in-tree SHM transport.
+// This transport targets Linux, Windows, and darwin (same-host IPC). Linux
+// uses eventfd wakeups (with a futex fallback) and Windows uses named
+// events; darwin — which has no cross-process futex reachable from pure
+// Go — uses an adaptive polling wait on the shared words (see
+// shm_futex_darwin.go), trading bounded wakeup latency for zero
+// platform-private API dependencies. Segments live under os.TempDir() on
+// darwin (there is no /dev/shm), so processes rendezvous by name within the
+// same user session.
 //
 // STATUS: functional. A gRPC client and server can select this transport end to
 // end through the exported D1 registries (client via
