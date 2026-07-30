@@ -51,10 +51,23 @@ import (
 
 const (
 	// futexPollYields is how many scheduler yields to burn before sleeping.
-	futexPollYields = 8
+	futexPollYields = 32
 	// futexPollFloor is the first sleep slice.
-	futexPollFloor = 10 * time.Microsecond
-	// futexPollCeiling bounds wake latency for active connections.
+	futexPollFloor = 5 * time.Microsecond
+	// The backoff is three-phase, because cumulative doubling directly
+	// quantizes observed wake latency: with a single 1ms ceiling, a waiter
+	// whose condition lands ~300µs out wakes on the 10+20+40+80+160+320µs
+	// tier boundaries — which showed up verbatim as ~370µs / ~730µs p99
+	// plateaus in RPC latency sweeps. Keeping the ceiling at 100µs while a
+	// wait is young compresses those plateaus at negligible CPU cost (a
+	// wait can spend at most futexPollActivePhase in the shallow phase).
+	//
+	// futexPollActiveCeiling bounds wake latency while the wait is young
+	// (an active connection blocked on the peer's next action).
+	futexPollActiveCeiling = 100 * time.Microsecond
+	// futexPollActivePhase is how long a wait stays in the shallow phase.
+	futexPollActivePhase = 5 * time.Millisecond
+	// futexPollCeiling bounds wake latency after the shallow phase.
 	futexPollCeiling = 1 * time.Millisecond
 	// futexPollIdleAfter is how long a wait runs before it is treated as
 	// idle and allowed the relaxed ceiling.
@@ -116,9 +129,12 @@ func futexPoll(addr *uint32, val uint32, deadline time.Time) error {
 		if atomic.LoadUint32(addr) != val {
 			return nil
 		}
-		ceiling := futexPollCeiling
-		if time.Since(start) >= futexPollIdleAfter {
+		waited := time.Since(start)
+		ceiling := futexPollActiveCeiling
+		if waited >= futexPollIdleAfter {
 			ceiling = futexPollIdleCeiling
+		} else if waited >= futexPollActivePhase {
+			ceiling = futexPollCeiling
 		}
 		if sleep < ceiling {
 			sleep *= 2
