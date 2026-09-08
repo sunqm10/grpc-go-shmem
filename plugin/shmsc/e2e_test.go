@@ -42,9 +42,8 @@ import (
 )
 
 // TestSelfContainedUnary exercises a full unary RPC over the self-contained SHM
-// transport, selected end to end through the exported D1 pluggable-transport
-// registries: the client via resolver.Address.TransportType == shmsc.Name and
-// the server via the tagged listener. Nothing here imports the engine or any
+// transport, selected end to end through the exported shmsc name resolver and
+// pluggable-transport registries. Nothing here imports the engine or any
 // internal package — the plugin is driven purely through public grpc-go APIs.
 func TestSelfContainedUnary(t *testing.T) {
 	name := fmt.Sprintf("shmsc_e2e_unary_%d", time.Now().UnixNano())
@@ -59,13 +58,7 @@ func TestSelfContainedUnary(t *testing.T) {
 	defer stopSrv()
 	time.Sleep(100 * time.Millisecond)
 
-	r := manual.NewBuilderWithScheme("shmscunary")
-	r.InitialState(resolver.State{
-		Addresses: []resolver.Address{{Addr: name, TransportType: shmsc.Name}},
-	})
-
-	conn, err := grpc.NewClient("shmscunary:///"+name,
-		grpc.WithResolvers(r),
+	conn, err := grpc.NewClient(shmsc.Name+":///"+name,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {

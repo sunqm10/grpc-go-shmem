@@ -121,7 +121,7 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	if addr == nil {
 		return nil, errors.New("address cannot be nil")
 	}
-	if err := validateSegmentName(addr.Name); err != nil {
+	if err := ValidateSegmentName(addr.Name); err != nil {
 		return nil, err
 	}
 

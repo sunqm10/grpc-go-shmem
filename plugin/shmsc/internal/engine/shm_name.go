@@ -24,7 +24,7 @@
 // would let a caller escape the intended namespace via path-traversal
 // metacharacters, inject NUL bytes into kernel APIs, or collide with
 // the internal "_ctl" / ".lock" / ".fds.sock" suffixes used by the
-// transport. validateSegmentName enforces a conservative grammar
+// transport. ValidateSegmentName enforces a conservative grammar
 // applied at every public entry that constructs a segment.
 
 package engine
@@ -42,7 +42,7 @@ import (
 // ".fds.sock" / ".lock" siblings.
 const maxSegmentNameLen = 200
 
-// validateSegmentName rejects names that would be unsafe to embed in
+// ValidateSegmentName rejects names that would be unsafe to embed in
 // filesystem paths or kernel object names. The accepted grammar is:
 //
 //	name := [A-Za-z0-9._-]{1,maxSegmentNameLen}
@@ -54,7 +54,7 @@ const maxSegmentNameLen = 200
 // control-segment lock file, ".fds.sock" for the SCM_RIGHTS handoff
 // socket) are also rejected so external callers cannot collide with
 // or shadow those internal artifacts.
-func validateSegmentName(name string) error {
+func ValidateSegmentName(name string) error {
 	if name == "" {
 		return fmt.Errorf("shm: segment name must not be empty")
 	}

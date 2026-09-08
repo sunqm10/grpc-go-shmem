@@ -89,7 +89,7 @@ func DefaultDialOptions() *DialOptions {
 
 // DialShm creates a new shared memory connection to the given address
 func DialShm(ctx context.Context, addr string, opts *DialOptions) (*shmClientTransport, error) {
-	if err := validateSegmentName(addr); err != nil {
+	if err := ValidateSegmentName(addr); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrInvalidConfig, "invalid segment name", err)
 	}
 	if opts == nil {
