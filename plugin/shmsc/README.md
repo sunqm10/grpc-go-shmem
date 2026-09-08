@@ -25,9 +25,8 @@ segment, ring and wakeup primitives are built only for those platforms.
 
 ## Usage
 
-The client selects the transport through `resolver.Address.TransportType`; the
-server tags accepted connections by wrapping its listener. Importing the package
-registers the builders under the transport type `shmsc`.
+Importing the package registers both the `shmsc` name resolver and the client /
+server transport builders. The canonical target is `shmsc:///<segment>`.
 
 Server:
 
@@ -47,22 +46,39 @@ Client:
 
 ```go
 import (
-    shmsc "google.golang.org/grpc/plugin/shmsc"
-    "google.golang.org/grpc/resolver"
+  "google.golang.org/grpc"
+  "google.golang.org/grpc/credentials/insecure"
+  shmsc "google.golang.org/grpc/plugin/shmsc"
 )
 
-// Any resolver that yields an Address with TransportType set works; a manual
-// resolver is used here for brevity.
-r := manual.NewBuilderWithScheme("example")
-r.InitialState(resolver.State{Addresses: []resolver.Address{
-    {Addr: "my-service", TransportType: shmsc.Name},
-}})
-
-cc, err := grpc.NewClient("example:///my-service",
-    grpc.WithResolvers(r),
+cc, err := grpc.NewClient(shmsc.Name+":///my-service",
     grpc.WithTransportCredentials(insecure.NewCredentials()),
 )
 ```
+
+Referencing `shmsc.Name` makes the required package import explicit. Without
+that import, grpc-go does not know the `shmsc` scheme and applies its normal
+unknown-scheme fallback, which can produce a misleading DNS-style error.
+
+Only the canonical parsed target form is accepted: no authority/host, userinfo,
+query, non-empty fragment, opaque target, or percent-encoded segment name. Go's
+URL parser discards a trailing empty `#`, so `shmsc:///segment#` is
+indistinguishable from `shmsc:///segment` at the resolver boundary; a non-empty
+fragment is rejected. Segment names are 1–200 ASCII bytes from
+`A-Z a-z 0-9 . _ -`, may not contain `..`, and may not end in `_ctl`, `.lock`,
+or `.fds.sock`. The registered resolver's default channel authority is
+`localhost`, not the segment name. Standard grpc-go precedence still applies:
+`WithAuthority` and a credential server name override that default.
+
+`grpc.NewClient` is lazy: resolver and connection errors normally surface from
+`Connect` or the first RPC, not from `NewClient`. Resolution validates syntax
+but does not require the segment to exist. A wait-for-ready RPC therefore uses
+normal ClientConn backoff and can succeed when the listener starts later.
+
+Advanced callers may still provide any resolver that emits a bare segment name
+with `resolver.Address.TransportType == shmsc.Name`. A manual resolver does not
+inherit the registered resolver's `localhost` authority override; its Builder
+must implement `resolver.AuthorityOverrider` if it needs the same default.
 
 An existing listener can also be tagged directly with `shmsc.NewListener`.
 

@@ -37,8 +37,8 @@
 // darwin), matching the in-tree SHM transport.
 //
 // STATUS: functional. A gRPC client and server can select this transport end to
-// end through the exported D1 registries (client via
-// resolver.Address.TransportType == Name, server via the tagged Listener), and
+// end through the registered shmsc name resolver and pluggable-transport
+// builders (or directly via resolver.Address.TransportType == Name), and
 // exchange unary + streaming RPCs — including metadata, trailers, rich status
 // (status.WithDetails), flow control, deadlines/cancellation, GOAWAY/graceful
 // close, keepalive, and per-RPC credentials — with the module importing NO

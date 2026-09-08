@@ -73,8 +73,32 @@ that would panic inside core.
 
 ## 5. Selection
 
-The client selects on `resolver.Address.TransportType`; the listener tags accepted connections with
-the same name (`shmsc.Name == "shmsc"`).
+The client normally selects the plugin with the canonical target `shmsc:///<segment>`. Importing
+`plugin/shmsc` registers a static resolver under the same name as the transport
+(`shmsc.Name == "shmsc"`). The resolver validates the target syntax, then publishes exactly one
+`resolver.Address{Addr: <bare segment name>, TransportType: shmsc.Name}`. It deliberately does not
+copy the in-tree transport's `ShmCapability` attribute, `shm:` address prefix, or `ServerName`:
+those belong to the monolithic `shm` selection path, while this plugin is selected only by
+`TransportType`.
+
+The resolver accepts only a canonical parsed URL structure: empty host, userinfo, query, non-empty
+fragment and opaque fields, and no percent-encoded path alias. Go's URL parser discards a trailing
+empty `#`, so that spelling is unavoidably equivalent to no fragment at the resolver boundary. Its
+default authority override is `localhost`, following grpc-go's unix resolver; a segment is a local
+object name, not a network authority. `WithAuthority` and a credential server name retain their
+normal higher precedence.
+Resolver `Build` is syntax-only and publishes its static address even when the listener does not
+yet exist. Segment-open failures stay in transport creation, where normal ClientConn backoff and
+wait-for-ready semantics apply.
+
+The scheme is `shmsc`, not `shm`, because the in-tree monolithic resolver already registers `shm`
+globally and `resolver.Register` is last-writer-wins. Reusing it would make one target select a
+different transport depending on package initialization order.
+
+grpc-go's delegating resolver also treats an explicitly typed address as non-proxyable. An HTTP
+CONNECT proxy cannot carry an arbitrary pluggable transport; replacing the address with a proxy
+address would drop `TransportType` and silently bypass fail-closed selection. Ordinary TCP
+addresses remain proxyable, including in a mixed resolver state.
 
 Selection is **fail-closed**: a non-empty transport type with no registered Builder is a connection
 error, and a tagged server connection whose type is unregistered is closed rather than handed to the
@@ -82,6 +106,11 @@ HTTP/2 parser. An empty type takes grpc-go's default path. An explicit transport
 quietly change the protocol on the wire — that is a correctness *and* a security property, and it is
 covered by dispatch-level tests that dial a real HTTP/2 server with an unregistered type and assert
 the RPC fails rather than succeeding over the fallback.
+
+Manual resolvers remain supported for advanced composition: they must publish the bare segment name
+in `Addr` and set `TransportType` to `shmsc.Name`. They do not inherit the registered resolver's
+authority override and must implement `resolver.AuthorityOverrider` if they need the same
+`localhost` default.
 
 ## 6. Module boundary and the guard
 
