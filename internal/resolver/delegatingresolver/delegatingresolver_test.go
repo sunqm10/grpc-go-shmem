@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/resolver"
 )
 
 type s struct {
@@ -103,5 +104,18 @@ func (s) TestproxyURLForTargetEnv(t *testing.T) {
 				t.Fatalf("parsedProxyURLForProxy(%v) = %v, want %v\n", targetTestAddr, got, tt.wantURL)
 			}
 		})
+	}
+}
+
+func (s) TestSkipProxyForPluggableTransport(t *testing.T) {
+	defer overrideHTTPSProxyFromEnvironment(func(*http.Request) (*url.URL, error) {
+		return &url.URL{Scheme: "https", Host: "proxy.example.com"}, nil
+	})()
+
+	if !skipProxy(resolver.Address{Addr: "segment", TransportType: "shmsc"}) {
+		t.Fatal("skipProxy() = false for a pluggable transport address; want true")
+	}
+	if skipProxy(resolver.Address{Addr: "backend.example.com:443"}) {
+		t.Fatal("skipProxy() = true for a TCP address with a configured proxy; want false")
 	}
 }

@@ -253,6 +253,14 @@ func parseTarget(target string) (string, error) {
 }
 
 func skipProxy(address resolver.Address) bool {
+	// An address with an explicit pluggable transport type is not a TCP
+	// endpoint an HTTP CONNECT proxy can carry. Rewriting it to the proxy
+	// address would also drop TransportType and silently bypass fail-closed
+	// transport selection.
+	if address.TransportType != "" {
+		return true
+	}
+
 	// Avoid proxy when network is not tcp.
 	networkType, ok := networktype.Get(address)
 	if !ok {
@@ -276,10 +284,10 @@ func skipProxy(address resolver.Address) bool {
 }
 
 // updateClientConnStateLocked constructs a combined list of addresses by
-// pairing each proxy address with every target address of type TCP. For each
+// pairing each proxy address with every proxy-eligible target address. For each
 // pair, it creates a new [resolver.Address] using the proxy address and
 // attaches the corresponding target address and user info as attributes. Target
-// addresses that are not of type TCP are appended to the list as-is. The
+// addresses that are not proxy-eligible are appended to the list as-is. The
 // function returns nil if either resolver has not yet provided an update, and
 // returns the result of ClientConn.UpdateState once both resolvers have
 // provided at least one update.
@@ -322,7 +330,7 @@ func (r *delegatingResolver) updateClientConnStateLocked() error {
 	for _, endpt := range (*r.targetResolverState).Endpoints {
 		var addrs []resolver.Address
 		for _, targetAddr := range endpt.Addresses {
-			// Avoid proxy when network is not tcp.
+			// Preserve addresses that are not eligible for HTTP CONNECT proxying.
 			if skipProxy(targetAddr) {
 				addrs = append(addrs, targetAddr)
 				continue
@@ -390,11 +398,11 @@ func (r *delegatingResolver) updateProxyResolverState(state resolver.State) erro
 
 // updateTargetResolverState is the StateListener function provided to the
 // target resolver via wrappingClientConn. It updates the resolver state and
-// marks the target resolver as ready. If the update includes at least one TCP
-// address and the proxy resolver has not yet been constructed, it initializes
-// the proxy resolver. A combined state update is triggered once both resolvers
-// are ready. If all addresses are non-TCP, it proceeds without waiting for the
-// proxy resolver. If ClientConn.UpdateState returns a non-nil error,
+// marks the target resolver as ready. If the update includes at least one
+// proxy-eligible address and the proxy resolver has not yet been constructed,
+// it initializes the proxy resolver. A combined state update is triggered once
+// both resolvers are ready. If no address is proxy-eligible, it proceeds without
+// waiting for the proxy resolver. If ClientConn.UpdateState returns a non-nil error,
 // ResolveNow() is called on the proxy resolver.
 func (r *delegatingResolver) updateTargetResolverState(state resolver.State) error {
 	r.mu.Lock()
@@ -404,9 +412,9 @@ func (r *delegatingResolver) updateTargetResolverState(state resolver.State) err
 		logger.Infof("Addresses received from target resolver: %v", state.Addresses)
 	}
 	r.targetResolverState = &state
-	// If all addresses returned by the target resolver have a non-TCP network
-	// type, or are listed in the `NO_PROXY` environment variable, do not wait
-	// for proxy update.
+	// If all addresses returned by the target resolver are explicit pluggable
+	// transports, have a non-TCP network type, or are listed in `NO_PROXY`, do
+	// not wait for a proxy update.
 	if !needsProxyResolver(r.targetResolverState) {
 		return r.cc.UpdateState(*r.targetResolverState)
 	}

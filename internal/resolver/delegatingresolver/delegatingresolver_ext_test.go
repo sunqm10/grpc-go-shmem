@@ -882,6 +882,50 @@ func (s) TestDelegatingResolverForNonTCPTarget(t *testing.T) {
 	}
 }
 
+// Tests the scenario where a proxy is configured and every resolved address
+// selects an explicit pluggable transport. The delegating resolver must not
+// build the proxy resolver and must preserve both Addresses and Endpoints,
+// including TransportType.
+func (s) TestDelegatingResolverForPluggableTransport(t *testing.T) {
+	const (
+		targetTestAddr = "test.target"
+		envProxyAddr   = "proxytest.com"
+	)
+	overrideTestHTTPSProxy(t, envProxyAddr)
+
+	targetResolver := manual.NewBuilderWithScheme("test")
+	target := targetResolver.Scheme() + ":///" + targetTestAddr
+	_, proxyResolverBuilt := setupDNS(t)
+
+	tcc, stateCh, _ := createTestResolverClientConn(t)
+	if _, err := delegatingresolver.New(resolver.Target{URL: *testutils.MustParseURL(target)}, tcc, resolver.BuildOptions{}, targetResolver, false); err != nil {
+		t.Fatalf("Failed to create delegating resolver: %v", err)
+	}
+
+	typedAddr := resolver.Address{Addr: "segment", TransportType: "shmsc"}
+	wantState := resolver.State{
+		Addresses:     []resolver.Address{typedAddr},
+		Endpoints:     []resolver.Endpoint{{Addresses: []resolver.Address{typedAddr}}},
+		ServiceConfig: &serviceconfig.ParseResult{},
+	}
+	targetResolver.UpdateState(wantState)
+
+	var gotState resolver.State
+	select {
+	case gotState = <-stateCh:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("Timeout when waiting for a state update from the delegating resolver")
+	}
+	select {
+	case <-proxyResolverBuilt:
+		t.Fatal("Unexpected build of proxy resolver for a pluggable transport")
+	case <-time.After(defaultTestShortTimeout):
+	}
+	if diff := cmp.Diff(gotState, wantState); diff != "" {
+		t.Fatalf("Unexpected state from delegating resolver. Diff (-got +want):\n%s", diff)
+	}
+}
+
 // Tests the scenario where a proxy is configured, and the resolver returns tcp
 // and non-tcp addresses. The test verifies that the delegating resolver doesn't
 // add proxyatrribute to adresses with network type other than tcp, but adds
@@ -943,6 +987,65 @@ func (s) TestDelegatingResolverForMixNetworkType(t *testing.T) {
 
 	if diff := cmp.Diff(gotState, wantState); diff != "" {
 		t.Fatalf("Unexpected state from delegating resolver. Diff (-got +want):\n%v", diff)
+	}
+}
+
+// Tests a mixed state containing an explicit pluggable transport and an
+// ordinary TCP address. The typed address must remain unchanged while the TCP
+// address is routed through the configured proxy, in both Addresses and
+// Endpoints.
+func (s) TestDelegatingResolverForMixedPluggableAndTCP(t *testing.T) {
+	const (
+		targetTestAddr       = "test.target"
+		resolvedTCPAddr      = "2.2.2.2:8080"
+		envProxyAddr         = "proxytest.com"
+		pluggableSegmentName = "segment"
+	)
+	overrideTestHTTPSProxy(t, envProxyAddr)
+
+	targetResolver := manual.NewBuilderWithScheme("test")
+	target := targetResolver.Scheme() + ":///" + targetTestAddr
+	proxyResolver, proxyResolverBuilt := setupDNS(t)
+
+	tcc, stateCh, _ := createTestResolverClientConn(t)
+	if _, err := delegatingresolver.New(resolver.Target{URL: *testutils.MustParseURL(target)}, tcc, resolver.BuildOptions{}, targetResolver, false); err != nil {
+		t.Fatalf("Failed to create delegating resolver: %v", err)
+	}
+
+	typedAddr := resolver.Address{Addr: pluggableSegmentName, TransportType: "shmsc"}
+	targetResolver.UpdateState(resolver.State{
+		Addresses:     []resolver.Address{typedAddr, {Addr: resolvedTCPAddr}},
+		Endpoints:     []resolver.Endpoint{{Addresses: []resolver.Address{typedAddr, {Addr: resolvedTCPAddr}}}},
+		ServiceConfig: &serviceconfig.ParseResult{},
+	})
+
+	select {
+	case <-stateCh:
+		t.Fatal("Delegating resolver invoked UpdateState before both proxy and target resolvers updated their states")
+	case <-time.After(defaultTestShortTimeout):
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	mustBuildResolver(ctx, t, proxyResolverBuilt)
+	proxyResolver.UpdateState(resolver.State{
+		Addresses:     []resolver.Address{{Addr: envProxyAddr}},
+		ServiceConfig: &serviceconfig.ParseResult{},
+	})
+
+	var gotState resolver.State
+	select {
+	case gotState = <-stateCh:
+	case <-ctx.Done():
+		t.Fatal("Context timed out when waiting for a state update from the delegating resolver")
+	}
+	wantState := resolver.State{
+		Addresses:     []resolver.Address{typedAddr, proxyAddressWithTargetAttribute(envProxyAddr, resolvedTCPAddr)},
+		Endpoints:     []resolver.Endpoint{{Addresses: []resolver.Address{typedAddr, proxyAddressWithTargetAttribute(envProxyAddr, resolvedTCPAddr)}}},
+		ServiceConfig: &serviceconfig.ParseResult{},
+	}
+	if diff := cmp.Diff(gotState, wantState); diff != "" {
+		t.Fatalf("Unexpected state from delegating resolver. Diff (-got +want):\n%s", diff)
 	}
 }
 
