@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
@@ -58,8 +59,10 @@ func TestSelfContainedUnary(t *testing.T) {
 	defer stopSrv()
 	time.Sleep(100 * time.Millisecond)
 
+	audiences := make(chan string, 1)
 	conn, err := grpc.NewClient(shmsc.Name+":///"+name,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(authorityCaptureCreds{audiences: audiences}),
 	)
 	if err != nil {
 		t.Fatalf("grpc.NewClient: %v", err)
@@ -83,8 +86,119 @@ func TestSelfContainedUnary(t *testing.T) {
 		if got := len(resp.GetPayload().GetBody()); got != sz {
 			t.Fatalf("UnaryCall(size=%d): response = %d bytes, want %d", sz, got, sz)
 		}
+		if sz == 0 {
+			select {
+			case got := <-audiences:
+				if got != "https://localhost/grpc.testing.BenchmarkService" {
+					t.Fatalf("credential audience = %q; want resolver authority localhost", got)
+				}
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for per-RPC credential audience")
+			}
+		}
 	}
 }
+
+// TestResolverRetriesUntilListenerStarts verifies that name resolution is
+// syntax-only: a missing segment fails in transport creation, enters normal
+// ClientConn backoff, and succeeds after a listener for the same static name
+// appears. The resolver must not probe segment existence in Build.
+func TestResolverRetriesUntilListenerStarts(t *testing.T) {
+	name := fmt.Sprintf("shmsc_late_listener_%d", time.Now().UnixNano())
+	conn, err := grpc.NewClient(shmsc.Name+":///"+name,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	stateCtx, stateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stateCancel()
+	conn.Connect()
+	if !waitForConnectivityState(stateCtx, conn, connectivity.TransientFailure) {
+		t.Fatalf("channel state = %v; want TransientFailure before listener starts", conn.GetState())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	client := testpb.NewBenchmarkServiceClient(conn)
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}, grpc.WaitForReady(true))
+		callDone <- err
+	}()
+	select {
+	case err := <-callDone:
+		t.Fatalf("WaitForReady UnaryCall returned before listener started: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	lis, err := shmsc.Listen(name)
+	if err != nil {
+		t.Fatalf("shmsc.Listen: %v", err)
+	}
+	defer lis.Close()
+	stopSrv := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis})
+	defer stopSrv()
+
+	select {
+	case err := <-callDone:
+		if err != nil {
+			t.Fatalf("UnaryCall after late listener start: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("WaitForReady UnaryCall did not complete after listener started")
+	}
+}
+
+// TestResolverMissingSegmentFailsWithinDeadline verifies a permanently absent
+// segment does not hang an RPC beyond its context deadline. The ClientConn may
+// keep retrying with its normal backoff until it is closed.
+func TestResolverMissingSegmentFailsWithinDeadline(t *testing.T) {
+	name := fmt.Sprintf("shmsc_missing_%d", time.Now().UnixNano())
+	conn, err := grpc.NewClient(shmsc.Name+":///"+name,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client := testpb.NewBenchmarkServiceClient(conn)
+	if _, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}, grpc.WaitForReady(true)); err == nil {
+		t.Fatal("UnaryCall to a missing segment succeeded; want a bounded failure")
+	} else if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("UnaryCall error = %v; want DeadlineExceeded", err)
+	}
+}
+
+func waitForConnectivityState(ctx context.Context, conn *grpc.ClientConn, want connectivity.State) bool {
+	for state := conn.GetState(); state != want; state = conn.GetState() {
+		if !conn.WaitForStateChange(ctx, state) {
+			return false
+		}
+	}
+	return true
+}
+
+type authorityCaptureCreds struct {
+	audiences chan<- string
+}
+
+func (c authorityCaptureCreds) GetRequestMetadata(_ context.Context, uri ...string) (map[string]string, error) {
+	if len(uri) > 0 {
+		select {
+		case c.audiences <- uri[0]:
+		default:
+		}
+	}
+	return map[string]string{}, nil
+}
+
+func (authorityCaptureCreds) RequireTransportSecurity() bool { return false }
 
 // TestSelfContainedStreaming exercises bidirectional streaming ping-pong over
 // the self-contained SHM transport selected through the registries.
